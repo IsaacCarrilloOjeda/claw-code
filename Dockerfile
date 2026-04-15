@@ -2,7 +2,7 @@
 # Stage 1: compile with the full Rust toolchain.
 # Stage 2: copy the single binary into a slim Debian image.
 
-FROM rust:1.75-slim AS builder
+FROM rust:1.85-slim AS builder
 
 # System deps needed to link sqlx with rustls-tls (no OpenSSL required for rustls).
 RUN apt-get update && apt-get install -y \
