@@ -1,43 +1,41 @@
-# GHOST daemon — multi-stage Rust build.
-# Stage 1: compile with the full Rust toolchain.
-# Stage 2: copy the single binary into a slim Debian image.
+# GHOST daemon — multi-stage Rust build with musl for a fully static binary.
+# Static binary has zero GLIBC dependency — runs on any Linux regardless of distro.
 
 FROM rust:slim AS builder
 
-# System deps needed to link sqlx with rustls-tls (no OpenSSL required for rustls).
+# musl-tools provides musl-gcc for static linking.
 RUN apt-get update && apt-get install -y \
     pkg-config \
+    musl-tools \
     && rm -rf /var/lib/apt/lists/*
 
+# Add the musl target.
+RUN rustup target add x86_64-unknown-linux-musl
+
 WORKDIR /app
-
-# Copy the entire rust workspace.
 COPY rust/ ./rust/
-
 WORKDIR /app/rust
 
-# sqlx offline mode: skip compile-time query checking since we have no DB at build time.
-# Migrations run at daemon startup via sqlx::migrate::Migrator.
+# Use musl-gcc as the C compiler for the musl target (needed by onig_sys / syntect).
+ENV CC_x86_64_unknown_linux_musl=musl-gcc
+# Skip compile-time sqlx query checks — no DB at build time.
 ENV SQLX_OFFLINE=true
 
-RUN cargo build --release -p rusty-claude-cli
+RUN cargo build --release -p rusty-claude-cli --target x86_64-unknown-linux-musl
 
 # ---------------------------------------------------------------------------
-# Stage 2: minimal runtime image.
+# Stage 2: minimal runtime — bookworm-slim is fine because the binary is static.
 # ---------------------------------------------------------------------------
-FROM debian:trixie-slim
+FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy the compiled binary. Migrations are embedded at compile time (sqlx::migrate!).
-COPY --from=builder /app/rust/target/release/claw /usr/local/bin/claw
+# Copy static binary. Migrations are embedded at compile time (sqlx::migrate!).
+COPY --from=builder /app/rust/target/x86_64-unknown-linux-musl/release/claw /usr/local/bin/claw
 
-# Railway injects PORT; daemon reads it from the PORT env var.
-# Expose a representative default for documentation — actual port is dynamic.
 EXPOSE 8080
 
-# Start the daemon. HOST=0.0.0.0 binds all interfaces (required on Railway).
-# --allow-unsafe-prompt enables POST /prompt; auth is enforced via GHOST_DAEMON_KEY.
+# HOST=0.0.0.0 and PORT are read from env vars (Railway injects PORT automatically).
 CMD ["claw", "daemon", "--allow-unsafe-prompt"]
