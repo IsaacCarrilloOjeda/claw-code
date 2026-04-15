@@ -6,9 +6,13 @@
     clippy::unnecessary_wraps,
     clippy::unused_self
 )]
+mod daemon;
+mod db;
+mod gerald;
 mod init;
 mod input;
 mod render;
+mod routing;
 
 use std::collections::BTreeSet;
 use std::env;
@@ -177,6 +181,7 @@ fn merge_prompt_with_stdin(prompt: &str, stdin_content: Option<&str>) -> String 
     format!("{prompt}\n\n{trimmed}")
 }
 
+#[allow(clippy::too_many_lines)]
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
     match parse_args(&args)? {
@@ -243,6 +248,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 None
             };
             let effective_prompt = merge_prompt_with_stdin(&prompt, stdin_context.as_deref());
+            // Route to cheapest capable model when CLAW_ROUTING=1 and no explicit --model
+            let model = if model == DEFAULT_MODEL {
+                routing::route_model(&effective_prompt).unwrap_or(model)
+            } else {
+                model
+            };
             let mut cli = LiveCli::new(model, true, allowed_tools, permission_mode)?;
             cli.set_reasoning_effort(reasoning_effort);
             cli.run_turn_with_output(&effective_prompt, output_format, compact)?;
@@ -270,6 +281,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             reasoning_effort,
             allow_broad_cwd,
         )?,
+        CliAction::Daemon {
+            port,
+            host,
+            allow_unsafe_prompt,
+        } => daemon::run_daemon(port, &host, allow_unsafe_prompt)?,
         CliAction::HelpTopic(topic) => print_help_topic(topic),
         CliAction::Help { output_format } => print_help(output_format)?,
     }
@@ -355,6 +371,11 @@ enum CliAction {
         base_commit: Option<String>,
         reasoning_effort: Option<String>,
         allow_broad_cwd: bool,
+    },
+    Daemon {
+        port: u16,
+        host: String,
+        allow_unsafe_prompt: bool,
     },
     HelpTopic(LocalHelpTopic),
     // prompt-mode formatting is only supported for non-interactive runs
@@ -630,6 +651,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     let permission_mode = permission_mode_override.unwrap_or_else(default_permission_mode);
 
     match rest[0].as_str() {
+        "daemon" => parse_daemon_args(&rest[1..]),
         "dump-manifests" => parse_dump_manifests_args(&rest[1..], output_format),
         "bootstrap-plan" => Ok(CliAction::BootstrapPlan { output_format }),
         "agents" => Ok(CliAction::Agents {
@@ -745,6 +767,11 @@ fn parse_single_word_command_alias(
         "sandbox" => Some(Ok(CliAction::Sandbox { output_format })),
         "doctor" => Some(Ok(CliAction::Doctor { output_format })),
         "state" => Some(Ok(CliAction::State { output_format })),
+        "daemon" => Some(Ok(CliAction::Daemon {
+            port: daemon::default_daemon_port(),
+            host: "127.0.0.1".to_string(),
+            allow_unsafe_prompt: false,
+        })),
         other => bare_slash_command_guidance(other).map(Err),
     }
 }
@@ -1217,6 +1244,58 @@ fn parse_export_args(args: &[String], output_format: CliOutputFormat) -> Result<
         session_reference,
         output_path,
         output_format,
+    })
+}
+
+fn parse_daemon_args(args: &[String]) -> Result<CliAction, String> {
+    // Railway (and any cloud platform) injects HOST and PORT env vars.
+    // CLI flags override them; if neither is set, fall back to local defaults.
+    let mut port = std::env::var("PORT")
+        .ok()
+        .and_then(|v| v.parse::<u16>().ok())
+        .unwrap_or_else(daemon::default_daemon_port);
+    let mut host = std::env::var("HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let mut allow_unsafe_prompt = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--port" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--port requires a number".to_string())?;
+                port = value
+                    .parse::<u16>()
+                    .map_err(|_| format!("invalid port: {value}"))?;
+                index += 2;
+            }
+            flag if flag.starts_with("--port=") => {
+                port = flag[7..]
+                    .parse::<u16>()
+                    .map_err(|_| format!("invalid port: {}", &flag[7..]))?;
+                index += 1;
+            }
+            "--host" => {
+                host.clone_from(
+                    args.get(index + 1)
+                        .ok_or_else(|| "--host requires an address".to_string())?,
+                );
+                index += 2;
+            }
+            flag if flag.starts_with("--host=") => {
+                host = flag[7..].to_string();
+                index += 1;
+            }
+            "--allow-unsafe-prompt" => {
+                allow_unsafe_prompt = true;
+                index += 1;
+            }
+            other => return Err(format!("unknown daemon option: {other}")),
+        }
+    }
+    Ok(CliAction::Daemon {
+        port,
+        host,
+        allow_unsafe_prompt,
     })
 }
 
@@ -3072,6 +3151,7 @@ fn run_repl(
                 }
                 if matches!(trimmed.as_str(), "/exit" | "/quit") {
                     cli.persist_session()?;
+                    gerald_autosave(&cli);
                     break;
                 }
                 match SlashCommand::parse(&trimmed) {
@@ -3104,12 +3184,22 @@ fn run_repl(
             input::ReadOutcome::Cancel => {}
             input::ReadOutcome::Exit => {
                 cli.persist_session()?;
+                gerald_autosave(&cli);
                 break;
             }
         }
     }
 
     Ok(())
+}
+
+/// Fire-and-forget: save a session summary to Gerald Brain on REPL exit.
+fn gerald_autosave(cli: &LiveCli) {
+    let cwd =
+        env::current_dir().map_or_else(|_| "unknown".to_string(), |p| p.display().to_string());
+    let turns = cli.prompt_history.len();
+    let note = format!("Completed {turns} turn(s). Model: {}.", cli.model);
+    gerald::save_session(&cwd, &cli.session.id, &note);
 }
 
 #[derive(Debug, Clone)]
@@ -6108,12 +6198,17 @@ fn short_tool_id(id: &str) -> String {
 }
 
 fn build_system_prompt() -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    Ok(load_system_prompt(
+    let mut sections = load_system_prompt(
         env::current_dir()?,
         DEFAULT_DATE,
         env::consts::OS,
         "unknown",
-    )?)
+    )?;
+    // Auto-load Gerald Brain memories (4 s timeout; silently skipped if unreachable)
+    if let Some(context) = gerald::load_context() {
+        sections.push(context);
+    }
+    Ok(sections)
 }
 
 fn build_runtime_plugin_state() -> Result<RuntimePluginState, Box<dyn std::error::Error>> {
