@@ -30,12 +30,17 @@ pub async fn dispatch(
 
     let core_context = load_core_context();
     let memory_context = load_memory_context(message, pool).await;
+    let web_context = load_web_context(message).await;
 
-    let system = if memory_context.is_empty() {
-        core_context
-    } else {
-        format!("{core_context}\n\n## What you remember about Isaac\n{memory_context}")
-    };
+    let mut system = core_context;
+    if !memory_context.is_empty() {
+        system.push_str("\n\n## What you remember about Isaac\n");
+        system.push_str(&memory_context);
+    }
+    if !web_context.is_empty() {
+        system.push_str("\n\n## Current web search results\n");
+        system.push_str(&web_context);
+    }
 
     let mut messages: Vec<serde_json::Value> = history.to_vec();
     messages.push(serde_json::json!({"role": "user", "content": message}));
@@ -88,6 +93,22 @@ async fn load_memory_context(message: &str, pool: Option<&sqlx::PgPool>) -> Stri
         .map(|n| format!("- [{}] {}", n.category, n.content))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Run a Brave web search for the message and format results for injection.
+/// Returns empty string if `BRAVE_API_KEY` is unset or the search returns nothing.
+async fn load_web_context(message: &str) -> String {
+    match crate::search::web_search(message).await {
+        Ok(results) if !results.is_empty() => {
+            eprintln!("[ghost search] {} result(s) for: {message}", results.len());
+            crate::search::format_results(&results)
+        }
+        Ok(_) => String::new(),
+        Err(e) => {
+            eprintln!("[ghost search] search failed: {e}");
+            String::new()
+        }
+    }
 }
 
 /// Load the core context file. Falls back to a minimal default if the env var

@@ -16,6 +16,7 @@ mod input;
 mod memory;
 mod render;
 mod routing;
+mod search;
 mod sms;
 
 use std::collections::BTreeSet;
