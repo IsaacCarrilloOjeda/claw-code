@@ -315,7 +315,7 @@ export default function App() {
             marginRight: 24,
             whiteSpace: 'nowrap',
           }}>
-            CHEETAH<span style={{ color: 'var(--text)', opacity: 0.5 }}>CLAWS</span>
+            GHOST
           </div>
 
           {/* Status */}
@@ -336,7 +336,7 @@ export default function App() {
             </>}
             {!status && !alive && (
               <div style={{ padding: '6px 14px', color: 'var(--muted)', borderLeft: '1px solid var(--border)' }}>
-                daemon unreachable — run <code style={{ color: 'var(--cyan)' }}>claw daemon</code>
+                daemon unreachable
               </div>
             )}
           </div>
