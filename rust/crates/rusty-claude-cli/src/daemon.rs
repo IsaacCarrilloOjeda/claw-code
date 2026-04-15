@@ -755,40 +755,53 @@ fn redact_secrets(s: &str) -> String {
 
 /// `POST /sms/inbound` — receives a webhook from Android SMS Gateway.
 ///
-/// Extracts `message` (or `text`) and `phoneNumber` (or `from`) from the JSON
-/// body, creates a job, then spawns a background task to process it. Returns
-/// 200 immediately so the Gateway isn't kept waiting.
+/// Accepts inbound SMS from two sources:
+///   - Android SMS Gateway: JSON body with `message`/`phoneNumber` fields
+///   - Twilio inbound webhook: `application/x-www-form-urlencoded` with `Body`/`From` fields
+///
+/// Creates a job, spawns a background task to process it, returns 200 immediately.
 ///
 /// Routing:
 ///   - starts with `.` → ignore (reserved), return 200
 ///   - starts with `!` → Director stub (strip `!`)
 ///   - everything else → Chat dispatcher
 async fn sms_inbound(cfg: &DaemonConfig, raw: &str) -> (&'static str, String) {
-    let body_str = raw
+    let (headers_part, body_str) = raw
         .split_once("\r\n\r\n")
         .or_else(|| raw.split_once("\n\n"))
-        .map_or("", |(_, b)| b);
+        .map_or(("", ""), |(h, b)| (h, b));
 
-    let Ok(body) = serde_json::from_str::<serde_json::Value>(body_str) else {
-        return (
-            "400 Bad Request",
-            r#"{"error":"body must be JSON"}"#.to_owned(),
-        );
+    // Twilio sends application/x-www-form-urlencoded; Gateway sends JSON.
+    let is_form = headers_part
+        .lines()
+        .any(|l| l.to_ascii_lowercase().contains("application/x-www-form-urlencoded"));
+
+    let (message, phone_from) = if is_form {
+        let fields = parse_urlencoded(body_str);
+        let msg = fields.get("Body").map_or("", String::as_str).trim().to_string();
+        let from = fields.get("From").cloned().unwrap_or_default();
+        (msg, from)
+    } else {
+        let Ok(body) = serde_json::from_str::<serde_json::Value>(body_str) else {
+            return (
+                "400 Bad Request",
+                r#"{"error":"body must be JSON or form-encoded"}"#.to_owned(),
+            );
+        };
+        // Android SMS Gateway may use either field name.
+        let msg = body["message"]
+            .as_str()
+            .or_else(|| body["text"].as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let from = body["phoneNumber"]
+            .as_str()
+            .or_else(|| body["from"].as_str())
+            .unwrap_or("")
+            .to_string();
+        (msg, from)
     };
-
-    // Android SMS Gateway may use either field name.
-    let message = body["message"]
-        .as_str()
-        .or_else(|| body["text"].as_str())
-        .unwrap_or("")
-        .trim()
-        .to_string();
-
-    let phone_from = body["phoneNumber"]
-        .as_str()
-        .or_else(|| body["from"].as_str())
-        .unwrap_or("")
-        .to_string();
 
     if message.is_empty() {
         return (
@@ -907,6 +920,49 @@ async fn sms_send_handler(raw: &str) -> (&'static str, String) {
 
 fn options_preflight() -> (&'static str, String) {
     ("204 No Content", String::new())
+}
+
+// ---------------------------------------------------------------------------
+// Form body helpers (Twilio inbound webhook)
+// ---------------------------------------------------------------------------
+
+/// Parse `application/x-www-form-urlencoded` into key→value pairs.
+fn parse_urlencoded(s: &str) -> std::collections::HashMap<String, String> {
+    s.split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .map(|(k, v)| (url_decode(k), url_decode(v)))
+        .collect()
+}
+
+/// Decode a percent-encoded string (`%XX` and `+` as space). UTF-8 safe.
+fn url_decode(s: &str) -> String {
+    let mut bytes: Vec<u8> = Vec::with_capacity(s.len());
+    let input = s.as_bytes();
+    let mut i = 0;
+    while i < input.len() {
+        match input[i] {
+            b'+' => {
+                bytes.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < input.len() => {
+                if let Ok(hex_str) = std::str::from_utf8(&input[i + 1..i + 3]) {
+                    if let Ok(b) = u8::from_str_radix(hex_str, 16) {
+                        bytes.push(b);
+                        i += 3;
+                        continue;
+                    }
+                }
+                bytes.push(b'%');
+                i += 1;
+            }
+            b => {
+                bytes.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 // ---------------------------------------------------------------------------
