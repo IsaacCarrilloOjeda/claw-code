@@ -487,6 +487,7 @@ async fn dispatch(cfg: &DaemonConfig, raw: &str, uptime_secs: u64) -> (&'static 
             }
             run_prompt(raw).await
         }
+        ("POST", "/chat") => chat_handler(cfg, raw).await,
         ("POST", "/sms/inbound") => sms_inbound(cfg, raw).await,
         ("POST", "/sms/send") => sms_send_handler(raw).await,
         ("OPTIONS", _) => options_preflight(),
@@ -755,6 +756,84 @@ fn redact_secrets(s: &str) -> String {
 
 /// `POST /sms/inbound` — receives a webhook from Android SMS Gateway.
 ///
+/// Synchronous chat endpoint for the dashboard.
+///
+/// POST /chat  `{"message": "..."}`
+/// Returns `{"response": "...", "job_id": "..."}` after AI call completes.
+/// Requires bearer auth when `GHOST_DAEMON_KEY` is set.
+/// Same routing logic as SMS: `!` prefix → Director, else → chat dispatcher.
+async fn chat_handler(cfg: &DaemonConfig, raw: &str) -> (&'static str, String) {
+    if configured_key().is_some() && !auth_matches(raw) {
+        return ("401 Unauthorized", r#"{"error":"unauthorized"}"#.to_owned());
+    }
+
+    let body_str = raw
+        .split_once("\r\n\r\n")
+        .or_else(|| raw.split_once("\n\n"))
+        .map_or("", |(_, b)| b);
+
+    let Ok(body) = serde_json::from_str::<serde_json::Value>(body_str) else {
+        return (
+            "400 Bad Request",
+            r#"{"error":"body must be JSON"}"#.to_owned(),
+        );
+    };
+
+    let message = body["message"]
+        .as_str()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    if message.is_empty() {
+        return (
+            "400 Bad Request",
+            r#"{"error":"missing message"}"#.to_owned(),
+        );
+    }
+
+    let Some(pool_ref) = cfg.db.as_deref() else {
+        return (
+            "503 Service Unavailable",
+            r#"{"error":"database not configured"}"#.to_owned(),
+        );
+    };
+
+    let (agent_name, process_msg) = if let Some(stripped) = message.strip_prefix('!') {
+        ("director", stripped.trim().to_string())
+    } else {
+        ("chat_dispatcher", message.clone())
+    };
+
+    let Some(job_id) =
+        db::create_job(pool_ref, &message, agent_name, "dashboard", None).await
+    else {
+        return (
+            "500 Internal Server Error",
+            r#"{"error":"failed to create job"}"#.to_owned(),
+        );
+    };
+
+    let result = if agent_name == "director" {
+        crate::director::handle(&process_msg, &job_id).await
+    } else {
+        crate::chat_dispatcher::dispatch(&process_msg, &job_id).await
+    };
+
+    match result {
+        Ok(text) => {
+            db::update_job_done(pool_ref, &job_id, &text).await;
+            let resp = serde_json::json!({"response": text, "job_id": job_id}).to_string();
+            ("200 OK", resp)
+        }
+        Err(e) => {
+            db::update_job_failed(pool_ref, &job_id, &e).await;
+            let resp = serde_json::json!({"error": e, "job_id": job_id}).to_string();
+            ("502 Bad Gateway", resp)
+        }
+    }
+}
+
 /// Accepts inbound SMS from two sources:
 ///   - Android SMS Gateway: JSON body with `message`/`phoneNumber` fields
 ///   - Twilio inbound webhook: `application/x-www-form-urlencoded` with `Body`/`From` fields

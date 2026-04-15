@@ -198,7 +198,7 @@ export default function App() {
   const [running, setRunning] = useState(false)
   const [result, setResult] = useState(null)
   const [memSearch, setMemSearch] = useState('')
-  const [activeTab, setActiveTab] = useState('prompt')
+  const [activeTab, setActiveTab] = useState('chat')
   const [lastPoll, setLastPoll] = useState(null)
   const [daemonKey, setDaemonKey] = useState(
     () => (typeof localStorage !== 'undefined' && localStorage.getItem(DAEMON_KEY_STORAGE)) || ''
@@ -253,7 +253,6 @@ export default function App() {
 
   async function sendPrompt() {
     if (!prompt.trim() || running) return
-    // Abort any in-flight prompt before starting a new one
     if (promptAbortRef.current) promptAbortRef.current.abort()
     const controller = new AbortController()
     promptAbortRef.current = controller
@@ -261,17 +260,17 @@ export default function App() {
     setRunning(true)
     setResult(null)
     try {
-      const data = await apiFetch('/prompt', {
+      const data = await apiFetch('/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ prompt: prompt.trim() }),
+        body: JSON.stringify({ message: prompt.trim() }),
         signal: controller.signal,
       }, daemonKey)
       if (!mountedRef.current) return
-      setResult(data)
+      setResult({ ok: true, response: data.response, job_id: data.job_id })
     } catch (e) {
       if (e.name === 'AbortError' || !mountedRef.current) return
-      setResult({ ok: false, output: '', stderr: e.message, model: '—' })
+      setResult({ ok: false, response: e.message })
     } finally {
       if (mountedRef.current) setRunning(false)
       if (promptAbortRef.current === controller) promptAbortRef.current = null
@@ -396,7 +395,7 @@ export default function App() {
               background: 'var(--surface)',
               flexShrink: 0,
             }}>
-              {['prompt', 'memory'].map(tab => (
+              {['chat', 'memory'].map(tab => (
                 <button
                   key={tab}
                   onClick={() => setActiveTab(tab)}
@@ -415,7 +414,7 @@ export default function App() {
               ))}
             </div>
 
-            {activeTab === 'prompt' && (
+            {activeTab === 'chat' && (
               <div style={{ display: 'flex', flexDirection: 'column', flex: 1, overflow: 'hidden', padding: 20, gap: 16 }}>
                 {/* Input area */}
                 <div style={{ flexShrink: 0 }}>
@@ -471,32 +470,22 @@ export default function App() {
                   )}
                   {result && (
                     <>
-                      <div style={{
-                        display: 'flex', gap: 12, marginBottom: 12,
-                        paddingBottom: 10, borderBottom: '1px solid var(--border)',
-                        fontSize: 11, color: 'var(--muted)',
+                      {result.job_id && (
+                        <div style={{
+                          marginBottom: 10, paddingBottom: 8,
+                          borderBottom: '1px solid var(--border)',
+                          fontSize: 10, color: 'var(--muted)',
+                        }}>
+                          job <span style={{ color: 'var(--cyan)' }}>{result.job_id}</span>
+                        </div>
+                      )}
+                      <pre style={{
+                        whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+                        color: result.ok ? 'var(--text)' : 'var(--red)',
+                        lineHeight: 1.7,
                       }}>
-                        <span>model: <span style={{ color: 'var(--cyan)' }}>{result.model}</span></span>
-                        <span style={{ color: result.ok ? 'var(--green)' : 'var(--red)' }}>
-                          {result.ok ? 'exit 0' : `exit ${result.exit_code ?? '?'}`}
-                        </span>
-                      </div>
-                      {result.output && (
-                        <pre style={{
-                          whiteSpace: 'pre-wrap', wordBreak: 'break-word',
-                          color: 'var(--text)', lineHeight: 1.7,
-                        }}>
-                          {result.output}
-                        </pre>
-                      )}
-                      {result.stderr && (
-                        <pre style={{
-                          whiteSpace: 'pre-wrap', color: 'var(--red)',
-                          marginTop: 10, fontSize: 11,
-                        }}>
-                          {result.stderr}
-                        </pre>
-                      )}
+                        {result.response}
+                      </pre>
                     </>
                   )}
                 </div>
