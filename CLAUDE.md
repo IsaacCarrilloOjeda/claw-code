@@ -43,6 +43,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **sqlx offline mode**: `SQLX_OFFLINE=true` is set in the Dockerfile so the build doesn't need a DB. Migrations run at daemon startup via embedded `sqlx::migrate!()`. No `.sqlx/` cache dir needed.
 - **pgvector on Railway**: enable via `CREATE EXTENSION IF NOT EXISTS vector;` in first migration. Requires Railway's Postgres to have the pgvector extension available — it is on Railway's managed Postgres.
 - **Dashboard DAEMON_URL**: set `VITE_DAEMON_URL=https://<your-service>.railway.app` in the dashboard's Vite env (`.env.production` or Railway build env) to point at the deployed daemon.
+- **OPENAI_API_KEY is OpenRouter here**: the user routes non-Anthropic models through OpenRouter using `OPENAI_API_KEY`. OpenRouter does NOT support the embeddings endpoint — do not use it for embeddings. Use `VOYAGE_API_KEY` instead.
+- **Embeddings provider**: `VOYAGE_API_KEY` → Voyage AI `voyage-3` with `output_dimension=1536` (matches DB schema). Falls back to `OPENAI_API_KEY` → OpenAI `text-embedding-3-small` (1536 dims). If neither key is set, notes store with `NULL` embedding and still appear in the memory panel — semantic injection just stays empty.
+- **Conversation history cap**: `POST /chat` accepts optional `history: [{role, content}]`. Daemon validates and caps at 6 entries (3 exchanges). Each content field capped at 8192 chars. SMS path always sends empty history (single-turn by nature).
+
+---
 
 ## Daemon (`claw daemon`)
 
@@ -58,12 +63,17 @@ All return JSON. CORS header on every response.
 |--------|------|------|-------------|
 | GET | `/health` | open | Uptime + pid. Always public. |
 | GET | `/status` | open on localhost | Version, cwd, session count, config home, uptime, db_connected. |
-| GET | `/sessions` | open on localhost | Workspace + file basenames (no absolute paths — info-disclosure fix). |
+| GET | `/sessions` | open on localhost | Workspace + file basenames (no absolute paths). |
 | GET | `/jobs` | open | List recent 100 jobs from Postgres. 503 if DB not configured. |
 | GET | `/jobs/:id` | open | Single job detail by UUID. |
 | GET | `/director/config` | open | Current primary/fallback model + health flags. |
 | POST | `/director/config` | **bearer** | Swap primary or fallback model. Body: `{"primary_model":"...","fallback_model":"..."}`. |
 | POST | `/prompt` | **flag + key + bearer** | Runs a one-shot prompt via `claw prompt` subprocess. Body: `{"prompt":"...","model":"..."}` |
+| POST | `/chat` | **bearer** (when key set) | Synchronous chat via `chat_dispatcher`. Body: `{"message":"...","history":[{role,content}]}`. Returns `{"response":"...","job_id":"..."}`. 503 if DB not configured. |
+| POST | `/sms/inbound` | open | Accept SMS from Android Gateway (JSON) or Twilio (form-encoded). Spawns background task, returns 200 immediately. |
+| POST | `/sms/send` | open | Internal: deliver outbound SMS. Body: `{"to":"+1...","body":"..."}`. |
+| GET | `/memories` | open | List up to 200 non-expired memory notes. 503 if DB not configured. |
+| DELETE | `/memories/:id` | **bearer** | Delete a single note by UUID. |
 
 ### `/prompt` security model (mandatory — fails closed)
 `POST /prompt` shells out to a subprocess with `--dangerously-skip-permissions`, so it is hardened three ways:
@@ -71,11 +81,16 @@ All return JSON. CORS header on every response.
 2. `GHOST_DAEMON_KEY` env var must be set to a **non-empty** value when the daemon starts; empty = refuse to start.
 3. Each request must carry `Authorization: Bearer <key>` or `X-Claw-Key: <key>` matching `GHOST_DAEMON_KEY` (constant-time compare). Missing/wrong → `401`.
 
-Additional hardening in the same path:
-- `Host` header is validated against the bind address (DNS-rebinding defense → `421`). Bypassed when binding `0.0.0.0` (Railway/cloud).
-- Request body is capped at 1 MiB (→ `413`) and read in a bounded loop, not a single 8 KiB read.
-- `model` field is validated against an allow-list charset; prompts starting with `--` are rejected (CLI-flag injection).
-- Subprocess stdout/stderr is piped through `redact_secrets` so `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` / `OPENAI_API_KEY` / settings-file key values are replaced with `***redacted***` before returning to the client.
+Additional hardening:
+- `Host` header validated against bind address (DNS-rebinding defense → `421`). Bypassed on `0.0.0.0`.
+- Request body capped at 1 MiB (→ `413`), read in bounded loop.
+- `model` field validated against allow-list charset; prompts starting with `--` rejected.
+- stdout/stderr piped through `redact_secrets` — replaces API keys with `***redacted***`.
+
+### Background tasks (daemon startup)
+Two tasks are spawned alongside the HTTP server:
+1. **Circuit-breaker reset** — calls `db::reset_health_flags` every 5 minutes. Restores `primary_healthy` / `fallback_healthy` after failures.
+2. **Confidence decay** — calls `db::decay_notes_confidence` every 24 hours. Reduces confidence 5% on notes older than 30 days; expires notes below 0.1.
 
 ### Phone / network access
 ```bash
@@ -88,6 +103,57 @@ Clients send `Authorization: Bearer <token>` or `X-Claw-Key: <token>`.
 .\scripts\daemon-install.ps1
 ```
 Creates `ClawDaemon` task: starts at boot, runs as current user, restarts on failure (3x / 1 min).
+
+---
+
+## Memory system (Phase 2 — complete)
+
+**Files:**
+- `rust/crates/rusty-claude-cli/src/memory.rs` — embedding + note extraction
+- `rust/crates/rusty-claude-cli/src/db.rs` — `insert_note`, `search_notes`, `list_notes`, `delete_note`, `decay_notes_confidence`
+- `rust/crates/rusty-claude-cli/src/chat_dispatcher.rs` — dispatch with history + memory injection
+
+### How it works
+1. **On every chat response**: `extract_and_store` runs fire-and-forget via `tokio::spawn`. Calls Haiku with a prompt that extracts 0–3 factual notes in `category|content` format. Each note is embedded and stored in `director_notes`.
+2. **On every incoming chat message**: the message is embedded, top-5 notes retrieved by cosine similarity (`embedding <=> $1::vector`), injected into the system prompt under `## What you remember about Isaac`.
+3. **Conversation history**: `dispatch(message, history, job_id, pool)` accepts up to 6 prior messages (3 exchanges) and sends them as a messages array to Anthropic so GHOST maintains context.
+4. **Confidence decay**: notes older than 30 days get `confidence * 0.95` daily. Notes below 0.1 are expired (soft-deleted via `expires_at`).
+
+### Embedding providers (checked in order)
+| Priority | Env var | Provider | Model | Dims |
+|----------|---------|----------|-------|------|
+| 1st | `VOYAGE_API_KEY` | Voyage AI | `voyage-3` | 1536 (via `output_dimension`) |
+| 2nd | `OPENAI_API_KEY` | OpenAI | `text-embedding-3-small` | 1536 |
+| fallback | — | none | NULL embedding stored | — |
+
+Notes with NULL embedding appear in the memory panel but don't rank in semantic search.
+
+### Note categories
+`personal` · `social` · `code` · `projects` · `style` · `calendar`
+
+### DB schema (migration `001_initial.sql`)
+```sql
+director_notes (
+  id           UUID PRIMARY KEY,
+  category     TEXT NOT NULL,
+  content      TEXT NOT NULL,
+  embedding    VECTOR(1536),       -- NULL if no embedding key set
+  confidence   FLOAT DEFAULT 1.0,
+  expires_at   TIMESTAMPTZ,        -- set when confidence < 0.1
+  created_at   TIMESTAMPTZ DEFAULT now()
+)
+```
+
+---
+
+## Chat dispatcher (`chat_dispatcher.rs`)
+
+**Signature:** `dispatch(message, history, job_id, pool) -> Result<String, String>`
+
+- Loads core context from `GHOST_CORE_CONTEXT_PATH` (falls back to minimal default).
+- Embeds `message`, pulls top-5 memory notes, injects as `## What you remember about Isaac` block.
+- Sends `[...history, {role: "user", content: message}]` to Claude Haiku (`claude-haiku-4-5-20251001`), max 1024 tokens.
+- After response: `tokio::spawn(extract_and_store(...))` — fire-and-forget, never blocks latency path.
 
 ---
 
@@ -121,7 +187,7 @@ Initialize → `notifications/initialized` → `tools/call`. Passes `Mcp-Session
 | mid | `claude-sonnet-4-6` | arch/design/review signals, or fallback from above tiers |
 | full | `claude-opus-4-6` | default |
 
-DeepSeek is called via OpenAI-compatible API using `OPENAI_API_KEY`.  
+`OPENAI_API_KEY` here points to OpenRouter (not real OpenAI). DeepSeek is called via OpenAI-compatible API.  
 If `OPENAI_API_KEY` is absent, fast/code tiers fall through to mid/full.
 
 ---
@@ -131,26 +197,27 @@ If `OPENAI_API_KEY` is absent, fast/code tiers fall through to mid/full.
 This repo is being built into **GHOST**, a personal AI operating system.
 Full vision, architecture, and roadmap: **`VISION.md`** (read this first for any non-trivial work).
 
-**Current phase: Phase 0 — Foundation**
-Goal: make the daemon cloud-deployable on Railway, add Postgres job model, wire Director config with fallback ranking. No new user-facing features yet.
+**Phase 0 (Foundation) — COMPLETE**  
+**Phase 2 (Memory + Context) — COMPLETE**  
+**Current: Phase 3 — Specialist Agents + Research Agent (web search / internet access)**
 
-### Phase 0 task list (in order)
-1. Add `#[cfg(unix)]` gates to all `PermissionsExt` / `set_mode(0o755)` calls in `runtime` crate so the workspace compiles on Linux (required for Docker build).
-2. Make daemon bind host/port from `HOST` + `PORT` env vars (Railway injects these). Currently hardcoded to `127.0.0.1:7878`.
-3. Add Postgres connection via `DATABASE_URL` env var (Railway injects this). Use `sqlx` with compile-time checked queries.
-4. Create migrations for three tables: `jobs`, `director_config`, `director_notes`. Schema is in `VISION.md` Phase 0 section. Enable `pgvector` extension in migration.
-5. Seed `director_config` singleton row on startup if absent: `primary_model = 'claude-sonnet-4-6'`, `fallback_model = 'gpt-4o'`, both healthy.
-6. Add circuit breaker logic: on Director call failure (429/402/500/timeout), flip `primary_healthy = false`, try fallback. Both fail → hard error. Background task resets health flags every 5 min.
-7. Add new endpoints: `GET /jobs`, `GET /jobs/:id`, `GET /director/config`, `POST /director/config`.
-8. Write `Dockerfile` (multi-stage Rust build → debian-slim, expose `$PORT`).
-9. Update dashboard `DAEMON_URL` to read from an env var instead of hardcoded `http://127.0.0.1:7878`. Add Railway URL to CORS allow-list.
-10. Verify: `POST /prompt` works end-to-end via the Railway URL.
+### Railway env vars (all required for full function)
+| Var | Purpose |
+|-----|---------|
+| `ANTHROPIC_API_KEY` | All Anthropic calls (chat, extraction) |
+| `OPENAI_API_KEY` | OpenRouter key — used for provider routing (not embeddings) |
+| `VOYAGE_API_KEY` | Voyage AI embeddings — enables semantic memory search |
+| `GHOST_DAEMON_KEY` | Bearer auth for `/chat`, `/prompt`, `/director/config`, `DELETE /memories/:id` |
+| `HOST` | Set to `0.0.0.0` (Railway injects this automatically) |
+| `PORT` | Injected by Railway automatically |
+| `DATABASE_URL` | Injected by Railway Postgres add-on |
+| `GHOST_CORE_CONTEXT_PATH` | Path to GHOST's personality/system context file |
+| `GHOST_ALLOWED_NUMBERS` | Comma-separated E.164 numbers allowed to SMS in |
 
 ### Railway deploy notes
 - Add Postgres add-on in Railway dashboard → `DATABASE_URL` is auto-injected.
-- Run `CREATE EXTENSION IF NOT EXISTS vector;` in first migration (pgvector for Phase 2 semantic search).
-- Env vars needed at deploy: `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GHOST_DAEMON_KEY`, `HOST=0.0.0.0`. `PORT` and `DATABASE_URL` are injected by Railway automatically.
-- The daemon auth key env var is `GHOST_DAEMON_KEY` going forward (was `CLAW_DAEMON_KEY` — rename during Phase 0).
+- Migrations run automatically at daemon startup (`sqlx::migrate!`). No manual DB setup needed.
+- pgvector (`CREATE EXTENSION IF NOT EXISTS vector`) is in migration `001_initial.sql`.
 
 ---
 
@@ -162,12 +229,12 @@ Goal: make the daemon cloud-deployable on Railway, add Postgres job model, wire 
 cd dashboard && npm run dev
 # http://localhost:5173
 ```
-**Daemon dependency:** expects daemon at `http://127.0.0.1:7878`. Shows "offline" gracefully if unreachable.
+**Daemon dependency:** expects daemon at `http://127.0.0.1:7878` locally, or `VITE_DAEMON_URL` in production.
 
 ### Features
-- Status bar — alive indicator, uptime, session count, version. Auto-polls every 10s with 5s per-request timeout.
-- **KEY field** — header input persists to `localStorage['claw-daemon-key']` and is sent as `Authorization: Bearer <key>` on every daemon request. Must match the daemon's `CLAW_DAEMON_KEY` exactly for `/prompt` to succeed.
-- Prompt tab — textarea → POST `/prompt` → output panel. Ctrl+Enter to send. In-flight requests are aborted on unmount / new-send via `AbortController`.
-- Memory tab — placeholder for future Gerald Brain search (`GET /memories?q=...`).
-- Session list — right sidebar, sorted by most recent, shows workspace hash + time ago + size. Stable keys (no `key={i}`).
-- `ErrorBoundary` wraps `<App/>` in `main.jsx` — render-time crashes show a reload button instead of a blank screen.
+- **Status bar** — alive indicator, uptime, session count, version, pid. Auto-polls every 10s.
+- **KEY field** — password input persists to `localStorage['ghost-daemon-key']`. Sent as `Authorization: Bearer <key>` on every request.
+- **Chat tab** — Claude-style conversation UI: messages grow upward, input bar pinned at bottom. Enter sends, Shift+Enter for newlines. Sends last 3 exchanges as `history` for context. Auto-scrolls to latest message. Clear button resets thread.
+- **Memory tab** — lists all non-expired notes with category color badges. Filter input + refresh button. Delete (×) per note.
+- **Sessions sidebar** — right panel, sorted by most recent, workspace hash + time ago + size.
+- `ErrorBoundary` wraps `<App/>` in `main.jsx` — render crashes show a reload button.

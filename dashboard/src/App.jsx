@@ -221,6 +221,7 @@ export default function App() {
     else localStorage.removeItem(DAEMON_KEY_STORAGE)
   }, [daemonKey])
   const outputRef = useRef(null)
+  const textareaRef = useRef(null)
   const promptAbortRef = useRef(null)
   const mountedRef = useRef(true)
 
@@ -270,6 +271,8 @@ export default function App() {
 
     const userMsg = prompt.trim()
     setPrompt('')
+    // Reset textarea height after clearing
+    if (textareaRef.current) textareaRef.current.style.height = 'auto'
     setChatMessages(prev => [...prev, { role: 'user', content: userMsg }])
     setRunning(true)
     try {
@@ -293,7 +296,17 @@ export default function App() {
   }
 
   function handleKeyDown(e) {
-    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) sendPrompt()
+    // Enter sends; Shift+Enter inserts a newline
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault()
+      sendPrompt()
+    }
+  }
+
+  function autoResize(e) {
+    const el = e.target
+    el.style.height = 'auto'
+    el.style.height = Math.min(el.scrollHeight, 180) + 'px'
   }
 
   async function loadNotes() {
@@ -455,102 +468,156 @@ export default function App() {
             </div>
 
             {activeTab === 'chat' && (
-              <div style={{ display: 'flex', flexDirection: 'column', flex: 1, overflow: 'hidden', padding: 20, gap: 16 }}>
-                {/* Input area */}
-                <div style={{ flexShrink: 0 }}>
-                  <textarea
-                    rows={4}
-                    placeholder="Ask anything… (Ctrl+Enter to send)"
-                    value={prompt}
-                    onChange={e => setPrompt(e.target.value)}
-                    onKeyDown={handleKeyDown}
-                    disabled={running || !alive}
-                  />
-                  <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 8, gap: 10, alignItems: 'center' }}>
-                    {running && (
-                      <span style={{ color: 'var(--muted)', fontSize: 11 }}>
-                        running<span className="blink">_</span>
-                      </span>
-                    )}
-                    <button
-                      onClick={sendPrompt}
-                      disabled={running || !alive || !prompt.trim()}
-                      style={{
-                        background: running || !alive ? 'var(--border)' : 'var(--cyan)',
-                        color: running || !alive ? 'var(--muted)' : '#000',
-                        cursor: running || !alive ? 'not-allowed' : 'pointer',
-                      }}
-                    >
-                      {running ? 'running' : 'send'}
-                    </button>
-                  </div>
-                </div>
+              <div style={{ display: 'flex', flexDirection: 'column', flex: 1, overflow: 'hidden' }}>
 
-                {/* Conversation thread */}
+                {/* ── Message thread — grows upward, newest at bottom ── */}
                 <div
                   ref={outputRef}
                   style={{
                     flex: 1,
                     overflowY: 'auto',
-                    background: '#080a0d',
-                    border: '1px solid var(--border)',
-                    borderRadius: 4,
-                    padding: chatMessages.length ? '14px 16px' : 0,
-                    position: 'relative',
+                    padding: '24px 0',
                     display: 'flex',
                     flexDirection: 'column',
-                    gap: 16,
+                    gap: 0,
                   }}
                 >
                   {chatMessages.length === 0 && !running && (
                     <div style={{
-                      position: 'absolute', inset: 0,
+                      flex: 1,
                       display: 'flex', alignItems: 'center', justifyContent: 'center',
                       color: 'var(--muted)', fontSize: 12,
                     }}>
-                      output will appear here
+                      start a conversation
                     </div>
                   )}
+
                   {chatMessages.map((msg, i) => (
-                    <div key={i}>
-                      <div style={{
-                        fontSize: 10, letterSpacing: '0.1em', marginBottom: 4,
-                        color: msg.role === 'user' ? 'var(--cyan)' : msg.role === 'error' ? 'var(--red)' : 'var(--green)',
-                        display: 'flex', gap: 10, alignItems: 'center',
-                      }}>
-                        <span>{msg.role === 'user' ? 'you' : msg.role === 'error' ? 'error' : 'ghost'}</span>
-                        {msg.job_id && (
-                          <span style={{ color: 'var(--muted)', fontWeight: 400 }}>
-                            · {msg.job_id.slice(0, 8)}
-                          </span>
-                        )}
-                      </div>
-                      <pre style={{
-                        whiteSpace: 'pre-wrap', wordBreak: 'break-word',
-                        color: msg.role === 'error' ? 'var(--red)' : 'var(--text)',
-                        lineHeight: 1.7, margin: 0,
-                      }}>
-                        {msg.content}
-                      </pre>
+                    <div
+                      key={i}
+                      style={{
+                        display: 'flex',
+                        justifyContent: msg.role === 'user' ? 'flex-end' : 'flex-start',
+                        padding: '6px 24px',
+                      }}
+                    >
+                      {msg.role === 'user' ? (
+                        /* User bubble — right-aligned */
+                        <div style={{
+                          maxWidth: '72%',
+                          background: 'rgba(0,229,255,0.07)',
+                          border: '1px solid rgba(0,229,255,0.15)',
+                          borderRadius: '16px 16px 4px 16px',
+                          padding: '10px 14px',
+                        }}>
+                          <pre style={{
+                            whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+                            color: 'var(--text)', lineHeight: 1.7, margin: 0,
+                            fontFamily: 'var(--mono)', fontSize: 13,
+                          }}>
+                            {msg.content}
+                          </pre>
+                        </div>
+                      ) : (
+                        /* Assistant / error — left-aligned */
+                        <div style={{ maxWidth: '82%' }}>
+                          <div style={{
+                            fontSize: 10, letterSpacing: '0.1em', marginBottom: 6,
+                            color: msg.role === 'error' ? 'var(--red)' : 'var(--green)',
+                            display: 'flex', gap: 8, alignItems: 'center',
+                          }}>
+                            <span style={{ fontWeight: 600 }}>
+                              {msg.role === 'error' ? 'error' : 'ghost'}
+                            </span>
+                            {msg.job_id && (
+                              <span style={{ color: 'var(--muted)', fontWeight: 400 }}>
+                                {msg.job_id.slice(0, 8)}
+                              </span>
+                            )}
+                          </div>
+                          <pre style={{
+                            whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+                            color: msg.role === 'error' ? 'var(--red)' : 'var(--text)',
+                            lineHeight: 1.7, margin: 0,
+                            fontFamily: 'var(--mono)', fontSize: 13,
+                          }}>
+                            {msg.content}
+                          </pre>
+                        </div>
+                      )}
                     </div>
                   ))}
+
+                  {/* Typing indicator */}
                   {running && (
-                    <div style={{ color: 'var(--muted)', fontSize: 12 }}>
-                      ghost<span className="blink">_</span>
+                    <div style={{ padding: '6px 24px', display: 'flex', justifyContent: 'flex-start' }}>
+                      <div style={{ fontSize: 10, color: 'var(--muted)', letterSpacing: '0.1em' }}>
+                        <span style={{ color: 'var(--green)', marginRight: 8 }}>ghost</span>
+                        <span className="blink">▋</span>
+                      </div>
                     </div>
                   )}
                 </div>
-                {/* Clear conversation */}
-                {chatMessages.length > 0 && (
-                  <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+
+                {/* ── Input bar — pinned at bottom ── */}
+                <div style={{
+                  flexShrink: 0,
+                  borderTop: '1px solid var(--border)',
+                  background: 'var(--surface)',
+                  padding: '12px 20px 16px',
+                }}>
+                  {chatMessages.length > 0 && (
+                    <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 6 }}>
+                      <button
+                        onClick={() => setChatMessages([])}
+                        style={{ background: 'none', color: 'var(--muted)', fontSize: 10, padding: '2px 4px', letterSpacing: '0.05em' }}
+                      >
+                        clear
+                      </button>
+                    </div>
+                  )}
+                  <div style={{ display: 'flex', gap: 10, alignItems: 'flex-end' }}>
+                    <textarea
+                      ref={textareaRef}
+                      rows={1}
+                      placeholder={alive ? 'Message GHOST…' : 'daemon offline'}
+                      value={prompt}
+                      onChange={e => { setPrompt(e.target.value); autoResize(e) }}
+                      onKeyDown={handleKeyDown}
+                      disabled={running || !alive}
+                      style={{
+                        flex: 1,
+                        resize: 'none',
+                        minHeight: 44,
+                        maxHeight: 180,
+                        lineHeight: 1.6,
+                        padding: '11px 14px',
+                        overflowY: 'auto',
+                      }}
+                    />
                     <button
-                      onClick={() => setChatMessages([])}
-                      style={{ background: 'none', color: 'var(--muted)', fontSize: 10, padding: '2px 6px' }}
+                      onClick={sendPrompt}
+                      disabled={running || !alive || !prompt.trim()}
+                      style={{
+                        flexShrink: 0,
+                        width: 44, height: 44,
+                        padding: 0,
+                        fontSize: 18,
+                        background: running || !alive || !prompt.trim() ? 'var(--border)' : 'var(--cyan)',
+                        color: running || !alive || !prompt.trim() ? 'var(--muted)' : '#000',
+                        cursor: running || !alive || !prompt.trim() ? 'not-allowed' : 'pointer',
+                        borderRadius: 8,
+                        display: 'flex', alignItems: 'center', justifyContent: 'center',
+                      }}
+                      title="Send (Enter)"
                     >
-                      clear
+                      ↑
                     </button>
                   </div>
-                )}
+                  <div style={{ marginTop: 6, fontSize: 10, color: 'var(--muted)', textAlign: 'center' }}>
+                    Enter to send · Shift+Enter for newline
+                  </div>
+                </div>
               </div>
             )}
 
