@@ -41,6 +41,8 @@ const MAX_REQUEST_BYTES: usize = 1024 * 1024; // 1 MiB
 const READ_CHUNK: usize = 8 * 1024;
 /// Background health-check interval: reset circuit-breaker flags every 5 min.
 const HEALTH_CHECK_INTERVAL_SECS: u64 = 300;
+/// Confidence decay runs once every 24 hours.
+const DECAY_INTERVAL_SECS: u64 = 86_400;
 const DEFAULT_CORS_ORIGINS: &[&str] = &[
     "http://localhost:5173",
     "http://127.0.0.1:5173",
@@ -108,6 +110,21 @@ async fn daemon_main(cfg: DaemonConfig) -> Result<(), Box<dyn std::error::Error>
                 interval.tick().await;
                 db::reset_health_flags(&pool).await;
                 eprintln!("{LOG_PREFIX} circuit breaker: health flags reset");
+            }
+        });
+    }
+
+    // Spawn confidence decay task (runs once per day).
+    // Reduces confidence by 5% on notes older than 30 days; expires notes below 0.1.
+    if let Some(pool) = cfg.db.clone() {
+        tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(std::time::Duration::from_secs(DECAY_INTERVAL_SECS));
+            interval.tick().await; // skip the immediate first tick
+            loop {
+                interval.tick().await;
+                db::decay_notes_confidence(&pool).await;
+                eprintln!("{LOG_PREFIX} memory: confidence decay applied");
             }
         });
     }
