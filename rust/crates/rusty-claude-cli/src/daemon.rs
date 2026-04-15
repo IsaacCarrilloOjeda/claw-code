@@ -797,6 +797,14 @@ async fn sms_inbound(cfg: &DaemonConfig, raw: &str) -> (&'static str, String) {
         );
     }
 
+    // Whitelist check — only process messages from allowed numbers.
+    if let Ok(allowed) = std::env::var("GHOST_ALLOWED_NUMBERS") {
+        let allowed_list: Vec<&str> = allowed.split(',').map(str::trim).collect();
+        if !phone_from.is_empty() && !allowed_list.iter().any(|n| *n == phone_from) {
+            return ("200 OK", r#"{"status":"ignored"}"#.to_owned());
+        }
+    }
+
     // `.` prefix → reserved/ignored for now.
     if message.starts_with('.') {
         return ("200 OK", r#"{"status":"ignored"}"#.to_owned());
