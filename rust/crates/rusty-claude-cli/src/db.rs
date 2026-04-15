@@ -252,6 +252,130 @@ pub async fn update_director_config(
 }
 
 // ---------------------------------------------------------------------------
+// Memory notes model (Phase 2)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, serde::Serialize)]
+pub struct MemoryNote {
+    pub id: String,
+    pub category: String,
+    pub content: String,
+    pub confidence: f64,
+    pub created_at: String,
+}
+
+/// Format a float vector as a pgvector literal: `[v1,v2,...]`
+fn vec_to_pgvector(v: &[f32]) -> String {
+    let inner = v
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("[{inner}]")
+}
+
+/// Insert a new memory note with its embedding vector.
+pub async fn insert_note(pool: &PgPool, category: &str, content: &str, embedding: &[f32]) -> bool {
+    let id = uuid::Uuid::new_v4().to_string();
+    let embedding_str = vec_to_pgvector(embedding);
+    sqlx::query(
+        "INSERT INTO director_notes (id, category, content, embedding)
+         VALUES ($1::uuid, $2, $3, $4::vector)",
+    )
+    .bind(&id)
+    .bind(category)
+    .bind(content)
+    .bind(&embedding_str)
+    .execute(pool)
+    .await
+    .is_ok()
+}
+
+/// Semantic search: return up to `limit` notes ordered by cosine similarity to
+/// the query embedding. Skips expired notes.
+pub async fn search_notes(pool: &PgPool, embedding: &[f32], limit: i64) -> Vec<MemoryNote> {
+    let embedding_str = vec_to_pgvector(embedding);
+    let rows = sqlx::query(
+        "SELECT id::text, category, content, confidence, created_at::text
+         FROM director_notes
+         WHERE expires_at IS NULL AND embedding IS NOT NULL
+         ORDER BY embedding <=> $1::vector
+         LIMIT $2",
+    )
+    .bind(&embedding_str)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    rows.iter()
+        .map(|row| MemoryNote {
+            id: row.try_get("id").unwrap_or_default(),
+            category: row.try_get("category").unwrap_or_default(),
+            content: row.try_get("content").unwrap_or_default(),
+            confidence: row.try_get("confidence").unwrap_or(1.0),
+            created_at: row.try_get("created_at").unwrap_or_default(),
+        })
+        .collect()
+}
+
+/// List all non-expired notes (for the dashboard memory panel).
+pub async fn list_notes(pool: &PgPool, limit: i64) -> Vec<MemoryNote> {
+    let rows = sqlx::query(
+        "SELECT id::text, category, content, confidence, created_at::text
+         FROM director_notes
+         WHERE expires_at IS NULL
+         ORDER BY created_at DESC
+         LIMIT $1",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    rows.iter()
+        .map(|row| MemoryNote {
+            id: row.try_get("id").unwrap_or_default(),
+            category: row.try_get("category").unwrap_or_default(),
+            content: row.try_get("content").unwrap_or_default(),
+            confidence: row.try_get("confidence").unwrap_or(1.0),
+            created_at: row.try_get("created_at").unwrap_or_default(),
+        })
+        .collect()
+}
+
+/// Delete a note by UUID. Returns true if a row was deleted.
+pub async fn delete_note(pool: &PgPool, id: &str) -> bool {
+    if uuid::Uuid::parse_str(id).is_err() {
+        return false;
+    }
+    sqlx::query("DELETE FROM director_notes WHERE id = $1::uuid")
+        .bind(id)
+        .execute(pool)
+        .await
+        .map(|r| r.rows_affected() > 0)
+        .unwrap_or(false)
+}
+
+/// Confidence decay: called by the background task every 24h.
+/// Reduces confidence by 5% on notes older than 30 days; marks notes below
+/// 0.1 confidence as expired.
+pub async fn decay_notes_confidence(pool: &PgPool) {
+    let _ = sqlx::query(
+        "UPDATE director_notes
+         SET confidence = confidence * 0.95,
+             expires_at = CASE
+                 WHEN confidence * 0.95 < 0.1 THEN now()
+                 ELSE expires_at
+             END
+         WHERE created_at < now() - interval '30 days'
+           AND expires_at IS NULL",
+    )
+    .execute(pool)
+    .await;
+}
+
+// ---------------------------------------------------------------------------
 // Circuit breaker helpers
 // ---------------------------------------------------------------------------
 

@@ -13,6 +13,7 @@ mod director;
 mod gerald;
 mod init;
 mod input;
+mod memory;
 mod render;
 mod routing;
 mod sms;

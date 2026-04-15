@@ -817,7 +817,7 @@ async fn chat_handler(cfg: &DaemonConfig, raw: &str) -> (&'static str, String) {
     let result = if agent_name == "director" {
         crate::director::handle(&process_msg, &job_id).await
     } else {
-        crate::chat_dispatcher::dispatch(&process_msg, &job_id).await
+        crate::chat_dispatcher::dispatch(&process_msg, &job_id, Some(pool_ref)).await
     };
 
     match result {
@@ -934,7 +934,7 @@ async fn sms_inbound(cfg: &DaemonConfig, raw: &str) -> (&'static str, String) {
         let result = if use_director {
             crate::director::handle(&process_msg, &job_id_bg).await
         } else {
-            crate::chat_dispatcher::dispatch(&process_msg, &job_id_bg).await
+            crate::chat_dispatcher::dispatch(&process_msg, &job_id_bg, Some(&pool_arc)).await
         };
 
         match result {
