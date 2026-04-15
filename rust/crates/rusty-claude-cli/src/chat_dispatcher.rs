@@ -14,10 +14,14 @@ const MEMORY_SEARCH_LIMIT: i64 = 5;
 
 /// Dispatch a no-prefix message to Claude Haiku. Returns the response text.
 ///
+/// `history` is a slice of prior `{role, content}` message objects (last N exchanges).
+/// These are prepended to the messages array so GHOST maintains conversational context.
+///
 /// If `pool` is provided, semantic memory search runs before the call and
 /// note extraction runs asynchronously after.
 pub async fn dispatch(
     message: &str,
+    history: &[serde_json::Value],
     _job_id: &str,
     pool: Option<&sqlx::PgPool>,
 ) -> Result<String, String> {
@@ -33,11 +37,14 @@ pub async fn dispatch(
         format!("{core_context}\n\n## What you remember about Isaac\n{memory_context}")
     };
 
+    let mut messages: Vec<serde_json::Value> = history.to_vec();
+    messages.push(serde_json::json!({"role": "user", "content": message}));
+
     let request_body = serde_json::json!({
         "model": HAIKU_MODEL,
         "max_tokens": 1024,
         "system": system,
-        "messages": [{"role": "user", "content": message}],
+        "messages": messages,
     });
 
     let response = call_anthropic(&api_key, &request_body).await?;

@@ -797,6 +797,25 @@ async fn chat_handler(cfg: &DaemonConfig, raw: &str) -> (&'static str, String) {
         );
     }
 
+    // Parse optional conversation history — at most 6 entries (3 exchanges), each
+    // validated to have a known role and non-empty content under 8 KiB.
+    let history: Vec<serde_json::Value> = body["history"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter(|m| {
+                    let role = m["role"].as_str().unwrap_or("");
+                    let content = m["content"].as_str().unwrap_or("");
+                    (role == "user" || role == "assistant")
+                        && !content.is_empty()
+                        && content.len() <= 8192
+                })
+                .take(6)
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+
     let Some(pool_ref) = cfg.db.as_deref() else {
         return (
             "503 Service Unavailable",
@@ -822,7 +841,7 @@ async fn chat_handler(cfg: &DaemonConfig, raw: &str) -> (&'static str, String) {
     let result = if agent_name == "director" {
         crate::director::handle(&process_msg, &job_id).await
     } else {
-        crate::chat_dispatcher::dispatch(&process_msg, &job_id, Some(pool_ref)).await
+        crate::chat_dispatcher::dispatch(&process_msg, &history, &job_id, Some(pool_ref)).await
     };
 
     match result {
@@ -939,7 +958,8 @@ async fn sms_inbound(cfg: &DaemonConfig, raw: &str) -> (&'static str, String) {
         let result = if use_director {
             crate::director::handle(&process_msg, &job_id_bg).await
         } else {
-            crate::chat_dispatcher::dispatch(&process_msg, &job_id_bg, Some(&pool_arc)).await
+            // SMS is single-turn — no conversation history.
+            crate::chat_dispatcher::dispatch(&process_msg, &[], &job_id_bg, Some(&pool_arc)).await
         };
 
         match result {

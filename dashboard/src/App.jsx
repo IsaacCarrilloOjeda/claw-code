@@ -205,7 +205,7 @@ export default function App() {
   const [sessions, setSessions] = useState([])
   const [prompt, setPrompt] = useState('')
   const [running, setRunning] = useState(false)
-  const [result, setResult] = useState(null)
+  const [chatMessages, setChatMessages] = useState([]) // [{role, content, job_id?}]
   const [memSearch, setMemSearch] = useState('')
   const [notes, setNotes] = useState(null)
   const [notesLoading, setNotesLoading] = useState(false)
@@ -260,7 +260,7 @@ export default function App() {
     if (outputRef.current) {
       outputRef.current.scrollTop = outputRef.current.scrollHeight
     }
-  }, [result])
+  }, [chatMessages])
 
   async function sendPrompt() {
     if (!prompt.trim() || running) return
@@ -268,20 +268,24 @@ export default function App() {
     const controller = new AbortController()
     promptAbortRef.current = controller
 
+    const userMsg = prompt.trim()
+    setPrompt('')
+    setChatMessages(prev => [...prev, { role: 'user', content: userMsg }])
     setRunning(true)
-    setResult(null)
     try {
+      // Send last 6 messages (3 exchanges) as context, stripping job_id.
+      const history = chatMessages.slice(-6).map(m => ({ role: m.role, content: m.content }))
       const data = await apiFetch('/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: prompt.trim() }),
+        body: JSON.stringify({ message: userMsg, history }),
         signal: controller.signal,
       }, daemonKey)
       if (!mountedRef.current) return
-      setResult({ ok: true, response: data.response, job_id: data.job_id })
+      setChatMessages(prev => [...prev, { role: 'assistant', content: data.response, job_id: data.job_id }])
     } catch (e) {
       if (e.name === 'AbortError' || !mountedRef.current) return
-      setResult({ ok: false, response: e.message })
+      setChatMessages(prev => [...prev, { role: 'error', content: e.message }])
     } finally {
       if (mountedRef.current) setRunning(false)
       if (promptAbortRef.current === controller) promptAbortRef.current = null
@@ -482,7 +486,7 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* Output */}
+                {/* Conversation thread */}
                 <div
                   ref={outputRef}
                   style={{
@@ -491,11 +495,14 @@ export default function App() {
                     background: '#080a0d',
                     border: '1px solid var(--border)',
                     borderRadius: 4,
-                    padding: result ? '14px 16px' : 0,
+                    padding: chatMessages.length ? '14px 16px' : 0,
                     position: 'relative',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: 16,
                   }}
                 >
-                  {!result && (
+                  {chatMessages.length === 0 && !running && (
                     <div style={{
                       position: 'absolute', inset: 0,
                       display: 'flex', alignItems: 'center', justifyContent: 'center',
@@ -504,27 +511,46 @@ export default function App() {
                       output will appear here
                     </div>
                   )}
-                  {result && (
-                    <>
-                      {result.job_id && (
-                        <div style={{
-                          marginBottom: 10, paddingBottom: 8,
-                          borderBottom: '1px solid var(--border)',
-                          fontSize: 10, color: 'var(--muted)',
-                        }}>
-                          job <span style={{ color: 'var(--cyan)' }}>{result.job_id}</span>
-                        </div>
-                      )}
+                  {chatMessages.map((msg, i) => (
+                    <div key={i}>
+                      <div style={{
+                        fontSize: 10, letterSpacing: '0.1em', marginBottom: 4,
+                        color: msg.role === 'user' ? 'var(--cyan)' : msg.role === 'error' ? 'var(--red)' : 'var(--green)',
+                        display: 'flex', gap: 10, alignItems: 'center',
+                      }}>
+                        <span>{msg.role === 'user' ? 'you' : msg.role === 'error' ? 'error' : 'ghost'}</span>
+                        {msg.job_id && (
+                          <span style={{ color: 'var(--muted)', fontWeight: 400 }}>
+                            · {msg.job_id.slice(0, 8)}
+                          </span>
+                        )}
+                      </div>
                       <pre style={{
                         whiteSpace: 'pre-wrap', wordBreak: 'break-word',
-                        color: result.ok ? 'var(--text)' : 'var(--red)',
-                        lineHeight: 1.7,
+                        color: msg.role === 'error' ? 'var(--red)' : 'var(--text)',
+                        lineHeight: 1.7, margin: 0,
                       }}>
-                        {result.response}
+                        {msg.content}
                       </pre>
-                    </>
+                    </div>
+                  ))}
+                  {running && (
+                    <div style={{ color: 'var(--muted)', fontSize: 12 }}>
+                      ghost<span className="blink">_</span>
+                    </div>
                   )}
                 </div>
+                {/* Clear conversation */}
+                {chatMessages.length > 0 && (
+                  <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+                    <button
+                      onClick={() => setChatMessages([])}
+                      style={{ background: 'none', color: 'var(--muted)', fontSize: 10, padding: '2px 6px' }}
+                    >
+                      clear
+                    </button>
+                  </div>
+                )}
               </div>
             )}
 

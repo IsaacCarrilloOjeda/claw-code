@@ -143,11 +143,12 @@ pub async fn extract_and_store(pool: sqlx::PgPool, message: String, response: St
 
         match embed(content).await {
             Ok(embedding) => {
-                crate::db::insert_note(&pool, category, content, &embedding).await;
+                crate::db::insert_note(&pool, category, content, Some(&embedding)).await;
                 eprintln!("[ghost memory] stored note [{category}]: {content}");
             }
             Err(e) => {
-                eprintln!("[ghost memory] embed failed for note '{content}': {e}");
+                eprintln!("[ghost memory] embed failed, storing without vector: {e}");
+                crate::db::insert_note(&pool, category, content, None).await;
             }
         }
     }

@@ -274,21 +274,36 @@ fn vec_to_pgvector(v: &[f32]) -> String {
     format!("[{inner}]")
 }
 
-/// Insert a new memory note with its embedding vector.
-pub async fn insert_note(pool: &PgPool, category: &str, content: &str, embedding: &[f32]) -> bool {
+/// Insert a new memory note. `embedding` may be `None` when `OPENAI_API_KEY`
+/// is absent — the note is stored without a vector and won't appear in
+/// semantic search results but will still show in the memory panel.
+pub async fn insert_note(pool: &PgPool, category: &str, content: &str, embedding: Option<&[f32]>) -> bool {
     let id = uuid::Uuid::new_v4().to_string();
-    let embedding_str = vec_to_pgvector(embedding);
-    sqlx::query(
-        "INSERT INTO director_notes (id, category, content, embedding)
-         VALUES ($1::uuid, $2, $3, $4::vector)",
-    )
-    .bind(&id)
-    .bind(category)
-    .bind(content)
-    .bind(&embedding_str)
-    .execute(pool)
-    .await
-    .is_ok()
+    if let Some(emb) = embedding {
+        let embedding_str = vec_to_pgvector(emb);
+        sqlx::query(
+            "INSERT INTO director_notes (id, category, content, embedding)
+             VALUES ($1::uuid, $2, $3, $4::vector)",
+        )
+        .bind(&id)
+        .bind(category)
+        .bind(content)
+        .bind(&embedding_str)
+        .execute(pool)
+        .await
+        .is_ok()
+    } else {
+        sqlx::query(
+            "INSERT INTO director_notes (id, category, content)
+             VALUES ($1::uuid, $2, $3)",
+        )
+        .bind(&id)
+        .bind(category)
+        .bind(content)
+        .execute(pool)
+        .await
+        .is_ok()
+    }
 }
 
 /// Semantic search: return up to `limit` notes ordered by cosine similarity to
