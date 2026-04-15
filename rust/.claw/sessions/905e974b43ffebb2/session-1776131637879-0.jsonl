@@ -1,0 +1,2 @@
+{"created_at_ms":1776131637878,"model":"claude-sonnet-4-6","session_id":"session-1776131637879-0","type":"session_meta","updated_at_ms":1776131637878,"version":1,"workspace_root":"C:\\claw-code\\claw-code\\rust"}
+{"message":{"blocks":[{"text":"hi","type":"text"}],"role":"user"},"type":"message"}

@@ -6,13 +6,16 @@
     clippy::unnecessary_wraps,
     clippy::unused_self
 )]
+mod chat_dispatcher;
 mod daemon;
 mod db;
+mod director;
 mod gerald;
 mod init;
 mod input;
 mod render;
 mod routing;
+mod sms;
 
 use std::collections::BTreeSet;
 use std::env;

@@ -34,7 +34,7 @@ RUN apt-get update && apt-get install -y \
 
 # Copy static binary. Migrations are embedded at compile time (sqlx::migrate!).
 COPY --from=builder /app/rust/target/x86_64-unknown-linux-musl/release/claw /usr/local/bin/claw
-
+COPY ghost-context.txt /app/ghost-context.txt
 EXPOSE 8080
 
 # HOST=0.0.0.0 and PORT are read from env vars (Railway injects PORT automatically).

@@ -487,6 +487,8 @@ async fn dispatch(cfg: &DaemonConfig, raw: &str, uptime_secs: u64) -> (&'static 
             }
             run_prompt(raw).await
         }
+        ("POST", "/sms/inbound") => sms_inbound(cfg, raw).await,
+        ("POST", "/sms/send") => sms_send_handler(raw).await,
         ("OPTIONS", _) => options_preflight(),
         _ => ("404 Not Found", r#"{"error":"not found"}"#.to_owned()),
     }
@@ -745,6 +747,154 @@ fn redact_secrets(s: &str) -> String {
         }
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// SMS endpoints
+// ---------------------------------------------------------------------------
+
+/// `POST /sms/inbound` — receives a webhook from Android SMS Gateway.
+///
+/// Extracts `message` (or `text`) and `phoneNumber` (or `from`) from the JSON
+/// body, creates a job, then spawns a background task to process it. Returns
+/// 200 immediately so the Gateway isn't kept waiting.
+///
+/// Routing:
+///   - starts with `.` → ignore (reserved), return 200
+///   - starts with `!` → Director stub (strip `!`)
+///   - everything else → Chat dispatcher
+async fn sms_inbound(cfg: &DaemonConfig, raw: &str) -> (&'static str, String) {
+    let body_str = raw
+        .split_once("\r\n\r\n")
+        .or_else(|| raw.split_once("\n\n"))
+        .map_or("", |(_, b)| b);
+
+    let Ok(body) = serde_json::from_str::<serde_json::Value>(body_str) else {
+        return (
+            "400 Bad Request",
+            r#"{"error":"body must be JSON"}"#.to_owned(),
+        );
+    };
+
+    // Android SMS Gateway may use either field name.
+    let message = body["message"]
+        .as_str()
+        .or_else(|| body["text"].as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    let phone_from = body["phoneNumber"]
+        .as_str()
+        .or_else(|| body["from"].as_str())
+        .unwrap_or("")
+        .to_string();
+
+    if message.is_empty() {
+        return (
+            "400 Bad Request",
+            r#"{"error":"missing or empty message field"}"#.to_owned(),
+        );
+    }
+
+    // `.` prefix → reserved/ignored for now.
+    if message.starts_with('.') {
+        return ("200 OK", r#"{"status":"ignored"}"#.to_owned());
+    }
+
+    // Determine route and strip prefix if needed.
+    let (agent_name, process_msg) = if let Some(stripped) = message.strip_prefix('!') {
+        ("director", stripped.trim().to_string())
+    } else {
+        ("chat_dispatcher", message.clone())
+    };
+
+    let Some(pool_ref) = cfg.db.as_deref() else {
+        return (
+            "503 Service Unavailable",
+            r#"{"error":"database not configured"}"#.to_owned(),
+        );
+    };
+
+    let Some(job_id) =
+        db::create_job(pool_ref, &message, agent_name, "sms", Some(&phone_from)).await
+    else {
+        return (
+            "500 Internal Server Error",
+            r#"{"error":"failed to create job"}"#.to_owned(),
+        );
+    };
+
+    // Clone what the background task needs — respond 200 before AI call.
+    let pool_arc = Arc::clone(cfg.db.as_ref().unwrap()); // safe: just checked above
+    let job_id_bg = job_id.clone();
+    let use_director = agent_name == "director";
+
+    tokio::spawn(async move {
+        let result = if use_director {
+            crate::director::handle(&process_msg, &job_id_bg).await
+        } else {
+            crate::chat_dispatcher::dispatch(&process_msg, &job_id_bg).await
+        };
+
+        match result {
+            Ok(text) => match crate::sms::send_response(&phone_from, &text, &job_id_bg).await {
+                Ok(()) => {
+                    db::update_job_done(&pool_arc, &job_id_bg, &text).await;
+                }
+                Err(e) => {
+                    eprintln!("[ghost sms] send failed for job {job_id_bg}: {e}");
+                    db::update_job_failed(&pool_arc, &job_id_bg, &e).await;
+                }
+            },
+            Err(e) => {
+                eprintln!("[ghost] processing failed for job {job_id_bg}: {e}");
+                db::update_job_failed(&pool_arc, &job_id_bg, &e).await;
+            }
+        }
+    });
+
+    let resp = serde_json::json!({"status": "accepted", "job_id": job_id}).to_string();
+    ("200 OK", resp)
+}
+
+/// `POST /sms/send` — internal helper to deliver an outbound SMS.
+///
+/// Body: `{"to": "+1234567890", "body": "Hello"}`
+async fn sms_send_handler(raw: &str) -> (&'static str, String) {
+    let body_str = raw
+        .split_once("\r\n\r\n")
+        .or_else(|| raw.split_once("\n\n"))
+        .map_or("", |(_, b)| b);
+
+    let Ok(body) = serde_json::from_str::<serde_json::Value>(body_str) else {
+        return (
+            "400 Bad Request",
+            r#"{"error":"body must be JSON"}"#.to_owned(),
+        );
+    };
+
+    let Some(to) = body["to"].as_str() else {
+        return (
+            "400 Bad Request",
+            r#"{"error":"missing field: to"}"#.to_owned(),
+        );
+    };
+
+    let Some(msg_body) = body["body"].as_str() else {
+        return (
+            "400 Bad Request",
+            r#"{"error":"missing field: body"}"#.to_owned(),
+        );
+    };
+
+    match crate::sms::send_response(to, msg_body, "manual").await {
+        Ok(()) => ("200 OK", r#"{"status":"sent"}"#.to_owned()),
+        Err(e) => {
+            let resp = serde_json::json!({"error": e}).to_string();
+            ("502 Bad Gateway", resp)
+        }
+    }
 }
 
 fn options_preflight() -> (&'static str, String) {

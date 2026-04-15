@@ -108,6 +108,63 @@ fn row_to_job(row: &sqlx::postgres::PgRow) -> Job {
     }
 }
 
+/// Create a new job with `status = 'running'`. Returns the UUID string on
+/// success, `None` on insert failure.
+pub async fn create_job(
+    pool: &PgPool,
+    input: &str,
+    agent: &str,
+    source: &str,
+    phone_from: Option<&str>,
+) -> Option<String> {
+    let id = uuid::Uuid::new_v4().to_string();
+    let result = sqlx::query(
+        "INSERT INTO jobs (id, status, input, agent, source, phone_from)
+         VALUES ($1::uuid, 'running', $2, $3, $4, $5)",
+    )
+    .bind(&id)
+    .bind(input)
+    .bind(agent)
+    .bind(source)
+    .bind(phone_from)
+    .execute(pool)
+    .await;
+
+    match result {
+        Ok(_) => Some(id),
+        Err(e) => {
+            eprintln!("[ghost db] create_job failed: {e}");
+            None
+        }
+    }
+}
+
+/// Mark a job as done, storing the output.
+pub async fn update_job_done(pool: &PgPool, id: &str, output: &str) {
+    let _ = sqlx::query(
+        "UPDATE jobs
+         SET status = 'done', output = $1, completed_at = now(), updated_at = now()
+         WHERE id = $2::uuid",
+    )
+    .bind(output)
+    .bind(id)
+    .execute(pool)
+    .await;
+}
+
+/// Mark a job as failed, storing the error message in `output`.
+pub async fn update_job_failed(pool: &PgPool, id: &str, error: &str) {
+    let _ = sqlx::query(
+        "UPDATE jobs
+         SET status = 'failed', output = $1, completed_at = now(), updated_at = now()
+         WHERE id = $2::uuid",
+    )
+    .bind(error)
+    .bind(id)
+    .execute(pool)
+    .await;
+}
+
 // ---------------------------------------------------------------------------
 // Director config model
 // ---------------------------------------------------------------------------

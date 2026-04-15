@@ -45,17 +45,18 @@ On "." prefix: core context file always loaded + semantic search pulls 3–5 mos
 | Interface | Notes |
 |---|---|
 | SMS (Android SMS Gateway) | Real S25+ number, free, open-source app |
-| SMS (Twilio backup) | Auto-fallback if Gateway unreachable |
+| SMS (backup provider) | Twilio deferred — age restriction. Will replace with TextBelt, email-to-SMS, or ntfy.sh. |
 | Web dashboard | More features than SMS, always functional |
 | Wake word app (Phase 7) | Porcupine (on-device) + Whisper, Android |
 
 ### Prefix Command Language (SMS + Dashboard)
 | Prefix | Behavior |
 |---|---|
-| `.` | Chat dispatcher — fast, semantic context, no agent spawning |
+| (none) | Chat dispatcher — fast, semantic context, no agent spawning |
 | `!` | Force Director + agents (override simple-task logic) |
 | `?` | Research only, no write actions |
 | `>` | Run a named scheduled task immediately |
+| `.` | Ignored — GHOST returns 200 but sends no reply (useful for testing webhook delivery) |
 
 ### Verification Rules
 - **Requires `y`:** email send, calendar create/edit, code push, any phone interaction
@@ -216,12 +217,87 @@ Everything below must be true before Phase 1 starts:
    Second call confirms pgvector ran and `director_config` was seeded.
 6. Set `VITE_DAEMON_URL=https://<your-service>.up.railway.app` in Railway dashboard build env (or `dashboard/.env.production`) so the dashboard points at the live server.
 
-### Phase 1 — SMS Loop
-- [ ] Android SMS Gateway integration (receive + send via real number)
-- [ ] SMS → Director → SMS response loop
-- [ ] "." prefix chat dispatcher with core context file + semantic search
-- [ ] `y` verification flow for flagged actions
-- [ ] Twilio backup with auto-fallback
+### Phase 1 — SMS Loop (CURRENT PHASE)
+
+**Goal:** Wire the full SMS in/out loop. Text GHOST from your S25+, get a response back.
+No specialists yet — Director responds with text only. Phase 1 is about proving the pipe.
+
+#### Prefix routing (locked — matches code)
+| Input | Route | Model |
+|---|---|---|
+| No leading punctuation | Chat dispatcher | Claude Haiku |
+| `!` | Director stub | Sonnet 4.6 |
+| `.` | Ignored — 200 OK, no reply sent | — |
+| `?` | Research only (Phase 3, not yet wired) | — |
+| `>name` | Named scheduled task (Phase 6, not yet wired) | — |
+
+`?` and `>` with no specialist wired → Director responds with plain text stub. Never silent-fail.
+
+#### Long response handling
+- Responses under 500 chars → send as-is
+- Responses 500+ chars → truncate at 497 chars + append dashboard link (3 chars for `...` + link on next segment)
+- Dashboard link format: `ghost.app/jobs/<job-id>` (or Railway URL until custom domain exists)
+- Every Director response (regardless of length) appends the job ID so you can always pull it up
+
+#### Android SMS Gateway setup
+- Install **Android SMS Gateway** app on S25+ (open source, F-Droid or GitHub)
+- App exposes a local HTTP API — GHOST sends outbound SMS by POSTing to it
+- Inbound: app forwards received texts to a webhook URL (your Railway server `POST /sms/inbound`)
+- App must stay running — add to battery optimization whitelist on Samsung
+
+#### New endpoints (Phase 1)
+| Method | Path | Description |
+|---|---|---|
+| POST | `/sms/inbound` | Receives webhook from Android SMS Gateway. Creates job, routes to chat dispatcher or Director. |
+| POST | `/sms/send` | Internal — daemon calls SMS Gateway to send outbound message |
+
+#### SMS backup (deferred)
+- Twilio requires 18+ account — deferred for now
+- `sms.rs` has the fallback path stubbed; will wire to TextBelt, email-to-SMS, or ntfy.sh in a follow-up
+- For now: if Gateway POST fails, GHOST logs the error and the job is marked failed
+- Inbound fallback is not needed — if phone is off, Isaac can't text anyway
+
+#### Chat dispatcher flow (no-prefix messages)
+```
+Inbound SMS → strip whitespace → no leading punctuation?
+    → create job (source=sms, agent=chat_dispatcher)
+    → load core context file (hardcoded path, always injected)
+    → call Haiku with [core context + message]
+    → get response
+    → length check: under 500? send direct. over 500? truncate + job link
+    → POST to SMS Gateway → delivered to your number
+    → mark job done
+```
+
+#### Director flow (! prefix, Phase 1 stub)
+```
+Inbound SMS → starts with !
+    → strip ! → create job (source=sms, agent=director)
+    → call Sonnet Director with [message]
+    → Director responds (no specialists yet — plain text only)
+    → same length check + send
+    → mark job done
+```
+
+#### Core context file
+A plain text file on the server (path in env var `GHOST_CORE_CONTEXT_PATH`) that always gets
+injected into chat dispatcher calls. This is your safety net when semantic search (Phase 2)
+doesn't return the right notes. Start with basics: your name, timezone, current projects,
+preferred response style. You edit it directly — no UI needed until Phase 5.
+
+#### Phase 1 Success Criteria
+- [x] Android SMS Gateway v1.20.0 installed, webhook registered at `https://brave-cat-production-dd8e.up.railway.app/sms/inbound` (webhook ID: `Ky_981sReNwNF7SOEuq-n`)
+- [x] `/sms/inbound`, `/sms/send`, `chat_dispatcher.rs`, `director.rs`, `sms.rs` — all built
+- [x] `ghost-context.txt` written with identity, style, projects, current date
+- [ ] **Push Phase 1 code to GitHub → Railway redeploys** ← next step
+- [ ] Add `COPY ghost-context.txt /app/ghost-context.txt` to Dockerfile
+- [ ] Set Railway env vars: `GHOST_BASE_URL`, `GHOST_SMS_GATEWAY_URL`, `GHOST_CORE_CONTEXT_PATH`
+- [ ] Text GHOST with no prefix → Haiku responds via SMS within 5 seconds
+- [ ] Text GHOST with `!` → Sonnet Director responds via SMS
+- [ ] Response over 500 chars → truncated with job link appended
+- [ ] Job created in Postgres for every inbound message
+- [ ] `GET /jobs` in dashboard shows the conversation history
+- [ ] SMS backup provider wired (TextBelt / email-to-SMS / ntfy.sh) — deferred to follow-up
 
 ### Phase 2 — Memory + Context
 - [ ] Director memory store with categories
@@ -304,7 +380,7 @@ All of these are green-lit in spirit — need design work before implementation:
 | GPT-4o (fallback Director, rare) | $0.50 | $1 | $3 |
 | E2B code sandboxes | $0 | $1 | $3 |
 | Android SMS Gateway | $0 | $0 | $0 |
-| Twilio backup number + messages | $2 | $2 | $2 |
+| SMS backup (TextBelt/email-to-SMS — deferred) | $0 | $0–1 | $1–2 |
 | Whisper (voice transcription) | $0.25 | $0.50 | $1.50 |
 | Brave/Tavily search | $0 | $1 | $3 |
 | **Total** | **~$13** | **~$25** | **~$53** |
@@ -319,7 +395,7 @@ All of these are green-lit in spirit — need design work before implementation:
 | Feature | Monthly Add |
 |---|---|
 | Android SMS Gateway | $0 |
-| Twilio backup | +$2 |
+| SMS backup (deferred) | +$0–2 |
 | Director (Sonnet) | ~$5–10 |
 | Director fallback (GPT-4o) | ~$0.50–2 |
 | Email Agent | $0 (Gmail API free) |
