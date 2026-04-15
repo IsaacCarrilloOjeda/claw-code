@@ -31,6 +31,15 @@ function timeAgo(unix) {
 
 const DAEMON_KEY_STORAGE = 'ghost-daemon-key'
 
+const CATEGORY_COLOR = {
+  personal:  '#00e5ff',
+  projects:  '#00ff88',
+  code:      '#ffb020',
+  style:     '#c678dd',
+  social:    '#56b6c2',
+  calendar:  '#ff3d6b',
+}
+
 async function apiFetch(path, opts = {}, token = null) {
   // Default to a 10s timeout so a hung daemon can't lock the UI forever.
   // Callers can pass their own signal via opts.signal to override.
@@ -198,6 +207,8 @@ export default function App() {
   const [running, setRunning] = useState(false)
   const [result, setResult] = useState(null)
   const [memSearch, setMemSearch] = useState('')
+  const [notes, setNotes] = useState(null)
+  const [notesLoading, setNotesLoading] = useState(false)
   const [activeTab, setActiveTab] = useState('chat')
   const [lastPoll, setLastPoll] = useState(null)
   const [daemonKey, setDaemonKey] = useState(
@@ -280,6 +291,31 @@ export default function App() {
   function handleKeyDown(e) {
     if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) sendPrompt()
   }
+
+  async function loadNotes() {
+    setNotesLoading(true)
+    try {
+      const data = await apiFetch('/memories', {}, daemonKey)
+      if (mountedRef.current) setNotes(data.notes || [])
+    } catch (e) {
+      if (mountedRef.current) setNotes([])
+    } finally {
+      if (mountedRef.current) setNotesLoading(false)
+    }
+  }
+
+  async function deleteNote(id) {
+    try {
+      await apiFetch(`/memories/${id}`, { method: 'DELETE' }, daemonKey)
+      setNotes(prev => prev ? prev.filter(n => n.id !== id) : prev)
+    } catch {
+      // ignore — row may already be gone
+    }
+  }
+
+  useEffect(() => {
+    if (activeTab === 'memory' && notes === null) loadNotes()
+  }, [activeTab])
 
   // ── Layout ────────────────────────────────────────────────────────────────
 
@@ -493,30 +529,87 @@ export default function App() {
             )}
 
             {activeTab === 'memory' && (
-              <div style={{ padding: 20, display: 'flex', flexDirection: 'column', gap: 14 }}>
-                <input
-                  type="text"
-                  placeholder="Search Gerald Brain memories..."
-                  value={memSearch}
-                  onChange={e => setMemSearch(e.target.value)}
-                />
-                <div style={{
-                  padding: 20,
-                  border: '1px solid var(--border)',
-                  borderRadius: 4,
-                  background: '#080a0d',
-                  color: 'var(--muted)',
-                  fontSize: 12,
-                  lineHeight: 1.8,
-                }}>
-                  <div style={{ color: 'var(--amber)', marginBottom: 8, fontWeight: 600 }}>
-                    // coming soon
-                  </div>
-                  Gerald Brain search will live here. The daemon already loads your
-                  memories at session start via <code style={{ color: 'var(--cyan)' }}>get_overview</code>.
-                  <br /><br />
-                  Next: wire <code style={{ color: 'var(--cyan)' }}>GET /memories?q=...</code> into the
-                  daemon and surface results here.
+              <div style={{ display: 'flex', flexDirection: 'column', flex: 1, overflow: 'hidden', padding: 20, gap: 14 }}>
+                {/* Toolbar */}
+                <div style={{ display: 'flex', gap: 10, flexShrink: 0, alignItems: 'center' }}>
+                  <input
+                    type="text"
+                    placeholder="Filter notes..."
+                    value={memSearch}
+                    onChange={e => setMemSearch(e.target.value)}
+                    style={{ flex: 1 }}
+                  />
+                  <button
+                    onClick={loadNotes}
+                    disabled={notesLoading}
+                    style={{
+                      background: 'var(--border)',
+                      color: 'var(--text)',
+                      flexShrink: 0,
+                      padding: '8px 14px',
+                    }}
+                  >
+                    {notesLoading ? '...' : 'refresh'}
+                  </button>
+                </div>
+
+                {/* Notes list */}
+                <div style={{ flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 6 }}>
+                  {notesLoading && notes === null && (
+                    <div style={{ color: 'var(--muted)', fontSize: 12, padding: 8 }}>loading<span className="blink">_</span></div>
+                  )}
+                  {!notesLoading && notes !== null && notes.length === 0 && (
+                    <div style={{ color: 'var(--muted)', fontSize: 12, padding: 8 }}>
+                      no memories yet — GHOST learns as you chat
+                    </div>
+                  )}
+                  {notes && notes
+                    .filter(n => !memSearch || n.content.toLowerCase().includes(memSearch.toLowerCase()) || n.category.toLowerCase().includes(memSearch.toLowerCase()))
+                    .map(note => (
+                      <div key={note.id} style={{
+                        display: 'flex', alignItems: 'flex-start', gap: 10,
+                        background: '#080a0d',
+                        border: '1px solid var(--border)',
+                        borderRadius: 4,
+                        padding: '10px 12px',
+                      }}>
+                        <span style={{
+                          flexShrink: 0,
+                          fontSize: 9,
+                          fontWeight: 700,
+                          letterSpacing: '0.08em',
+                          textTransform: 'uppercase',
+                          color: '#000',
+                          background: CATEGORY_COLOR[note.category] || 'var(--muted)',
+                          borderRadius: 3,
+                          padding: '2px 6px',
+                          marginTop: 1,
+                        }}>
+                          {note.category}
+                        </span>
+                        <span style={{ flex: 1, color: 'var(--text)', fontSize: 12, lineHeight: 1.6 }}>
+                          {note.content}
+                        </span>
+                        <span style={{ flexShrink: 0, color: 'var(--muted)', fontSize: 10, marginTop: 2 }}>
+                          {note.created_at?.slice(0, 10)}
+                        </span>
+                        <button
+                          onClick={() => deleteNote(note.id)}
+                          style={{
+                            flexShrink: 0,
+                            background: 'none',
+                            color: 'var(--muted)',
+                            padding: '0 4px',
+                            fontSize: 14,
+                            lineHeight: 1,
+                          }}
+                          title="Delete note"
+                        >
+                          ×
+                        </button>
+                      </div>
+                    ))
+                  }
                 </div>
               </div>
             )}

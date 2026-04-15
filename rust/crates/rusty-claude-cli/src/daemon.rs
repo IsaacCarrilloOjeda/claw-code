@@ -487,6 +487,11 @@ async fn dispatch(cfg: &DaemonConfig, raw: &str, uptime_secs: u64) -> (&'static 
             }
             run_prompt(raw).await
         }
+        ("GET", "/memories") => memories_list(cfg.db.as_deref()).await,
+        ("DELETE", p) if p.starts_with("/memories/") => {
+            let id = &p["/memories/".len()..];
+            memory_delete(cfg.db.as_deref(), raw, id).await
+        }
         ("POST", "/chat") => chat_handler(cfg, raw).await,
         ("POST", "/sms/inbound") => sms_inbound(cfg, raw).await,
         ("POST", "/sms/send") => sms_send_handler(raw).await,
@@ -999,6 +1004,37 @@ async fn sms_send_handler(raw: &str) -> (&'static str, String) {
 
 fn options_preflight() -> (&'static str, String) {
     ("204 No Content", String::new())
+}
+
+/// `GET /memories` — list up to 200 non-expired memory notes.
+async fn memories_list(db: Option<&PgPool>) -> (&'static str, String) {
+    let Some(pool) = db else {
+        return (
+            "503 Service Unavailable",
+            r#"{"error":"database not configured"}"#.to_owned(),
+        );
+    };
+    let notes = db::list_notes(pool, 200).await;
+    ("200 OK", serde_json::json!({ "notes": notes }).to_string())
+}
+
+/// `DELETE /memories/:id` — delete a single memory note by UUID.
+/// Requires bearer auth (same key as `/chat`).
+async fn memory_delete(db: Option<&PgPool>, raw: &str, id: &str) -> (&'static str, String) {
+    if configured_key().is_some() && !auth_matches(raw) {
+        return ("401 Unauthorized", r#"{"error":"unauthorized"}"#.to_owned());
+    }
+    let Some(pool) = db else {
+        return (
+            "503 Service Unavailable",
+            r#"{"error":"database not configured"}"#.to_owned(),
+        );
+    };
+    if db::delete_note(pool, id).await {
+        ("200 OK", r#"{"status":"deleted"}"#.to_owned())
+    } else {
+        ("404 Not Found", r#"{"error":"not found"}"#.to_owned())
+    }
 }
 
 // ---------------------------------------------------------------------------
