@@ -672,6 +672,7 @@ async fn run_prompt(raw: &str) -> (&'static str, String) {
         "--model",
         model,
         "--dangerously-skip-permissions",
+        "--allow-broad-cwd",
         "--output-format",
         "json",
         "prompt",
