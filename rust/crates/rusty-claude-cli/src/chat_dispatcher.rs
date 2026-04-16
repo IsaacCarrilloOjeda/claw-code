@@ -30,7 +30,9 @@ pub async fn dispatch(
 
     let core_context = load_core_context();
     let memory_context = load_memory_context(message, pool).await;
-    let web_context = if should_search(message) {
+    let do_search = should_search(message);
+    eprintln!("[ghost chat] should_search={do_search} for: {message}");
+    let web_context = if do_search {
         load_web_context(message).await
     } else {
         String::new()

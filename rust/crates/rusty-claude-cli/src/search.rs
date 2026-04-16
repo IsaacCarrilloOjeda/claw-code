@@ -24,7 +24,10 @@ pub struct SearchResult {
 pub async fn web_search(query: &str) -> Result<Vec<SearchResult>, String> {
     let api_key = match std::env::var("BRAVE_API_KEY") {
         Ok(k) if !k.trim().is_empty() => k,
-        _ => return Ok(vec![]),
+        _ => {
+            eprintln!("[ghost search] BRAVE_API_KEY not set — skipping web search");
+            return Ok(vec![]);
+        }
     };
 
     let client = crate::http_client::shared_client();
