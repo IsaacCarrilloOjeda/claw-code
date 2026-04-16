@@ -1,10 +1,10 @@
 //! Memory system for GHOST — embeddings, semantic search, and note extraction.
 //!
 //! `embed()` tries providers in order:
-//!   1. `VOYAGE_API_KEY` → Voyage AI `voyage-3` with `output_dimension=1536`
-//!   2. `OPENAI_API_KEY` → `OpenAI` `text-embedding-3-small` (1536 dims)
+//!   1. `VOYAGE_API_KEY` → Voyage AI `voyage-3` with `output_dimension=1024`
+//!   2. `OPENAI_API_KEY` → `OpenAI` `text-embedding-3-small` (1024 dims)
 //!
-//! Both produce 1536-dim vectors matching the DB schema. When neither key is
+//! Both produce 1024-dim vectors matching the DB schema. When neither key is
 //! set, `embed()` returns `Err` and notes are stored without a vector.
 //!
 //! `extract_and_store()` is fire-and-forget: call via `tokio::spawn` after a
@@ -14,7 +14,7 @@ use std::time::Duration;
 
 const VOYAGE_EMBED_URL: &str = "https://api.voyageai.com/v1/embeddings";
 const VOYAGE_EMBED_MODEL: &str = "voyage-3";
-const VOYAGE_OUTPUT_DIM: u32 = 1536; // match DB VECTOR(1536)
+const VOYAGE_OUTPUT_DIM: u32 = 1024; // match DB VECTOR(1024)
 
 const OPENAI_EMBED_URL: &str = "https://api.openai.com/v1/embeddings";
 const OPENAI_EMBED_MODEL: &str = "text-embedding-3-small";
@@ -24,7 +24,7 @@ use crate::constants::{ANTHROPIC_MESSAGES_URL, HAIKU_MODEL};
 const EMBED_TIMEOUT_SECS: u64 = 10;
 const EXTRACT_TIMEOUT_SECS: u64 = 15;
 
-/// Embed `text` as a 1536-dim vector.
+/// Embed `text` as a 1024-dim vector.
 ///
 /// Tries Voyage AI first (`VOYAGE_API_KEY`), then `OpenAI` (`OPENAI_API_KEY`).
 /// Returns `Err` if no key is available or the API call fails.
@@ -76,6 +76,7 @@ async fn embed_openai(text: &str, api_key: &str) -> Result<Vec<f32>, String> {
     let body = serde_json::json!({
         "model": OPENAI_EMBED_MODEL,
         "input": text,
+        "dimensions": VOYAGE_OUTPUT_DIM,
     });
 
     let resp = client

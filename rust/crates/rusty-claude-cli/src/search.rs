@@ -36,7 +36,8 @@ pub async fn web_search(query: &str) -> Result<Vec<SearchResult>, String> {
         .get(BRAVE_SEARCH_URL)
         .timeout(Duration::from_secs(SEARCH_TIMEOUT_SECS))
         .header("Accept", "application/json")
-        .header("Accept-Encoding", "gzip")
+        // Note: don't send Accept-Encoding: gzip — reqwest is not built with
+        // the `gzip` feature, so the compressed response can't be decoded.
         .header("X-Subscription-Token", api_key.trim())
         .query(&[
             ("q", query),
