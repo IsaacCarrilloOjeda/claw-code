@@ -58,24 +58,42 @@ pub async fn web_search(query: &str) -> Result<Vec<SearchResult>, String> {
         .await
         .map_err(|e| format!("Failed to parse Brave response: {e}"))?;
 
-    let results = json["web"]["results"]
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|item| {
-                    let title = item["title"].as_str()?.to_string();
-                    let url = item["url"].as_str()?.to_string();
-                    let description = item["description"].as_str().unwrap_or("").to_string();
-                    Some(SearchResult {
-                        title,
-                        url,
-                        description,
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    // Log raw response structure for debugging
+    let web_obj = &json["web"];
+    if web_obj.is_null() {
+        eprintln!("[ghost search] Brave response has no 'web' key. Top-level keys: {:?}",
+            json.as_object().map(|o| o.keys().collect::<Vec<_>>()).unwrap_or_default());
+        return Ok(vec![]);
+    }
 
+    let results_arr = web_obj["results"].as_array();
+    if results_arr.is_none() {
+        eprintln!("[ghost search] Brave 'web' object has no 'results' array. Keys: {:?}",
+            web_obj.as_object().map(|o| o.keys().collect::<Vec<_>>()).unwrap_or_default());
+        return Ok(vec![]);
+    }
+
+    let results: Vec<SearchResult> = results_arr
+        .unwrap()
+        .iter()
+        .filter_map(|item| {
+            let title = item["title"].as_str()?.to_string();
+            let url = item["url"].as_str()?.to_string();
+            // Brave uses "description" but some endpoints use "snippet"
+            let description = item["description"]
+                .as_str()
+                .or_else(|| item["snippet"].as_str())
+                .unwrap_or("")
+                .to_string();
+            Some(SearchResult {
+                title,
+                url,
+                description,
+            })
+        })
+        .collect();
+
+    eprintln!("[ghost search] parsed {} result(s) from Brave response", results.len());
     Ok(results)
 }
 

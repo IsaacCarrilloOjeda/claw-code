@@ -51,8 +51,11 @@ pub async fn dispatch(
         system.push_str("\n</memory_notes>");
     }
     if !web_context.is_empty() {
+        eprintln!("[ghost chat] injecting {} bytes of web context", web_context.len());
         system.push_str("\n\n## Current web search results\nUse these results to answer the user's question:\n");
         system.push_str(&web_context);
+    } else {
+        eprintln!("[ghost chat] web_context is empty — nothing to inject");
     }
 
     let mut messages: Vec<serde_json::Value> = history.to_vec();
