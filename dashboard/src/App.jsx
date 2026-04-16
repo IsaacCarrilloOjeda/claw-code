@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
+import ReactMarkdown from 'react-markdown'
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
@@ -970,14 +971,13 @@ function ChatThread({ messages, running, alive, selectedAgents, onSend }) {
                     </span>
                   )}
                 </div>
-                <pre style={{
-                  whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+                <div className="ghost-md" style={{
                   color: msg.role === 'error' ? 'var(--red)' : 'var(--text)',
-                  lineHeight: 1.6, margin: 0,
+                  lineHeight: 1.6,
                   fontFamily: 'var(--mono)', fontSize: 12,
                 }}>
-                  {msg.content}
-                </pre>
+                  <ReactMarkdown>{msg.content}</ReactMarkdown>
+                </div>
               </div>
             )}
           </div>
