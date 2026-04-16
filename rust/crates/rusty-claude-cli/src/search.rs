@@ -27,13 +27,11 @@ pub async fn web_search(query: &str) -> Result<Vec<SearchResult>, String> {
         _ => return Ok(vec![]),
     };
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(SEARCH_TIMEOUT_SECS))
-        .build()
-        .map_err(|e| format!("HTTP client error: {e}"))?;
+    let client = crate::http_client::shared_client();
 
     let resp = client
         .get(BRAVE_SEARCH_URL)
+        .timeout(Duration::from_secs(SEARCH_TIMEOUT_SECS))
         .header("Accept", "application/json")
         .header("Accept-Encoding", "gzip")
         .header("X-Subscription-Token", api_key.trim())
@@ -64,11 +62,12 @@ pub async fn web_search(query: &str) -> Result<Vec<SearchResult>, String> {
                 .filter_map(|item| {
                     let title = item["title"].as_str()?.to_string();
                     let url = item["url"].as_str()?.to_string();
-                    let description = item["description"]
-                        .as_str()
-                        .unwrap_or("")
-                        .to_string();
-                    Some(SearchResult { title, url, description })
+                    let description = item["description"].as_str().unwrap_or("").to_string();
+                    Some(SearchResult {
+                        title,
+                        url,
+                        description,
+                    })
                 })
                 .collect()
         })
@@ -82,15 +81,7 @@ pub fn format_results(results: &[SearchResult]) -> String {
     results
         .iter()
         .enumerate()
-        .map(|(i, r)| {
-            format!(
-                "{}. {}\n   {}\n   {}",
-                i + 1,
-                r.title,
-                r.url,
-                r.description
-            )
-        })
+        .map(|(i, r)| format!("{}. {}\n   {}\n   {}", i + 1, r.title, r.url, r.description))
         .collect::<Vec<_>>()
         .join("\n\n")
 }

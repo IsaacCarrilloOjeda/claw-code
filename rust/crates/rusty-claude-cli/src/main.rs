@@ -7,10 +7,12 @@
     clippy::unused_self
 )]
 mod chat_dispatcher;
+mod constants;
 mod daemon;
 mod db;
 mod director;
 mod gerald;
+mod http_client;
 mod init;
 mod input;
 mod memory;

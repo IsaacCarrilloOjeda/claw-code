@@ -17,7 +17,11 @@
 /// Returns the model string to use for this prompt, or `None` if routing is
 /// disabled or the current model is already overridden.
 pub fn route_model(prompt: &str) -> Option<String> {
-    if std::env::var("CLAW_ROUTING").unwrap_or_default() != "1" {
+    // GHOST_ prefix takes precedence; fall back to legacy CLAW_ROUTING.
+    let routing_val = std::env::var("GHOST_ROUTING")
+        .or_else(|_| std::env::var("CLAW_ROUTING"))
+        .unwrap_or_default();
+    if routing_val != "1" {
         return None;
     }
     Some(classify(prompt, has_openai_key()).to_string())

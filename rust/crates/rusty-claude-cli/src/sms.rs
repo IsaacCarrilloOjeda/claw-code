@@ -45,13 +45,11 @@ async fn send_via_gateway(to: &str, body: &str) -> Result<(), String> {
         "phoneNumbers": [to],
     });
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(SMS_TIMEOUT_SECS))
-        .build()
-        .map_err(|e| format!("HTTP client build error: {e}"))?;
+    let client = crate::http_client::shared_client();
 
     let resp = client
         .post(&url)
+        .timeout(Duration::from_secs(SMS_TIMEOUT_SECS))
         .json(&payload)
         .send()
         .await
@@ -80,13 +78,11 @@ async fn send_via_twilio(to: &str, body: &str) -> Result<(), String> {
         percent_encode(body),
     );
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(SMS_TIMEOUT_SECS))
-        .build()
-        .map_err(|e| format!("HTTP client build error: {e}"))?;
+    let client = crate::http_client::shared_client();
 
     let resp = client
         .post(&url)
+        .timeout(Duration::from_secs(SMS_TIMEOUT_SECS))
         .basic_auth(&sid, Some(&auth))
         .header("content-type", "application/x-www-form-urlencoded")
         .body(encoded)

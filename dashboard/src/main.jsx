@@ -14,46 +14,52 @@ class ErrorBoundary extends Component {
   }
 
   componentDidCatch(error, info) {
-    console.error('[dashboard] uncaught render error', error, info)
+    console.error('[ghost-dashboard] uncaught render error', error, info)
   }
 
   render() {
     if (this.state.error) {
       return (
         <div style={{
-          fontFamily: 'IBM Plex Mono, monospace',
-          background: '#0d0d0f',
-          color: '#c8d0e0',
+          fontFamily: "'IBM Plex Mono', monospace",
+          background: '#08090b',
+          color: '#c9d1d9',
           minHeight: '100vh',
-          padding: 32,
+          display: 'flex',
+          flexDirection: 'column',
+          alignItems: 'center',
+          justifyContent: 'center',
+          padding: 40,
+          gap: 20,
         }}>
-          <h1 style={{ color: '#ff3d6b', fontSize: 16, marginBottom: 16 }}>
-            dashboard crashed
-          </h1>
+          <div style={{ color: '#f43f5e', fontSize: 14, fontWeight: 600, letterSpacing: '0.05em' }}>
+            GHOST DASHBOARD CRASHED
+          </div>
           <pre style={{
-            background: '#080a0d',
-            border: '1px solid #1e2330',
-            padding: 16,
-            borderRadius: 4,
+            background: '#0c0e12',
+            border: '1px solid #1a1f2e',
+            padding: 20,
+            borderRadius: 6,
             fontSize: 12,
             whiteSpace: 'pre-wrap',
             wordBreak: 'break-word',
-            marginBottom: 16,
+            maxWidth: 600,
+            width: '100%',
+            color: '#c9d1d9',
           }}>
             {String(this.state.error?.stack ?? this.state.error)}
           </pre>
           <button
             onClick={() => window.location.reload()}
             style={{
-              background: '#00e5ff',
-              color: '#000',
+              background: '#2dd4bf',
+              color: '#08090b',
               border: 'none',
-              padding: '8px 18px',
-              borderRadius: 3,
-              fontFamily: 'inherit',
+              padding: '8px 24px',
+              borderRadius: 4,
               fontSize: 12,
               fontWeight: 600,
-              letterSpacing: '0.08em',
+              letterSpacing: '0.06em',
               textTransform: 'uppercase',
               cursor: 'pointer',
             }}

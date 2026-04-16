@@ -1,230 +1,1604 @@
-import { useState, useEffect, useRef, useCallback } from 'react'
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 
-// VITE_DAEMON_URL lets the dashboard point at a Railway-deployed daemon.
-// Falls back to localhost for local dev (npm run dev).
+// ─── Config ──────────────────────────────────────────────────────────────────
+
 const API = import.meta.env.VITE_DAEMON_URL || 'http://127.0.0.1:7878'
+const STORAGE_KEY = 'ghost-daemon-key'
+const PROJECTS_KEY = 'ghost-projects'
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+const AGENTS = [
+  { id: 'echo',     label: 'Echo',     color: '#2dd4bf' },
+  { id: 'research', label: 'Research', color: '#3b82f6' },
+  { id: 'email',    label: 'Email',    color: '#a78bfa' },
+  { id: 'calendar', label: 'Calendar', color: '#f59e0b' },
+  { id: 'code',     label: 'Code',     color: '#34d399' },
+  { id: 'itguide',  label: 'IT Guide', color: '#22d3ee' },
+  { id: 'law',      label: 'Law',      color: '#f43f5e' },
+]
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+function uid() {
+  return crypto.randomUUID?.() ?? Math.random().toString(36).slice(2, 10)
+}
 
 function fmtUptime(secs) {
-  if (secs < 60) return `${secs}s`
-  if (secs < 3600) return `${Math.floor(secs / 60)}m ${secs % 60}s`
-  const h = Math.floor(secs / 3600)
+  if (secs == null) return '--'
+  const d = Math.floor(secs / 86400)
+  const h = Math.floor((secs % 86400) / 3600)
   const m = Math.floor((secs % 3600) / 60)
-  return `${h}h ${m}m`
-}
-
-function fmtBytes(b) {
-  if (b < 1024) return `${b} B`
-  if (b < 1024 ** 2) return `${(b / 1024).toFixed(1)} KB`
-  return `${(b / 1024 ** 2).toFixed(1)} MB`
-}
-
-function timeAgo(unix) {
-  if (!unix) return '—'
-  const diff = Math.floor(Date.now() / 1000) - unix
-  if (diff < 60) return `${diff}s ago`
-  if (diff < 3600) return `${Math.floor(diff / 60)}m ago`
-  if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`
-  return `${Math.floor(diff / 86400)}d ago`
-}
-
-const DAEMON_KEY_STORAGE = 'ghost-daemon-key'
-
-const CATEGORY_COLOR = {
-  personal:  '#00e5ff',
-  projects:  '#00ff88',
-  code:      '#ffb020',
-  style:     '#c678dd',
-  social:    '#56b6c2',
-  calendar:  '#ff3d6b',
+  if (d > 0) return `${d}d ${h}h`
+  if (h > 0) return `${h}h ${m}m`
+  if (m > 0) return `${m}m`
+  return `${secs}s`
 }
 
 async function apiFetch(path, opts = {}, token = null) {
-  // Default to a 10s timeout so a hung daemon can't lock the UI forever.
-  // Callers can pass their own signal via opts.signal to override.
-  const signal = opts.signal ?? AbortSignal.timeout(10_000)
   const headers = { ...(opts.headers || {}) }
   if (token) headers['Authorization'] = `Bearer ${token}`
+  const signal = opts.signal ?? AbortSignal.timeout(10_000)
   const r = await fetch(`${API}${path}`, { ...opts, headers, signal })
-  if (!r.ok) throw new Error(`${r.status} ${r.statusText}`)
+  if (!r.ok) throw new Error(`${r.status}`)
   return r.json()
 }
 
-// ─── Styles ───────────────────────────────────────────────────────────────────
+function loadProjects() {
+  try {
+    const raw = localStorage.getItem(PROJECTS_KEY)
+    if (raw) return JSON.parse(raw)
+  } catch { /* ignore */ }
+  return [{ id: uid(), name: 'Default', expanded: true, chats: [{ id: uid(), name: 'General', messages: [] }] }]
+}
 
-const CSS = `
-  @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Syne:wght@700;800&display=swap');
+function saveProjects(projects) {
+  localStorage.setItem(PROJECTS_KEY, JSON.stringify(projects))
+}
 
-  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+// ─── Auth Screen ─────────────────────────────────────────────────────────────
 
-  :root {
-    --bg:       #0d0d0f;
-    --surface:  #111318;
-    --border:   #1e2330;
-    --cyan:     #00e5ff;
-    --green:    #00ff88;
-    --red:      #ff3d6b;
-    --amber:    #ffb020;
-    --muted:    #4a5568;
-    --text:     #c8d0e0;
-    --mono:     'IBM Plex Mono', monospace;
-    --display:  'Syne', sans-serif;
+function AuthScreen({ onAuth }) {
+  const [key, setKey] = useState('')
+  const [checking, setChecking] = useState(false)
+  const [error, setError] = useState(null)
+  const inputRef = useRef(null)
+
+  useEffect(() => { inputRef.current?.focus() }, [])
+
+  async function submit(e) {
+    e.preventDefault()
+    if (!key.trim()) return
+    setChecking(true)
+    setError(null)
+    try {
+      // First check if daemon is reachable at all (health is open)
+      await apiFetch('/health', { signal: AbortSignal.timeout(6_000) })
+    } catch {
+      setChecking(false)
+      setError('daemon unreachable')
+      return
+    }
+    try {
+      // Validate key against a protected endpoint
+      await fetch(`${API}/director/config`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${key.trim()}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({}),
+        signal: AbortSignal.timeout(6_000),
+      }).then(r => {
+        // 401 = wrong key. Anything else (200, 400, 500) means the key was accepted.
+        if (r.status === 401) throw new Error('401')
+      })
+      localStorage.setItem(STORAGE_KEY, key.trim())
+      onAuth(key.trim())
+    } catch (err) {
+      if (err.message.includes('401')) {
+        setError('wrong key')
+      } else {
+        // Key might be valid but endpoint errored for another reason — let them in
+        localStorage.setItem(STORAGE_KEY, key.trim())
+        onAuth(key.trim())
+      }
+    } finally {
+      setChecking(false)
+    }
   }
 
-  html, body, #root {
-    height: 100%;
-    background: var(--bg);
-    color: var(--text);
-    font-family: var(--mono);
-    font-size: 13px;
-    line-height: 1.5;
-    overflow: hidden;
-  }
-
-  /* Scan line overlay */
-  body::before {
-    content: '';
-    position: fixed;
-    inset: 0;
-    background: repeating-linear-gradient(
-      to bottom,
-      transparent,
-      transparent 2px,
-      rgba(0,0,0,0.04) 2px,
-      rgba(0,0,0,0.04) 4px
-    );
-    pointer-events: none;
-    z-index: 9999;
-  }
-
-  ::-webkit-scrollbar { width: 4px; }
-  ::-webkit-scrollbar-track { background: transparent; }
-  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
-
-  .session-row { transition: background 0.1s; cursor: default; }
-  .session-row:hover { background: #161a24; }
-
-  .pulse {
-    animation: pulse 2s ease-in-out infinite;
-  }
-  @keyframes pulse {
-    0%, 100% { opacity: 1; }
-    50% { opacity: 0.3; }
-  }
-
-  .blink {
-    animation: blink 1s step-end infinite;
-  }
-  @keyframes blink {
-    0%, 100% { opacity: 1; }
-    50% { opacity: 0; }
-  }
-
-  textarea {
-    resize: none;
-    font-family: var(--mono);
-    font-size: 13px;
-    background: #080a0d;
-    color: var(--text);
-    border: 1px solid var(--border);
-    border-radius: 4px;
-    padding: 10px 12px;
-    width: 100%;
-    outline: none;
-    transition: border-color 0.2s;
-    line-height: 1.6;
-  }
-  textarea:focus { border-color: var(--cyan); }
-
-  button {
-    font-family: var(--mono);
-    font-size: 12px;
-    font-weight: 600;
-    cursor: pointer;
-    border: none;
-    border-radius: 3px;
-    padding: 8px 18px;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-    transition: all 0.15s;
-  }
-
-  input[type=text] {
-    font-family: var(--mono);
-    font-size: 13px;
-    background: #080a0d;
-    color: var(--text);
-    border: 1px solid var(--border);
-    border-radius: 4px;
-    padding: 8px 12px;
-    outline: none;
-    width: 100%;
-    transition: border-color 0.2s;
-  }
-  input[type=text]:focus { border-color: var(--cyan); }
-`
-
-// ─── Sub-components ───────────────────────────────────────────────────────────
-
-function Dot({ alive }) {
   return (
-    <span style={{
-      display: 'inline-block',
-      width: 8, height: 8,
-      borderRadius: '50%',
-      background: alive ? 'var(--green)' : 'var(--red)',
-      boxShadow: alive ? '0 0 8px var(--green)' : '0 0 8px var(--red)',
-      flexShrink: 0,
-    }} className={alive ? 'pulse' : ''} />
+    <div style={{
+      height: '100vh',
+      display: 'flex',
+      flexDirection: 'column',
+      alignItems: 'center',
+      justifyContent: 'center',
+      background: 'var(--bg)',
+      gap: 0,
+    }}>
+      {error && (
+        <div style={{
+          position: 'fixed', top: 0, left: 0, right: 0,
+          background: 'rgba(244,63,94,0.12)',
+          borderBottom: '1px solid rgba(244,63,94,0.3)',
+          color: '#f43f5e',
+          fontSize: 12,
+          fontWeight: 600,
+          padding: '8px 16px',
+          textAlign: 'center',
+          letterSpacing: '0.04em',
+        }}>
+          {error}
+        </div>
+      )}
+
+      <div style={{
+        fontFamily: 'var(--sans)',
+        fontSize: 28,
+        fontWeight: 700,
+        color: 'var(--accent)',
+        letterSpacing: '-0.03em',
+        marginBottom: 8,
+      }}>
+        GHOST
+      </div>
+      <div style={{ color: 'var(--text-muted)', fontSize: 12, marginBottom: 32 }}>
+        enter daemon key
+      </div>
+
+      <form onSubmit={submit} style={{ display: 'flex', gap: 8, width: 340 }}>
+        <input
+          ref={inputRef}
+          type="password"
+          value={key}
+          onChange={e => { setKey(e.target.value); setError(null) }}
+          placeholder="GHOST_DAEMON_KEY"
+          autoComplete="off"
+          spellCheck={false}
+          style={{
+            flex: 1,
+            fontFamily: 'var(--mono)',
+            fontSize: 13,
+            background: 'var(--surface)',
+            color: 'var(--text)',
+            border: `1px solid ${error ? 'var(--red)' : 'var(--border)'}`,
+            borderRadius: 'var(--radius)',
+            padding: '10px 14px',
+            outline: 'none',
+            transition: 'border-color var(--transition)',
+          }}
+          onFocus={e => { if (!error) e.target.style.borderColor = 'var(--accent)' }}
+          onBlur={e => { if (!error) e.target.style.borderColor = 'var(--border)' }}
+        />
+        <button
+          type="submit"
+          disabled={checking || !key.trim()}
+          style={{
+            fontFamily: 'var(--mono)',
+            fontSize: 12,
+            fontWeight: 600,
+            padding: '10px 20px',
+            background: checking || !key.trim() ? 'var(--border)' : 'var(--accent)',
+            color: checking || !key.trim() ? 'var(--text-muted)' : 'var(--bg)',
+            border: 'none',
+            borderRadius: 'var(--radius)',
+            cursor: checking || !key.trim() ? 'default' : 'pointer',
+            letterSpacing: '0.04em',
+            textTransform: 'uppercase',
+            transition: 'all var(--transition)',
+          }}
+        >
+          {checking ? '...' : 'enter'}
+        </button>
+      </form>
+
+      {error === 'wrong key' && (
+        <div style={{ color: 'var(--red)', fontSize: 12, marginTop: 12 }}>
+          wrong key
+        </div>
+      )}
+    </div>
   )
 }
 
-function StatChip({ label, value, accent }) {
+// ─── Top Bar ─────────────────────────────────────────────────────────────────
+
+function TopBar({ alive, status, openTabs, activeTabId, onSelectTab, onCloseTab }) {
+  return (
+    <header style={{
+      display: 'flex',
+      alignItems: 'center',
+      height: 'var(--topbar-h)',
+      background: 'var(--surface)',
+      borderBottom: '1px solid var(--border)',
+      padding: '0 16px',
+      flexShrink: 0,
+      gap: 0,
+      overflow: 'hidden',
+    }}>
+      {/* Health dot + GHOST */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 }}>
+        <span style={{
+          width: 7, height: 7,
+          borderRadius: '50%',
+          background: alive ? 'var(--green)' : 'var(--red)',
+          boxShadow: alive ? '0 0 6px var(--green)' : '0 0 6px var(--red)',
+          display: 'inline-block',
+        }} />
+        <span style={{
+          fontWeight: 700,
+          fontSize: 13,
+          color: 'var(--accent)',
+          letterSpacing: '-0.02em',
+        }}>GHOST</span>
+      </div>
+
+      {/* Uptime */}
+      <span style={{
+        color: 'var(--text-muted)',
+        fontSize: 11,
+        fontFamily: 'var(--mono)',
+        marginLeft: 10,
+        flexShrink: 0,
+      }}>
+        {status ? fmtUptime(status.uptime_secs) : '--'}
+      </span>
+
+      {/* Divider */}
+      <div style={{
+        width: 1, height: 20,
+        background: 'var(--border)',
+        margin: '0 12px',
+        flexShrink: 0,
+      }} />
+
+      {/* Chat tabs */}
+      <div style={{
+        display: 'flex',
+        gap: 2,
+        overflow: 'hidden',
+        flex: 1,
+        minWidth: 0,
+      }}>
+        {openTabs.map(tab => {
+          const isActive = tab.id === activeTabId
+          const tabColor = isActive ? 'var(--blue)' : 'var(--green)'
+          return (
+            <div
+              key={tab.id}
+              onClick={() => onSelectTab(tab.id)}
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: 6,
+                padding: '4px 10px',
+                background: isActive ? 'var(--surface-2)' : 'transparent',
+                borderRadius: 'var(--radius-sm)',
+                cursor: 'pointer',
+                flexShrink: 0,
+                maxWidth: 160,
+                transition: 'background var(--transition)',
+              }}
+              onMouseEnter={e => { if (!isActive) e.currentTarget.style.background = 'var(--bg-raised)' }}
+              onMouseLeave={e => { if (!isActive) e.currentTarget.style.background = 'transparent' }}
+            >
+              <span style={{
+                width: 5, height: 5,
+                borderRadius: '50%',
+                background: tabColor,
+                flexShrink: 0,
+              }} />
+              <span style={{
+                fontSize: 11,
+                color: isActive ? 'var(--text-bright)' : 'var(--text-muted)',
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+                whiteSpace: 'nowrap',
+                fontWeight: isActive ? 600 : 400,
+              }}>
+                {tab.name}
+              </span>
+              <span
+                onClick={e => { e.stopPropagation(); onCloseTab(tab.id) }}
+                style={{
+                  fontSize: 13,
+                  color: 'var(--text-dim)',
+                  cursor: 'pointer',
+                  lineHeight: 1,
+                  padding: '0 2px',
+                  flexShrink: 0,
+                }}
+                onMouseEnter={e => e.target.style.color = 'var(--red)'}
+                onMouseLeave={e => e.target.style.color = 'var(--text-dim)'}
+              >
+                x
+              </span>
+            </div>
+          )
+        })}
+      </div>
+    </header>
+  )
+}
+
+// ─── Job Banner ──────────────────────────────────────────────────────────────
+
+function JobBanner({ job, onDismiss }) {
+  if (!job) return null
   return (
     <div style={{
-      display: 'flex', flexDirection: 'column', gap: 2,
-      padding: '6px 14px',
-      borderLeft: '1px solid var(--border)',
+      height: 'var(--banner-h)',
+      background: 'var(--accent-dim)',
+      borderBottom: '1px solid var(--border)',
+      display: 'flex',
+      alignItems: 'center',
+      padding: '0 16px',
+      fontSize: 11,
+      fontFamily: 'var(--mono)',
+      gap: 12,
+      flexShrink: 0,
     }}>
-      <span style={{ color: 'var(--muted)', fontSize: 10, textTransform: 'uppercase', letterSpacing: '0.1em' }}>
-        {label}
-      </span>
-      <span style={{ color: accent || 'var(--text)', fontWeight: 600, fontSize: 13 }}>
-        {value ?? '—'}
+      <span style={{
+        width: 6, height: 6,
+        borderRadius: '50%',
+        background: 'var(--accent)',
+        animation: 'pulse 1.5s ease-in-out infinite',
+      }} />
+      <span style={{ color: 'var(--accent)', fontWeight: 600 }}>{job.agent}</span>
+      <span style={{ color: 'var(--text-muted)' }}>{job.status}</span>
+      <span style={{ color: 'var(--text-muted)' }}>{job.elapsed != null ? `${job.elapsed}s` : ''}</span>
+      <span style={{ flex: 1 }} />
+      <span
+        onClick={onDismiss}
+        style={{ color: 'var(--text-dim)', cursor: 'pointer', fontSize: 14, lineHeight: 1 }}
+        onMouseEnter={e => e.target.style.color = 'var(--text)'}
+        onMouseLeave={e => e.target.style.color = 'var(--text-dim)'}
+      >
+        x
       </span>
     </div>
   )
 }
 
-// ─── Main App ─────────────────────────────────────────────────────────────────
+// ─── Sidebar: Project Tree ───────────────────────────────────────────────────
 
-export default function App() {
-  const [status, setStatus] = useState(null)
-  const [alive, setAlive] = useState(false)
-  const [sessions, setSessions] = useState([])
-  const [prompt, setPrompt] = useState('')
-  const [running, setRunning] = useState(false)
-  const [chatMessages, setChatMessages] = useState([]) // [{role, content, job_id?}]
-  const [memSearch, setMemSearch] = useState('')
-  const [notes, setNotes] = useState(null)
-  const [notesLoading, setNotesLoading] = useState(false)
-  const [activeTab, setActiveTab] = useState('chat')
-  const [lastPoll, setLastPoll] = useState(null)
-  const [daemonKey, setDaemonKey] = useState(
-    () => (typeof localStorage !== 'undefined' && localStorage.getItem(DAEMON_KEY_STORAGE)) || ''
+function ProjectTree({ projects, setProjects, onOpenChat, activeChatId }) {
+  function addProject() {
+    setProjects(prev => [...prev, { id: uid(), name: 'New Project', expanded: false, chats: [] }])
+  }
+
+  function toggleProject(pid) {
+    setProjects(prev => prev.map(p => p.id === pid ? { ...p, expanded: !p.expanded } : p))
+  }
+
+  function renameProject(pid, name) {
+    setProjects(prev => prev.map(p => p.id === pid ? { ...p, name } : p))
+  }
+
+  function deleteProject(pid) {
+    setProjects(prev => prev.filter(p => p.id !== pid))
+  }
+
+  function addChat(pid) {
+    setProjects(prev => prev.map(p => {
+      if (p.id !== pid) return p
+      return { ...p, expanded: true, chats: [...p.chats, { id: uid(), name: 'New Chat', messages: [] }] }
+    }))
+  }
+
+  function deleteChat(pid, cid) {
+    setProjects(prev => prev.map(p => {
+      if (p.id !== pid) return p
+      return { ...p, chats: p.chats.filter(c => c.id !== cid) }
+    }))
+  }
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 2, padding: '8px 0' }}>
+      {/* Add project button */}
+      <div
+        onClick={addProject}
+        style={{
+          padding: '6px 12px',
+          fontSize: 11,
+          color: 'var(--text-muted)',
+          cursor: 'pointer',
+          display: 'flex',
+          alignItems: 'center',
+          gap: 6,
+          transition: 'color var(--transition)',
+        }}
+        onMouseEnter={e => e.currentTarget.style.color = 'var(--accent)'}
+        onMouseLeave={e => e.currentTarget.style.color = 'var(--text-muted)'}
+      >
+        <span style={{ fontSize: 14, lineHeight: 1 }}>+</span>
+        <span>new project</span>
+      </div>
+
+      {projects.map(project => (
+        <ProjectItem
+          key={project.id}
+          project={project}
+          onToggle={() => toggleProject(project.id)}
+          onRename={name => renameProject(project.id, name)}
+          onDelete={() => deleteProject(project.id)}
+          onAddChat={() => addChat(project.id)}
+          onDeleteChat={cid => deleteChat(project.id, cid)}
+          onOpenChat={(cid) => onOpenChat(project.id, cid)}
+          activeChatId={activeChatId}
+        />
+      ))}
+    </div>
   )
+}
+
+function ProjectItem({ project, onToggle, onRename, onDelete, onAddChat, onDeleteChat, onOpenChat, activeChatId }) {
+  const [editing, setEditing] = useState(false)
+  const [editName, setEditName] = useState(project.name)
+  const [confirmDelete, setConfirmDelete] = useState(false)
+  const inputRef = useRef(null)
 
   useEffect(() => {
-    if (typeof localStorage === 'undefined') return
-    if (daemonKey) localStorage.setItem(DAEMON_KEY_STORAGE, daemonKey)
-    else localStorage.removeItem(DAEMON_KEY_STORAGE)
-  }, [daemonKey])
-  const outputRef = useRef(null)
-  const textareaRef = useRef(null)
-  const promptAbortRef = useRef(null)
-  const mountedRef = useRef(true)
+    if (editing) {
+      inputRef.current?.focus()
+      inputRef.current?.select()
+    }
+  }, [editing])
 
+  function commitRename() {
+    const trimmed = editName.trim()
+    if (trimmed && trimmed !== project.name) onRename(trimmed)
+    else setEditName(project.name)
+    setEditing(false)
+  }
+
+  function handleDelete() {
+    if (!confirmDelete) {
+      setConfirmDelete(true)
+      setTimeout(() => setConfirmDelete(false), 3000)
+      return
+    }
+    onDelete()
+  }
+
+  return (
+    <div>
+      {/* Project row */}
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          padding: '5px 12px',
+          cursor: 'pointer',
+          gap: 6,
+          transition: 'background var(--transition)',
+        }}
+        onMouseEnter={e => e.currentTarget.style.background = 'var(--bg-raised)'}
+        onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
+      >
+        <span
+          onClick={onToggle}
+          style={{ fontSize: 9, color: 'var(--text-dim)', width: 12, textAlign: 'center', flexShrink: 0 }}
+        >
+          {project.expanded ? '\u25BC' : '\u25B6'}
+        </span>
+
+        {editing ? (
+          <input
+            ref={inputRef}
+            value={editName}
+            onChange={e => setEditName(e.target.value)}
+            onBlur={commitRename}
+            onKeyDown={e => { if (e.key === 'Enter') commitRename(); if (e.key === 'Escape') { setEditName(project.name); setEditing(false) } }}
+            style={{
+              flex: 1,
+              background: 'var(--surface-2)',
+              border: '1px solid var(--accent)',
+              borderRadius: 'var(--radius-sm)',
+              color: 'var(--text)',
+              fontSize: 12,
+              padding: '2px 6px',
+              outline: 'none',
+              fontFamily: 'var(--sans)',
+            }}
+          />
+        ) : (
+          <span
+            onClick={onToggle}
+            onDoubleClick={() => { setEditName(project.name); setEditing(true) }}
+            style={{
+              flex: 1,
+              fontSize: 12,
+              fontWeight: 500,
+              color: 'var(--text)',
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              whiteSpace: 'nowrap',
+            }}
+          >
+            {project.name}
+          </span>
+        )}
+
+        {/* Add chat */}
+        <span
+          onClick={e => { e.stopPropagation(); onAddChat() }}
+          style={{
+            fontSize: 14, lineHeight: 1, color: 'var(--text-dim)', cursor: 'pointer',
+            padding: '0 2px', flexShrink: 0,
+          }}
+          onMouseEnter={e => e.target.style.color = 'var(--accent)'}
+          onMouseLeave={e => e.target.style.color = 'var(--text-dim)'}
+        >
+          +
+        </span>
+
+        {/* Delete project */}
+        <span
+          onClick={e => { e.stopPropagation(); handleDelete() }}
+          style={{
+            fontSize: 11, lineHeight: 1,
+            color: confirmDelete ? 'var(--red)' : 'var(--text-dim)',
+            cursor: 'pointer', padding: '0 2px', flexShrink: 0,
+            fontFamily: 'var(--mono)',
+            fontWeight: confirmDelete ? 600 : 400,
+          }}
+          onMouseEnter={e => { if (!confirmDelete) e.target.style.color = 'var(--red)' }}
+          onMouseLeave={e => { if (!confirmDelete) e.target.style.color = 'var(--text-dim)' }}
+        >
+          {confirmDelete ? 'confirm?' : 'x'}
+        </span>
+      </div>
+
+      {/* Chats under project */}
+      {project.expanded && (
+        <div style={{ paddingLeft: 20 }}>
+          {project.chats.map(chat => (
+            <ChatItem
+              key={chat.id}
+              chat={chat}
+              isActive={chat.id === activeChatId}
+              onOpen={() => onOpenChat(chat.id)}
+              onDelete={() => onDeleteChat(chat.id)}
+            />
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function ChatItem({ chat, isActive, onOpen, onDelete }) {
+  const [confirmDelete, setConfirmDelete] = useState(false)
+
+  function handleDelete(e) {
+    e.stopPropagation()
+    if (!confirmDelete) {
+      setConfirmDelete(true)
+      setTimeout(() => setConfirmDelete(false), 3000)
+      return
+    }
+    onDelete()
+  }
+
+  return (
+    <div
+      onClick={onOpen}
+      style={{
+        display: 'flex',
+        alignItems: 'center',
+        padding: '4px 8px',
+        cursor: 'pointer',
+        gap: 6,
+        borderRadius: 'var(--radius-sm)',
+        background: isActive ? 'var(--accent-dim)' : 'transparent',
+        transition: 'background var(--transition)',
+      }}
+      onMouseEnter={e => { if (!isActive) e.currentTarget.style.background = 'var(--bg-raised)' }}
+      onMouseLeave={e => { if (!isActive) e.currentTarget.style.background = isActive ? 'var(--accent-dim)' : 'transparent' }}
+    >
+      <span style={{
+        fontSize: 12,
+        color: isActive ? 'var(--accent)' : 'var(--text-muted)',
+        flex: 1,
+        overflow: 'hidden',
+        textOverflow: 'ellipsis',
+        whiteSpace: 'nowrap',
+      }}>
+        {chat.name}
+      </span>
+      <span
+        onClick={handleDelete}
+        style={{
+          fontSize: 11, lineHeight: 1,
+          color: confirmDelete ? 'var(--red)' : 'var(--text-dim)',
+          cursor: 'pointer', padding: '0 2px', flexShrink: 0,
+          fontFamily: 'var(--mono)',
+          fontWeight: confirmDelete ? 600 : 400,
+        }}
+        onMouseEnter={e => { if (!confirmDelete) e.target.style.color = 'var(--red)' }}
+        onMouseLeave={e => { if (!confirmDelete) e.target.style.color = 'var(--text-dim)' }}
+      >
+        {confirmDelete ? 'confirm?' : 'x'}
+      </span>
+    </div>
+  )
+}
+
+// ─── Sidebar Bottom Nav ──────────────────────────────────────────────────────
+
+function SidebarNav({ activeNav, onNav }) {
+  const items = ['Settings', 'Statistics', 'About']
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 1, padding: '8px 0' }}>
+      {items.map(item => {
+        const active = activeNav === item.toLowerCase()
+        return (
+          <div
+            key={item}
+            onClick={() => onNav(item.toLowerCase())}
+            style={{
+              padding: '6px 14px',
+              fontSize: 12,
+              color: active ? 'var(--accent)' : 'var(--text-muted)',
+              cursor: 'pointer',
+              background: active ? 'var(--accent-dim)' : 'transparent',
+              borderRadius: 'var(--radius-sm)',
+              margin: '0 6px',
+              transition: 'all var(--transition)',
+            }}
+            onMouseEnter={e => { if (!active) e.currentTarget.style.background = 'var(--bg-raised)' }}
+            onMouseLeave={e => { if (!active) e.currentTarget.style.background = active ? 'var(--accent-dim)' : 'transparent' }}
+          >
+            {item}
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
+// ─── Left Sidebar ────────────────────────────────────────────────────────────
+
+function Sidebar({ collapsed, onToggle, projects, setProjects, onOpenChat, activeChatId, activeNav, onNav, bottomRatio, onBottomResize }) {
+  const dragRef = useRef(null)
+  const sidebarRef = useRef(null)
+
+  function startDrag(e) {
+    e.preventDefault()
+    const startY = e.clientY
+    const startRatio = bottomRatio
+
+    function onMove(ev) {
+      if (!sidebarRef.current) return
+      const rect = sidebarRef.current.getBoundingClientRect()
+      const totalH = rect.height
+      const delta = startY - ev.clientY
+      const newRatio = Math.min(0.5, Math.max(0.1, startRatio + delta / totalH))
+      onBottomResize(newRatio)
+    }
+
+    function onUp() {
+      document.removeEventListener('mousemove', onMove)
+      document.removeEventListener('mouseup', onUp)
+    }
+
+    document.addEventListener('mousemove', onMove)
+    document.addEventListener('mouseup', onUp)
+  }
+
+  if (collapsed) {
+    return (
+      <div style={{
+        width: 36,
+        background: 'var(--surface)',
+        borderRight: '1px solid var(--border)',
+        display: 'flex',
+        flexDirection: 'column',
+        alignItems: 'center',
+        flexShrink: 0,
+      }}>
+        <div
+          onClick={onToggle}
+          style={{
+            padding: '12px 0',
+            cursor: 'pointer',
+            color: 'var(--text-dim)',
+            fontSize: 13,
+            transition: 'color var(--transition)',
+          }}
+          onMouseEnter={e => e.currentTarget.style.color = 'var(--accent)'}
+          onMouseLeave={e => e.currentTarget.style.color = 'var(--text-dim)'}
+          title="Expand sidebar"
+        >
+          {'\u25B6'}
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <div
+      ref={sidebarRef}
+      style={{
+        width: 'var(--sidebar-w)',
+        background: 'var(--surface)',
+        borderRight: '1px solid var(--border)',
+        display: 'flex',
+        flexDirection: 'column',
+        flexShrink: 0,
+        overflow: 'hidden',
+        position: 'relative',
+      }}
+    >
+      {/* Collapse button on right edge */}
+      <div
+        onClick={onToggle}
+        style={{
+          position: 'absolute',
+          top: 10,
+          right: 0,
+          width: 18,
+          height: 22,
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          cursor: 'pointer',
+          color: 'var(--text-dim)',
+          fontSize: 9,
+          zIndex: 2,
+          borderRadius: '3px 0 0 3px',
+          transition: 'all var(--transition)',
+        }}
+        onMouseEnter={e => { e.currentTarget.style.color = 'var(--accent)'; e.currentTarget.style.background = 'var(--surface-2)' }}
+        onMouseLeave={e => { e.currentTarget.style.color = 'var(--text-dim)'; e.currentTarget.style.background = 'transparent' }}
+        title="Collapse sidebar"
+      >
+        {'\u25C0'}
+      </div>
+
+      {/* Top: scrollable project tree */}
+      <div style={{
+        flex: `1 1 ${(1 - bottomRatio) * 100}%`,
+        overflowY: 'auto',
+        overflowX: 'hidden',
+        minHeight: 0,
+      }}>
+        <ProjectTree
+          projects={projects}
+          setProjects={setProjects}
+          onOpenChat={onOpenChat}
+          activeChatId={activeChatId}
+        />
+      </div>
+
+      {/* Draggable divider */}
+      <div
+        ref={dragRef}
+        onMouseDown={startDrag}
+        style={{
+          height: 3,
+          background: 'var(--border)',
+          cursor: 'ns-resize',
+          flexShrink: 0,
+          transition: 'background var(--transition)',
+        }}
+        onMouseEnter={e => e.currentTarget.style.background = 'var(--accent)'}
+        onMouseLeave={e => e.currentTarget.style.background = 'var(--border)'}
+      />
+
+      {/* Bottom: fixed nav */}
+      <div style={{
+        flex: `0 0 ${bottomRatio * 100}%`,
+        overflowY: 'auto',
+        overflowX: 'hidden',
+        minHeight: 0,
+      }}>
+        <SidebarNav activeNav={activeNav} onNav={onNav} />
+      </div>
+    </div>
+  )
+}
+
+// ─── Agent Toggles ───────────────────────────────────────────────────────────
+
+function AgentToggles({ selected, onToggle, collapsed, onCollapseToggle }) {
+  return (
+    <div style={{
+      borderTop: '1px solid var(--border)',
+      background: 'var(--surface)',
+      flexShrink: 0,
+    }}>
+      {/* Collapse header */}
+      <div
+        onClick={onCollapseToggle}
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          padding: '4px 16px',
+          cursor: 'pointer',
+          gap: 6,
+          fontSize: 10,
+          color: 'var(--text-dim)',
+          letterSpacing: '0.06em',
+          textTransform: 'uppercase',
+        }}
+      >
+        <span style={{ fontSize: 8 }}>{collapsed ? '\u25B6' : '\u25BC'}</span>
+        <span>agents</span>
+      </div>
+
+      {!collapsed && (
+        <div style={{
+          display: 'flex',
+          flexWrap: 'wrap',
+          gap: 4,
+          padding: '0 16px 8px',
+        }}>
+          {AGENTS.map(agent => {
+            const isOn = selected.includes(agent.id)
+            return (
+              <button
+                key={agent.id}
+                onClick={() => onToggle(agent.id)}
+                style={{
+                  background: isOn ? agent.color + '1a' : 'transparent',
+                  border: `1px solid ${isOn ? agent.color + '55' : 'var(--border)'}`,
+                  color: isOn ? agent.color : 'var(--text-muted)',
+                  borderRadius: 'var(--radius-sm)',
+                  padding: '3px 10px',
+                  fontSize: 11,
+                  fontWeight: isOn ? 600 : 400,
+                  cursor: 'pointer',
+                  transition: 'all var(--transition)',
+                  lineHeight: '18px',
+                }}
+              >
+                {agent.label}
+              </button>
+            )
+          })}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ─── Chat Tab (messages + input) ─────────────────────────────────────────────
+
+function ChatThread({ messages, running, alive, selectedAgents, onSend }) {
+  const [input, setInput] = useState('')
+  const scrollRef = useRef(null)
+  const textareaRef = useRef(null)
+
+  useEffect(() => {
+    if (scrollRef.current) {
+      scrollRef.current.scrollTop = scrollRef.current.scrollHeight
+    }
+  }, [messages, running])
+
+  function handleSend() {
+    if (!input.trim() || running) return
+    onSend(input.trim())
+    setInput('')
+    if (textareaRef.current) textareaRef.current.style.height = 'auto'
+  }
+
+  function handleKeyDown(e) {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault()
+      handleSend()
+    }
+  }
+
+  function autoResize(e) {
+    const el = e.target
+    el.style.height = 'auto'
+    el.style.height = Math.min(el.scrollHeight, 160) + 'px'
+  }
+
+  const activeAgentLabel = useMemo(() => {
+    if (selectedAgents.length === 0) return 'Echo'
+    return selectedAgents.map(id => AGENTS.find(a => a.id === id)?.label ?? id).join(' + ')
+  }, [selectedAgents])
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', flex: 1, overflow: 'hidden' }}>
+      {/* Message area */}
+      <div
+        ref={scrollRef}
+        style={{
+          flex: 1,
+          overflowY: 'auto',
+          padding: '20px 0',
+          display: 'flex',
+          flexDirection: 'column',
+          gap: 0,
+          minHeight: 0,
+        }}
+      >
+        {messages.length === 0 && !running && (
+          <div style={{
+            flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center',
+            color: 'var(--text-dim)', fontSize: 12, fontFamily: 'var(--mono)',
+          }}>
+            start a conversation
+          </div>
+        )}
+
+        {messages.map((msg, i) => (
+          <div
+            key={i}
+            style={{
+              display: 'flex',
+              justifyContent: msg.role === 'user' ? 'flex-end' : 'flex-start',
+              padding: '4px 20px',
+            }}
+          >
+            {msg.role === 'user' ? (
+              <div style={{
+                maxWidth: '70%',
+                background: 'rgba(45,212,191,0.06)',
+                border: '1px solid rgba(45,212,191,0.12)',
+                borderRadius: '14px 14px 4px 14px',
+                padding: '9px 14px',
+              }}>
+                <pre style={{
+                  whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+                  color: 'var(--text)', lineHeight: 1.6, margin: 0,
+                  fontFamily: 'var(--mono)', fontSize: 12,
+                }}>
+                  {msg.content}
+                </pre>
+              </div>
+            ) : (
+              <div style={{ maxWidth: '80%' }}>
+                <div style={{
+                  fontSize: 10, letterSpacing: '0.06em', marginBottom: 4,
+                  color: msg.role === 'error' ? 'var(--red)' : 'var(--text-muted)',
+                  display: 'flex', gap: 6, alignItems: 'center',
+                }}>
+                  <span style={{
+                    fontWeight: 600,
+                    color: msg.role === 'error' ? 'var(--red)' : (AGENTS.find(a => a.id === msg.agent)?.color ?? 'var(--accent)'),
+                  }}>
+                    {msg.role === 'error' ? 'error' : (msg.agent ? AGENTS.find(a => a.id === msg.agent)?.label ?? msg.agent : 'Echo')}
+                  </span>
+                  {msg.job_id && (
+                    <span style={{ color: 'var(--text-dim)', fontFamily: 'var(--mono)', fontSize: 9 }}>
+                      {msg.job_id.slice(0, 8)}
+                    </span>
+                  )}
+                </div>
+                <pre style={{
+                  whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+                  color: msg.role === 'error' ? 'var(--red)' : 'var(--text)',
+                  lineHeight: 1.6, margin: 0,
+                  fontFamily: 'var(--mono)', fontSize: 12,
+                }}>
+                  {msg.content}
+                </pre>
+              </div>
+            )}
+          </div>
+        ))}
+
+        {running && (
+          <div style={{ padding: '4px 20px', display: 'flex', justifyContent: 'flex-start' }}>
+            <div style={{ fontSize: 10, color: 'var(--text-dim)' }}>
+              <span style={{ color: 'var(--accent)', marginRight: 8, fontWeight: 600 }}>{activeAgentLabel}</span>
+              <span style={{ animation: 'blink 1s step-end infinite' }}>{'\u258B'}</span>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Input bar */}
+      <div style={{
+        flexShrink: 0,
+        padding: '10px 16px 14px',
+        background: 'var(--surface)',
+      }}>
+        {messages.length > 0 && (
+          <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 4 }}>
+            <span
+              onClick={() => onSend(null)}
+              style={{ color: 'var(--text-dim)', fontSize: 10, cursor: 'pointer', fontFamily: 'var(--mono)' }}
+              onMouseEnter={e => e.target.style.color = 'var(--text-muted)'}
+              onMouseLeave={e => e.target.style.color = 'var(--text-dim)'}
+            >
+              clear
+            </span>
+          </div>
+        )}
+        <div style={{ display: 'flex', gap: 8, alignItems: 'flex-end' }}>
+          <textarea
+            ref={textareaRef}
+            rows={1}
+            placeholder={alive ? `Message ${activeAgentLabel}...` : 'daemon offline'}
+            value={input}
+            onChange={e => { setInput(e.target.value); autoResize(e) }}
+            onKeyDown={handleKeyDown}
+            disabled={running || !alive}
+            style={{
+              flex: 1,
+              fontFamily: 'var(--mono)',
+              fontSize: 12,
+              background: 'var(--bg)',
+              color: 'var(--text)',
+              border: '1px solid var(--border)',
+              borderRadius: 'var(--radius)',
+              padding: '10px 14px',
+              outline: 'none',
+              resize: 'none',
+              minHeight: 42,
+              maxHeight: 160,
+              lineHeight: 1.6,
+              transition: 'border-color var(--transition)',
+            }}
+            onFocus={e => e.target.style.borderColor = 'var(--accent)'}
+            onBlur={e => e.target.style.borderColor = 'var(--border)'}
+          />
+          <button
+            onClick={handleSend}
+            disabled={running || !alive || !input.trim()}
+            style={{
+              flexShrink: 0,
+              width: 40, height: 40,
+              padding: 0,
+              fontSize: 16,
+              fontFamily: 'var(--mono)',
+              background: running || !alive || !input.trim() ? 'var(--border)' : 'var(--accent)',
+              color: running || !alive || !input.trim() ? 'var(--text-dim)' : 'var(--bg)',
+              cursor: running || !alive || !input.trim() ? 'default' : 'pointer',
+              borderRadius: 'var(--radius)',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              border: 'none',
+              transition: 'all var(--transition)',
+            }}
+          >
+            {'\u2191'}
+          </button>
+        </div>
+        <div style={{ marginTop: 4, fontSize: 10, color: 'var(--text-dim)', textAlign: 'center', fontFamily: 'var(--mono)' }}>
+          enter to send / shift+enter for newline
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ─── Preview Tab ─────────────────────────────────────────────────────────────
+
+function PreviewTab({ selectedAgents }) {
+  const primary = selectedAgents[0] || 'echo'
+  const agent = AGENTS.find(a => a.id === primary)
+  const label = agent?.label ?? 'Echo'
+  const color = agent?.color ?? 'var(--accent)'
+
+  if (primary === 'code') {
+    return (
+      <div style={{
+        flex: 1, display: 'flex', flexDirection: 'column',
+        background: '#0a0a0a',
+        fontFamily: 'var(--mono)',
+        fontSize: 12,
+        color: 'var(--text-dim)',
+        padding: 20,
+      }}>
+        <div style={{ color, fontSize: 10, fontWeight: 600, letterSpacing: '0.06em', marginBottom: 12 }}>
+          CODE TERMINAL
+        </div>
+        <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+          no output yet
+        </div>
+      </div>
+    )
+  }
+
+  if (primary === 'email') {
+    return (
+      <div style={{ flex: 1, padding: 20 }}>
+        <div style={{ color, fontSize: 10, fontWeight: 600, letterSpacing: '0.06em', marginBottom: 16 }}>
+          EMAIL DRAFTS
+        </div>
+        <div style={{
+          background: 'var(--surface-2)',
+          border: '1px solid var(--border)',
+          borderRadius: 'var(--radius)',
+          padding: 16,
+          color: 'var(--text-dim)',
+          fontSize: 12,
+        }}>
+          no drafts yet
+        </div>
+      </div>
+    )
+  }
+
+  if (primary === 'research') {
+    return (
+      <div style={{ flex: 1, padding: 20 }}>
+        <div style={{ color, fontSize: 10, fontWeight: 600, letterSpacing: '0.06em', marginBottom: 16 }}>
+          RESEARCH RESULTS
+        </div>
+        <div style={{ color: 'var(--text-dim)', fontSize: 12 }}>
+          no results yet
+        </div>
+      </div>
+    )
+  }
+
+  if (primary === 'calendar') {
+    return (
+      <div style={{ flex: 1, padding: 20 }}>
+        <div style={{ color, fontSize: 10, fontWeight: 600, letterSpacing: '0.06em', marginBottom: 16 }}>
+          CALENDAR
+        </div>
+        <div style={{ color: 'var(--text-dim)', fontSize: 12 }}>
+          no events loaded
+        </div>
+      </div>
+    )
+  }
+
+  if (primary === 'itguide') {
+    return (
+      <div style={{ flex: 1, padding: 20 }}>
+        <div style={{ color, fontSize: 10, fontWeight: 600, letterSpacing: '0.06em', marginBottom: 16 }}>
+          STEP MAP
+        </div>
+        <div style={{ color: 'var(--text-dim)', fontSize: 12 }}>
+          no steps yet
+        </div>
+      </div>
+    )
+  }
+
+  if (primary === 'law') {
+    return (
+      <div style={{ flex: 1, padding: 20 }}>
+        <div style={{ color, fontSize: 10, fontWeight: 600, letterSpacing: '0.06em', marginBottom: 16 }}>
+          LEGAL CITATIONS
+        </div>
+        <div style={{ color: 'var(--text-dim)', fontSize: 12 }}>
+          no citations yet
+        </div>
+      </div>
+    )
+  }
+
+  // echo / default
+  return (
+    <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--text-dim)', fontSize: 12 }}>
+      {label} preview
+    </div>
+  )
+}
+
+// ─── Context Tab ─────────────────────────────────────────────────────────────
+
+function ContextTab({ selectedAgents }) {
+  const [coreExpanded, setCoreExpanded] = useState(false)
+  const [memExpanded, setMemExpanded] = useState(false)
+
+  const toolsByAgent = {
+    echo: ['chat_dispatcher', 'memory_search'],
+    research: ['brave_search', 'page_reader', 'summarize'],
+    email: ['gmail_read', 'gmail_draft', 'gmail_send'],
+    calendar: ['gcal_read', 'gcal_create', 'gcal_edit', 'gcal_delete'],
+    code: ['e2b_execute', 'file_write', 'github_push'],
+    itguide: ['brave_search', 'screenshot_read', 'step_map'],
+    law: ['cornell_search', 'case_lookup', 'citation_format'],
+  }
+
+  const primary = selectedAgents[0] || 'echo'
+  const tools = toolsByAgent[primary] || toolsByAgent.echo
+
+  return (
+    <div style={{ flex: 1, padding: 20, overflowY: 'auto' }}>
+      {/* Core context card */}
+      <div style={{
+        background: 'var(--surface-2)',
+        border: '1px solid var(--border)',
+        borderRadius: 'var(--radius)',
+        marginBottom: 12,
+        overflow: 'hidden',
+      }}>
+        <div
+          onClick={() => setCoreExpanded(!coreExpanded)}
+          style={{
+            padding: '10px 14px',
+            cursor: 'pointer',
+            display: 'flex',
+            alignItems: 'center',
+            gap: 8,
+            fontSize: 11,
+            color: 'var(--text-muted)',
+          }}
+        >
+          <span style={{ fontSize: 8 }}>{coreExpanded ? '\u25BC' : '\u25B6'}</span>
+          <span style={{ fontWeight: 600 }}>Core Context File</span>
+        </div>
+        {coreExpanded && (
+          <div style={{
+            padding: '0 14px 12px',
+            fontSize: 11,
+            color: 'var(--text-dim)',
+            fontFamily: 'var(--mono)',
+          }}>
+            Loaded from GHOST_CORE_CONTEXT_PATH at dispatch time.
+          </div>
+        )}
+      </div>
+
+      {/* Injected memories card */}
+      <div style={{
+        background: 'var(--surface-2)',
+        border: '1px solid var(--border)',
+        borderRadius: 'var(--radius)',
+        marginBottom: 16,
+        overflow: 'hidden',
+      }}>
+        <div
+          onClick={() => setMemExpanded(!memExpanded)}
+          style={{
+            padding: '10px 14px',
+            cursor: 'pointer',
+            display: 'flex',
+            alignItems: 'center',
+            gap: 8,
+            fontSize: 11,
+            color: 'var(--text-muted)',
+          }}
+        >
+          <span style={{ fontSize: 8 }}>{memExpanded ? '\u25BC' : '\u25B6'}</span>
+          <span style={{ fontWeight: 600 }}>Injected Memories</span>
+        </div>
+        {memExpanded && (
+          <div style={{
+            padding: '0 14px 12px',
+            fontSize: 11,
+            color: 'var(--text-dim)',
+            fontFamily: 'var(--mono)',
+          }}>
+            Semantic search results injected at runtime (Phase 2).
+          </div>
+        )}
+      </div>
+
+      {/* Tools */}
+      <div style={{
+        fontSize: 10,
+        fontWeight: 600,
+        color: 'var(--text-dim)',
+        letterSpacing: '0.06em',
+        textTransform: 'uppercase',
+        marginBottom: 8,
+      }}>
+        Tools
+      </div>
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+        {tools.map(tool => (
+          <span key={tool} style={{
+            padding: '4px 10px',
+            background: 'var(--surface-2)',
+            border: '1px solid var(--border)',
+            borderRadius: 12,
+            fontSize: 11,
+            fontFamily: 'var(--mono)',
+            color: 'var(--text-muted)',
+          }}>
+            {tool}
+          </span>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+// ─── Thinking Tab ────────────────────────────────────────────────────────────
+
+function ThinkingTab() {
+  return (
+    <div style={{
+      flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center',
+      color: 'var(--text-dim)', fontSize: 12, fontFamily: 'var(--mono)',
+    }}>
+      Thinking will stream here when enabled.
+    </div>
+  )
+}
+
+// ─── Settings Panel ──────────────────────────────────────────────────────────
+
+function SettingsPanel() {
+  return (
+    <div style={{ flex: 1, padding: 24, overflowY: 'auto' }}>
+      <div style={{ fontSize: 14, fontWeight: 600, color: 'var(--text-bright)', marginBottom: 20 }}>
+        Settings
+      </div>
+
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+        <SettingRow label="Job status banner" description="Show in-flight job status below the top bar" defaultOn={true} />
+        <SettingRow label="Auto-switch tabs" description="Switch to agent preview tab on response" defaultOn={false} />
+        <SettingRow label="Agent thinking (Echo)" description="Stream narrated reasoning for Echo agent" defaultOn={false} />
+        <SettingRow label="Agent thinking (Research)" description="Stream narrated reasoning for Research agent" defaultOn={true} />
+        <SettingRow label="Agent thinking (Code)" description="Stream narrated reasoning for Code agent" defaultOn={true} />
+      </div>
+    </div>
+  )
+}
+
+function SettingRow({ label, description, defaultOn }) {
+  const [on, setOn] = useState(defaultOn)
+  return (
+    <div style={{
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'space-between',
+      padding: '12px 16px',
+      background: 'var(--surface-2)',
+      border: '1px solid var(--border)',
+      borderRadius: 'var(--radius)',
+    }}>
+      <div>
+        <div style={{ fontSize: 12, fontWeight: 500, color: 'var(--text)' }}>{label}</div>
+        <div style={{ fontSize: 11, color: 'var(--text-dim)', marginTop: 2 }}>{description}</div>
+      </div>
+      <div
+        onClick={() => setOn(!on)}
+        style={{
+          width: 36, height: 20,
+          background: on ? 'var(--accent)' : 'var(--border)',
+          borderRadius: 10,
+          cursor: 'pointer',
+          position: 'relative',
+          transition: 'background var(--transition)',
+          flexShrink: 0,
+          marginLeft: 16,
+        }}
+      >
+        <div style={{
+          width: 16, height: 16,
+          borderRadius: '50%',
+          background: '#fff',
+          position: 'absolute',
+          top: 2,
+          left: on ? 18 : 2,
+          transition: 'left var(--transition)',
+        }} />
+      </div>
+    </div>
+  )
+}
+
+// ─── Statistics Panel ────────────────────────────────────────────────────────
+
+function StatisticsPanel() {
+  return (
+    <div style={{ flex: 1, padding: 24, overflowY: 'auto' }}>
+      <div style={{ fontSize: 14, fontWeight: 600, color: 'var(--text-bright)', marginBottom: 20 }}>
+        Statistics
+      </div>
+      <div style={{ color: 'var(--text-dim)', fontSize: 12, fontFamily: 'var(--mono)' }}>
+        Usage statistics will appear here once jobs are tracked.
+      </div>
+    </div>
+  )
+}
+
+// ─── About Panel ─────────────────────────────────────────────────────────────
+
+function AboutPanel() {
+  return (
+    <div style={{ flex: 1, padding: 24, overflowY: 'auto' }}>
+      <div style={{ fontSize: 14, fontWeight: 600, color: 'var(--text-bright)', marginBottom: 20 }}>
+        About GHOST
+      </div>
+
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 12, fontSize: 12, color: 'var(--text)' }}>
+        <p style={{ lineHeight: 1.6 }}>
+          GHOST is a personal AI operating system. Routes requests through a Director AI to specialist agents for code, email, calendar, research, and more.
+        </p>
+
+        <div style={{
+          background: 'var(--surface-2)',
+          border: '1px solid var(--border)',
+          borderRadius: 'var(--radius)',
+          padding: 14,
+        }}>
+          <div style={{ fontSize: 10, fontWeight: 600, color: 'var(--text-dim)', letterSpacing: '0.06em', textTransform: 'uppercase', marginBottom: 8 }}>
+            Agents
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 4, fontFamily: 'var(--mono)', fontSize: 11 }}>
+            {AGENTS.map(a => (
+              <div key={a.id} style={{ display: 'flex', gap: 8 }}>
+                <span style={{ color: a.color, width: 70 }}>{a.label}</span>
+                <span style={{ color: 'var(--text-muted)' }}>
+                  {a.id === 'echo' && 'General chat, default agent'}
+                  {a.id === 'research' && 'Brave Search, web synthesis'}
+                  {a.id === 'email' && 'Gmail read, draft, send'}
+                  {a.id === 'calendar' && 'Google Calendar CRUD'}
+                  {a.id === 'code' && 'DeepSeek + E2B sandbox'}
+                  {a.id === 'itguide' && 'Step-by-step navigation'}
+                  {a.id === 'law' && 'US legal research + citations'}
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <div style={{ fontSize: 10, color: 'var(--text-dim)', lineHeight: 1.6, marginTop: 8 }}>
+          AI disclaimer: GHOST provides AI-generated responses. Verify critical information independently.
+          This system is built and operated by Isaac Carrillo / KYNE Systems.
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ─── No Chat Selected ────────────────────────────────────────────────────────
+
+function NoChatSelected() {
+  return (
+    <div style={{
+      flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center',
+      flexDirection: 'column', gap: 8,
+    }}>
+      <div style={{ fontSize: 20, fontWeight: 700, color: 'var(--accent)', letterSpacing: '-0.02em' }}>
+        GHOST
+      </div>
+      <div style={{ color: 'var(--text-dim)', fontSize: 12 }}>
+        select or create a chat to begin
+      </div>
+    </div>
+  )
+}
+
+// ─── Main Chat Area (with per-chat tabs) ─────────────────────────────────────
+
+function ChatArea({
+  chat, alive, selectedAgents, setSelectedAgents, running,
+  onSendMessage, onClearMessages, agentsCollapsed, onAgentsCollapseToggle,
+}) {
+  const [innerTab, setInnerTab] = useState('chat')
+  const tabs = ['Chat', 'Preview', 'Context', 'Thinking']
+
+  function handleAgentToggle(agentId) {
+    setSelectedAgents(prev => {
+      if (agentId === 'echo') {
+        // Toggling Echo: if it's the only one, keep it. If others are on, toggle echo off/on.
+        if (prev.includes('echo')) {
+          const without = prev.filter(id => id !== 'echo')
+          return without.length === 0 ? ['echo'] : without
+        }
+        return [...prev, 'echo']
+      }
+      // Specialist toggle
+      if (prev.includes(agentId)) {
+        const without = prev.filter(id => id !== agentId)
+        return without.length === 0 ? ['echo'] : without
+      }
+      // Max: echo + one specialist
+      const specialists = prev.filter(id => id !== 'echo')
+      if (specialists.length >= 1) {
+        // Replace the specialist
+        const hasEcho = prev.includes('echo')
+        return hasEcho ? ['echo', agentId] : [agentId]
+      }
+      return [...prev, agentId]
+    })
+  }
+
+  function handleSend(text) {
+    if (text === null) {
+      onClearMessages()
+      return
+    }
+    onSendMessage(text)
+  }
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', flex: 1, overflow: 'hidden' }}>
+      {/* Inner tabs */}
+      <div style={{
+        display: 'flex',
+        borderBottom: '1px solid var(--border)',
+        background: 'var(--surface)',
+        flexShrink: 0,
+      }}>
+        {tabs.map(tab => {
+          const key = tab.toLowerCase()
+          const active = innerTab === key
+          return (
+            <button
+              key={key}
+              onClick={() => setInnerTab(key)}
+              style={{
+                background: 'none',
+                border: 'none',
+                borderBottom: active ? '2px solid var(--accent)' : '2px solid transparent',
+                color: active ? 'var(--accent)' : 'var(--text-dim)',
+                padding: '9px 16px',
+                fontSize: 11,
+                fontWeight: active ? 600 : 400,
+                cursor: 'pointer',
+                letterSpacing: '0.04em',
+                transition: 'all var(--transition)',
+              }}
+            >
+              {tab}
+            </button>
+          )
+        })}
+      </div>
+
+      {/* Tab content */}
+      {innerTab === 'chat' && (
+        <>
+          <ChatThread
+            messages={chat.messages}
+            running={running}
+            alive={alive}
+            selectedAgents={selectedAgents}
+            onSend={handleSend}
+          />
+          <AgentToggles
+            selected={selectedAgents}
+            onToggle={handleAgentToggle}
+            collapsed={agentsCollapsed}
+            onCollapseToggle={onAgentsCollapseToggle}
+          />
+        </>
+      )}
+      {innerTab === 'preview' && <PreviewTab selectedAgents={selectedAgents} />}
+      {innerTab === 'context' && <ContextTab selectedAgents={selectedAgents} />}
+      {innerTab === 'thinking' && <ThinkingTab />}
+    </div>
+  )
+}
+
+// ─── Main App ────────────────────────────────────────────────────────────────
+
+export default function App() {
+  // Auth
+  const [daemonKey, setDaemonKey] = useState(() => {
+    try { return localStorage.getItem(STORAGE_KEY) || '' } catch { return '' }
+  })
+  const [authed, setAuthed] = useState(() => !!daemonKey)
+
+  // Daemon state
+  const [alive, setAlive] = useState(false)
+  const [status, setStatus] = useState(null)
+
+  // Projects + chats (localStorage)
+  const [projects, setProjects] = useState(loadProjects)
+  const [activeChatId, setActiveChatId] = useState(null)
+  const [openTabs, setOpenTabs] = useState([]) // [{id, name, projectId}]
+
+  // Sidebar
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
+  const [bottomRatio, setBottomRatio] = useState(0.25)
+  const [activeNav, setActiveNav] = useState(null) // 'settings' | 'statistics' | 'about' | null
+
+  // Chat state
+  const [selectedAgents, setSelectedAgents] = useState(['echo'])
+  const [agentsCollapsed, setAgentsCollapsed] = useState(false)
+  const [running, setRunning] = useState(false)
+
+  // Job banner
+  const [activeJob, setActiveJob] = useState(null)
+
+  const mountedRef = useRef(true)
+  const promptAbortRef = useRef(null)
+
+  // Persist projects
+  useEffect(() => { saveProjects(projects) }, [projects])
+
+  // Cleanup
   useEffect(() => {
     mountedRef.current = true
     return () => {
@@ -233,537 +1607,245 @@ export default function App() {
     }
   }, [])
 
+  // Health poll
   const poll = useCallback(async () => {
+    if (!daemonKey) return
     try {
-      const [s, sess] = await Promise.all([
-        apiFetch('/status', { signal: AbortSignal.timeout(5_000) }, daemonKey),
-        apiFetch('/sessions', { signal: AbortSignal.timeout(5_000) }, daemonKey),
-      ])
+      const s = await apiFetch('/status', { signal: AbortSignal.timeout(5_000) }, daemonKey)
       if (!mountedRef.current) return
       setStatus(s)
-      setSessions(sess.sessions || [])
       setAlive(true)
     } catch {
       if (!mountedRef.current) return
       setAlive(false)
       setStatus(null)
     }
-    if (mountedRef.current) setLastPoll(new Date())
   }, [daemonKey])
 
   useEffect(() => {
+    if (!authed) return
     poll()
     const id = setInterval(poll, 10_000)
     return () => clearInterval(id)
-  }, [poll])
+  }, [authed, poll])
 
-  useEffect(() => {
-    if (outputRef.current) {
-      outputRef.current.scrollTop = outputRef.current.scrollHeight
+  // Find active chat data
+  const activeChat = useMemo(() => {
+    for (const p of projects) {
+      const c = p.chats.find(ch => ch.id === activeChatId)
+      if (c) return c
     }
-  }, [chatMessages])
+    return null
+  }, [projects, activeChatId])
 
-  async function sendPrompt() {
-    if (!prompt.trim() || running) return
+  // Open a chat (from sidebar click)
+  function handleOpenChat(projectId, chatId) {
+    setActiveChatId(chatId)
+    setActiveNav(null) // close nav panels when opening a chat
+
+    // Find chat name
+    const project = projects.find(p => p.id === projectId)
+    const chat = project?.chats.find(c => c.id === chatId)
+    if (!chat) return
+
+    setOpenTabs(prev => {
+      if (prev.some(t => t.id === chatId)) return prev
+      return [...prev, { id: chatId, name: chat.name, projectId }]
+    })
+  }
+
+  function handleSelectTab(tabId) {
+    setActiveChatId(tabId)
+    setActiveNav(null)
+  }
+
+  function handleCloseTab(tabId) {
+    setOpenTabs(prev => prev.filter(t => t.id !== tabId))
+    if (activeChatId === tabId) {
+      // Switch to the next tab or null
+      setOpenTabs(prev => {
+        const remaining = prev.filter(t => t.id !== tabId)
+        if (remaining.length > 0) setActiveChatId(remaining[remaining.length - 1].id)
+        else setActiveChatId(null)
+        return remaining
+      })
+    }
+  }
+
+  // Send message
+  async function handleSendMessage(text) {
+    if (!text || running) return
     if (promptAbortRef.current) promptAbortRef.current.abort()
     const controller = new AbortController()
     promptAbortRef.current = controller
 
-    const userMsg = prompt.trim()
-    setPrompt('')
-    // Reset textarea height after clearing
-    if (textareaRef.current) textareaRef.current.style.height = 'auto'
-    setChatMessages(prev => [...prev, { role: 'user', content: userMsg }])
+    // Add user message
+    setProjects(prev => prev.map(p => ({
+      ...p,
+      chats: p.chats.map(c => {
+        if (c.id !== activeChatId) return c
+        return { ...c, messages: [...c.messages, { role: 'user', content: text }] }
+      }),
+    })))
+
     setRunning(true)
+    const agentLabel = selectedAgents[0] || 'echo'
+
+    // Show job banner
+    const startTime = Date.now()
+    setActiveJob({ agent: AGENTS.find(a => a.id === agentLabel)?.label ?? 'Echo', status: 'running', elapsed: 0 })
+    const jobInterval = setInterval(() => {
+      setActiveJob(prev => prev ? { ...prev, elapsed: Math.floor((Date.now() - startTime) / 1000) } : null)
+    }, 1000)
+
     try {
-      // Send last 6 messages (3 exchanges) as context, stripping job_id.
-      const history = chatMessages.slice(-6).map(m => ({ role: m.role, content: m.content }))
+      // Get current messages for history
+      let currentMessages = []
+      for (const p of projects) {
+        const c = p.chats.find(ch => ch.id === activeChatId)
+        if (c) { currentMessages = c.messages; break }
+      }
+      const history = currentMessages.slice(-6).map(m => ({ role: m.role, content: m.content }))
+
       const data = await apiFetch('/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: userMsg, history }),
+        body: JSON.stringify({ message: text, history }),
         signal: controller.signal,
       }, daemonKey)
+
       if (!mountedRef.current) return
-      setChatMessages(prev => [...prev, { role: 'assistant', content: data.response, job_id: data.job_id }])
+
+      setProjects(prev => prev.map(p => ({
+        ...p,
+        chats: p.chats.map(c => {
+          if (c.id !== activeChatId) return c
+          return {
+            ...c,
+            messages: [...c.messages, {
+              role: 'assistant',
+              content: data.response,
+              job_id: data.job_id,
+              agent: agentLabel,
+            }],
+          }
+        }),
+      })))
+
+      setActiveJob(prev => prev ? { ...prev, status: 'done' } : null)
+      setTimeout(() => setActiveJob(null), 2000)
     } catch (e) {
       if (e.name === 'AbortError' || !mountedRef.current) return
-      setChatMessages(prev => [...prev, { role: 'error', content: e.message }])
+      setProjects(prev => prev.map(p => ({
+        ...p,
+        chats: p.chats.map(c => {
+          if (c.id !== activeChatId) return c
+          return { ...c, messages: [...c.messages, { role: 'error', content: e.message }] }
+        }),
+      })))
+      setActiveJob(null)
     } finally {
+      clearInterval(jobInterval)
       if (mountedRef.current) setRunning(false)
       if (promptAbortRef.current === controller) promptAbortRef.current = null
     }
   }
 
-  function handleKeyDown(e) {
-    // Enter sends; Shift+Enter inserts a newline
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault()
-      sendPrompt()
-    }
+  function handleClearMessages() {
+    setProjects(prev => prev.map(p => ({
+      ...p,
+      chats: p.chats.map(c => {
+        if (c.id !== activeChatId) return c
+        return { ...c, messages: [] }
+      }),
+    })))
   }
 
-  function autoResize(e) {
-    const el = e.target
-    el.style.height = 'auto'
-    el.style.height = Math.min(el.scrollHeight, 180) + 'px'
+  // Nav panel overrides main area
+  function handleNav(name) {
+    setActiveNav(prev => prev === name ? null : name)
   }
 
-  async function loadNotes() {
-    setNotesLoading(true)
-    try {
-      const data = await apiFetch('/memories', {}, daemonKey)
-      if (mountedRef.current) setNotes(data.notes || [])
-    } catch (e) {
-      if (mountedRef.current) setNotes([])
-    } finally {
-      if (mountedRef.current) setNotesLoading(false)
-    }
+  // ── Auth gate ──
+  if (!authed) {
+    return <AuthScreen onAuth={key => { setDaemonKey(key); setAuthed(true) }} />
   }
 
-  async function deleteNote(id) {
-    try {
-      await apiFetch(`/memories/${id}`, { method: 'DELETE' }, daemonKey)
-      setNotes(prev => prev ? prev.filter(n => n.id !== id) : prev)
-    } catch {
-      // ignore — row may already be gone
-    }
-  }
-
-  useEffect(() => {
-    if (activeTab === 'memory' && notes === null) loadNotes()
-  }, [activeTab])
-
-  // ── Layout ────────────────────────────────────────────────────────────────
+  // ── Main layout ──
+  const showBanner = !!activeJob
 
   return (
-    <>
-      <style>{CSS}</style>
+    <div style={{
+      display: 'flex',
+      flexDirection: 'column',
+      height: '100vh',
+      overflow: 'hidden',
+      background: 'var(--bg)',
+    }}>
+      {/* Animations */}
+      <style>{`
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+        @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
+      `}</style>
+
+      <TopBar
+        alive={alive}
+        status={status}
+        openTabs={openTabs}
+        activeTabId={activeChatId}
+        onSelectTab={handleSelectTab}
+        onCloseTab={handleCloseTab}
+      />
+
+      {showBanner && <JobBanner job={activeJob} onDismiss={() => setActiveJob(null)} />}
 
       <div style={{
-        display: 'grid',
-        gridTemplateRows: 'auto 1fr',
-        height: '100vh',
+        display: 'flex',
+        flex: 1,
         overflow: 'hidden',
+        minHeight: 0,
       }}>
+        <Sidebar
+          collapsed={sidebarCollapsed}
+          onToggle={() => setSidebarCollapsed(!sidebarCollapsed)}
+          projects={projects}
+          setProjects={setProjects}
+          onOpenChat={handleOpenChat}
+          activeChatId={activeChatId}
+          activeNav={activeNav}
+          onNav={handleNav}
+          bottomRatio={bottomRatio}
+          onBottomResize={setBottomRatio}
+        />
 
-        {/* ── Top Bar ── */}
-        <header style={{
-          display: 'flex',
-          alignItems: 'center',
-          gap: 0,
-          padding: '0 24px',
-          height: 52,
-          borderBottom: '1px solid var(--border)',
-          background: 'var(--surface)',
-          flexShrink: 0,
-        }}>
-          {/* Wordmark */}
-          <div style={{
-            fontFamily: 'var(--display)',
-            fontSize: 15,
-            fontWeight: 800,
-            letterSpacing: '-0.02em',
-            color: 'var(--cyan)',
-            marginRight: 24,
-            whiteSpace: 'nowrap',
-          }}>
-            GHOST
-          </div>
-
-          {/* Status */}
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginRight: 24 }}>
-            <Dot alive={alive} />
-            <span style={{ color: alive ? 'var(--green)' : 'var(--red)', fontWeight: 600, fontSize: 11, textTransform: 'uppercase', letterSpacing: '0.1em' }}>
-              {alive ? 'online' : 'offline'}
-            </span>
-          </div>
-
-          {/* Stats */}
-          <div style={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
-            {status && <>
-              <StatChip label="uptime" value={fmtUptime(status.uptime_secs)} accent="var(--cyan)" />
-              <StatChip label="sessions" value={status.session_count} />
-              <StatChip label="version" value={`v${status.version}`} />
-              <StatChip label="pid" value={status.pid} />
-            </>}
-            {!status && !alive && (
-              <div style={{ padding: '6px 14px', color: 'var(--muted)', borderLeft: '1px solid var(--border)' }}>
-                daemon unreachable
-              </div>
-            )}
-          </div>
-
-          {/* Daemon key */}
-          <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginRight: 16 }}>
-            <span style={{ color: 'var(--muted)', fontSize: 10, letterSpacing: '0.1em', textTransform: 'uppercase' }}>
-              key
-            </span>
-            <input
-              type="password"
-              value={daemonKey}
-              onChange={e => setDaemonKey(e.target.value)}
-              placeholder={daemonKey ? '' : 'CLAW_DAEMON_KEY'}
-              spellCheck={false}
-              autoComplete="off"
-              style={{
-                fontFamily: 'var(--mono)',
-                fontSize: 11,
-                background: '#080a0d',
-                color: 'var(--text)',
-                border: '1px solid var(--border)',
-                borderRadius: 3,
-                padding: '4px 8px',
-                width: 140,
-                outline: 'none',
-              }}
-              title="Stored in localStorage. Sent as Authorization: Bearer <key> to the daemon."
-            />
-          </div>
-
-          {/* Poll indicator */}
-          <div style={{ color: 'var(--muted)', fontSize: 10, whiteSpace: 'nowrap' }}>
-            {lastPoll && `polled ${timeAgo(Math.floor(lastPoll / 1000))}`}
-          </div>
-        </header>
-
-        {/* ── Body ── */}
+        {/* Main area */}
         <div style={{
-          display: 'grid',
-          gridTemplateColumns: '1fr 280px',
+          flex: 1,
+          display: 'flex',
+          flexDirection: 'column',
           overflow: 'hidden',
+          minWidth: 0,
+          background: 'var(--bg)',
         }}>
-
-          {/* ── Left: Main panel ── */}
-          <div style={{
-            display: 'flex',
-            flexDirection: 'column',
-            overflow: 'hidden',
-            borderRight: '1px solid var(--border)',
-          }}>
-            {/* Tabs */}
-            <div style={{
-              display: 'flex',
-              borderBottom: '1px solid var(--border)',
-              background: 'var(--surface)',
-              flexShrink: 0,
-            }}>
-              {['chat', 'memory'].map(tab => (
-                <button
-                  key={tab}
-                  onClick={() => setActiveTab(tab)}
-                  style={{
-                    background: 'none',
-                    color: activeTab === tab ? 'var(--cyan)' : 'var(--muted)',
-                    borderBottom: activeTab === tab ? '2px solid var(--cyan)' : '2px solid transparent',
-                    borderRadius: 0,
-                    padding: '12px 20px',
-                    fontSize: 11,
-                    letterSpacing: '0.1em',
-                  }}
-                >
-                  {tab.toUpperCase()}
-                </button>
-              ))}
-            </div>
-
-            {activeTab === 'chat' && (
-              <div style={{ display: 'flex', flexDirection: 'column', flex: 1, overflow: 'hidden' }}>
-
-                {/* ── Message thread — grows upward, newest at bottom ── */}
-                <div
-                  ref={outputRef}
-                  style={{
-                    flex: 1,
-                    overflowY: 'auto',
-                    padding: '24px 0',
-                    display: 'flex',
-                    flexDirection: 'column',
-                    gap: 0,
-                  }}
-                >
-                  {chatMessages.length === 0 && !running && (
-                    <div style={{
-                      flex: 1,
-                      display: 'flex', alignItems: 'center', justifyContent: 'center',
-                      color: 'var(--muted)', fontSize: 12,
-                    }}>
-                      start a conversation
-                    </div>
-                  )}
-
-                  {chatMessages.map((msg, i) => (
-                    <div
-                      key={i}
-                      style={{
-                        display: 'flex',
-                        justifyContent: msg.role === 'user' ? 'flex-end' : 'flex-start',
-                        padding: '6px 24px',
-                      }}
-                    >
-                      {msg.role === 'user' ? (
-                        /* User bubble — right-aligned */
-                        <div style={{
-                          maxWidth: '72%',
-                          background: 'rgba(0,229,255,0.07)',
-                          border: '1px solid rgba(0,229,255,0.15)',
-                          borderRadius: '16px 16px 4px 16px',
-                          padding: '10px 14px',
-                        }}>
-                          <pre style={{
-                            whiteSpace: 'pre-wrap', wordBreak: 'break-word',
-                            color: 'var(--text)', lineHeight: 1.7, margin: 0,
-                            fontFamily: 'var(--mono)', fontSize: 13,
-                          }}>
-                            {msg.content}
-                          </pre>
-                        </div>
-                      ) : (
-                        /* Assistant / error — left-aligned */
-                        <div style={{ maxWidth: '82%' }}>
-                          <div style={{
-                            fontSize: 10, letterSpacing: '0.1em', marginBottom: 6,
-                            color: msg.role === 'error' ? 'var(--red)' : 'var(--green)',
-                            display: 'flex', gap: 8, alignItems: 'center',
-                          }}>
-                            <span style={{ fontWeight: 600 }}>
-                              {msg.role === 'error' ? 'error' : 'ghost'}
-                            </span>
-                            {msg.job_id && (
-                              <span style={{ color: 'var(--muted)', fontWeight: 400 }}>
-                                {msg.job_id.slice(0, 8)}
-                              </span>
-                            )}
-                          </div>
-                          <pre style={{
-                            whiteSpace: 'pre-wrap', wordBreak: 'break-word',
-                            color: msg.role === 'error' ? 'var(--red)' : 'var(--text)',
-                            lineHeight: 1.7, margin: 0,
-                            fontFamily: 'var(--mono)', fontSize: 13,
-                          }}>
-                            {msg.content}
-                          </pre>
-                        </div>
-                      )}
-                    </div>
-                  ))}
-
-                  {/* Typing indicator */}
-                  {running && (
-                    <div style={{ padding: '6px 24px', display: 'flex', justifyContent: 'flex-start' }}>
-                      <div style={{ fontSize: 10, color: 'var(--muted)', letterSpacing: '0.1em' }}>
-                        <span style={{ color: 'var(--green)', marginRight: 8 }}>ghost</span>
-                        <span className="blink">▋</span>
-                      </div>
-                    </div>
-                  )}
-                </div>
-
-                {/* ── Input bar — pinned at bottom ── */}
-                <div style={{
-                  flexShrink: 0,
-                  borderTop: '1px solid var(--border)',
-                  background: 'var(--surface)',
-                  padding: '12px 20px 16px',
-                }}>
-                  {chatMessages.length > 0 && (
-                    <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 6 }}>
-                      <button
-                        onClick={() => setChatMessages([])}
-                        style={{ background: 'none', color: 'var(--muted)', fontSize: 10, padding: '2px 4px', letterSpacing: '0.05em' }}
-                      >
-                        clear
-                      </button>
-                    </div>
-                  )}
-                  <div style={{ display: 'flex', gap: 10, alignItems: 'flex-end' }}>
-                    <textarea
-                      ref={textareaRef}
-                      rows={1}
-                      placeholder={alive ? 'Message GHOST…' : 'daemon offline'}
-                      value={prompt}
-                      onChange={e => { setPrompt(e.target.value); autoResize(e) }}
-                      onKeyDown={handleKeyDown}
-                      disabled={running || !alive}
-                      style={{
-                        flex: 1,
-                        resize: 'none',
-                        minHeight: 44,
-                        maxHeight: 180,
-                        lineHeight: 1.6,
-                        padding: '11px 14px',
-                        overflowY: 'auto',
-                      }}
-                    />
-                    <button
-                      onClick={sendPrompt}
-                      disabled={running || !alive || !prompt.trim()}
-                      style={{
-                        flexShrink: 0,
-                        width: 44, height: 44,
-                        padding: 0,
-                        fontSize: 18,
-                        background: running || !alive || !prompt.trim() ? 'var(--border)' : 'var(--cyan)',
-                        color: running || !alive || !prompt.trim() ? 'var(--muted)' : '#000',
-                        cursor: running || !alive || !prompt.trim() ? 'not-allowed' : 'pointer',
-                        borderRadius: 8,
-                        display: 'flex', alignItems: 'center', justifyContent: 'center',
-                      }}
-                      title="Send (Enter)"
-                    >
-                      ↑
-                    </button>
-                  </div>
-                  <div style={{ marginTop: 6, fontSize: 10, color: 'var(--muted)', textAlign: 'center' }}>
-                    Enter to send · Shift+Enter for newline
-                  </div>
-                </div>
-              </div>
-            )}
-
-            {activeTab === 'memory' && (
-              <div style={{ display: 'flex', flexDirection: 'column', flex: 1, overflow: 'hidden', padding: 20, gap: 14 }}>
-                {/* Toolbar */}
-                <div style={{ display: 'flex', gap: 10, flexShrink: 0, alignItems: 'center' }}>
-                  <input
-                    type="text"
-                    placeholder="Filter notes..."
-                    value={memSearch}
-                    onChange={e => setMemSearch(e.target.value)}
-                    style={{ flex: 1 }}
-                  />
-                  <button
-                    onClick={loadNotes}
-                    disabled={notesLoading}
-                    style={{
-                      background: 'var(--border)',
-                      color: 'var(--text)',
-                      flexShrink: 0,
-                      padding: '8px 14px',
-                    }}
-                  >
-                    {notesLoading ? '...' : 'refresh'}
-                  </button>
-                </div>
-
-                {/* Notes list */}
-                <div style={{ flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 6 }}>
-                  {notesLoading && notes === null && (
-                    <div style={{ color: 'var(--muted)', fontSize: 12, padding: 8 }}>loading<span className="blink">_</span></div>
-                  )}
-                  {!notesLoading && notes !== null && notes.length === 0 && (
-                    <div style={{ color: 'var(--muted)', fontSize: 12, padding: 8 }}>
-                      no memories yet — GHOST learns as you chat
-                    </div>
-                  )}
-                  {notes && notes
-                    .filter(n => !memSearch || n.content.toLowerCase().includes(memSearch.toLowerCase()) || n.category.toLowerCase().includes(memSearch.toLowerCase()))
-                    .map(note => (
-                      <div key={note.id} style={{
-                        display: 'flex', alignItems: 'flex-start', gap: 10,
-                        background: '#080a0d',
-                        border: '1px solid var(--border)',
-                        borderRadius: 4,
-                        padding: '10px 12px',
-                      }}>
-                        <span style={{
-                          flexShrink: 0,
-                          fontSize: 9,
-                          fontWeight: 700,
-                          letterSpacing: '0.08em',
-                          textTransform: 'uppercase',
-                          color: '#000',
-                          background: CATEGORY_COLOR[note.category] || 'var(--muted)',
-                          borderRadius: 3,
-                          padding: '2px 6px',
-                          marginTop: 1,
-                        }}>
-                          {note.category}
-                        </span>
-                        <span style={{ flex: 1, color: 'var(--text)', fontSize: 12, lineHeight: 1.6 }}>
-                          {note.content}
-                        </span>
-                        <span style={{ flexShrink: 0, color: 'var(--muted)', fontSize: 10, marginTop: 2 }}>
-                          {note.created_at?.slice(0, 10)}
-                        </span>
-                        <button
-                          onClick={() => deleteNote(note.id)}
-                          style={{
-                            flexShrink: 0,
-                            background: 'none',
-                            color: 'var(--muted)',
-                            padding: '0 4px',
-                            fontSize: 14,
-                            lineHeight: 1,
-                          }}
-                          title="Delete note"
-                        >
-                          ×
-                        </button>
-                      </div>
-                    ))
-                  }
-                </div>
-              </div>
-            )}
-          </div>
-
-          {/* ── Right: Sessions ── */}
-          <div style={{
-            display: 'flex',
-            flexDirection: 'column',
-            overflow: 'hidden',
-          }}>
-            <div style={{
-              padding: '12px 16px',
-              borderBottom: '1px solid var(--border)',
-              background: 'var(--surface)',
-              fontSize: 11,
-              color: 'var(--muted)',
-              letterSpacing: '0.1em',
-              textTransform: 'uppercase',
-              flexShrink: 0,
-            }}>
-              Sessions ({sessions.length})
-            </div>
-
-            <div style={{ overflowY: 'auto', flex: 1 }}>
-              {sessions.length === 0 && (
-                <div style={{ padding: 20, color: 'var(--muted)', fontSize: 12 }}>
-                  {alive ? 'no sessions found' : 'daemon offline'}
-                </div>
-              )}
-              {sessions.map((s, i) => {
-                const ws = s.workspace?.slice(0, 8) ?? '????????'
-                const key = `${s.workspace ?? 'ws'}-${s.file ?? s.modified_unix ?? i}`
-                return (
-                  <div
-                    key={key}
-                    className="session-row"
-                    style={{
-                      padding: '10px 16px',
-                      borderBottom: '1px solid var(--border)',
-                    }}
-                  >
-                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                      <code style={{ color: 'var(--cyan)', fontSize: 12 }}>
-                        {ws}
-                      </code>
-                      <span style={{ color: 'var(--muted)', fontSize: 10 }}>
-                        {fmtBytes(s.bytes)}
-                      </span>
-                    </div>
-                    <div style={{ color: 'var(--muted)', fontSize: 10, marginTop: 2 }}>
-                      {timeAgo(s.modified_unix)}
-                    </div>
-                  </div>
-                )
-              })}
-            </div>
-          </div>
-
+          {activeNav === 'settings' && <SettingsPanel />}
+          {activeNav === 'statistics' && <StatisticsPanel />}
+          {activeNav === 'about' && <AboutPanel />}
+          {!activeNav && activeChat && (
+            <ChatArea
+              chat={activeChat}
+              alive={alive}
+              selectedAgents={selectedAgents}
+              setSelectedAgents={setSelectedAgents}
+              running={running}
+              onSendMessage={handleSendMessage}
+              onClearMessages={handleClearMessages}
+              agentsCollapsed={agentsCollapsed}
+              onAgentsCollapseToggle={() => setAgentsCollapsed(!agentsCollapsed)}
+            />
+          )}
+          {!activeNav && !activeChat && <NoChatSelected />}
         </div>
       </div>
-    </>
+    </div>
   )
 }

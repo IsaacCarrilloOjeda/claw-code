@@ -7,8 +7,8 @@
 
 use std::time::Duration;
 
-const HAIKU_MODEL: &str = "claude-haiku-4-5-20251001";
-const ANTHROPIC_MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
+use crate::constants::{ANTHROPIC_MESSAGES_URL, HAIKU_MODEL};
+
 const AI_TIMEOUT_SECS: u64 = 60;
 const MEMORY_SEARCH_LIMIT: i64 = 5;
 
@@ -30,12 +30,23 @@ pub async fn dispatch(
 
     let core_context = load_core_context();
     let memory_context = load_memory_context(message, pool).await;
-    let web_context = load_web_context(message).await;
+    let web_context = if should_search(message) {
+        load_web_context(message).await
+    } else {
+        String::new()
+    };
 
     let mut system = core_context;
     if !memory_context.is_empty() {
-        system.push_str("\n\n## What you remember about Isaac\n");
-        system.push_str(&memory_context);
+        system.push_str("\n\n## What you remember about Isaac\n<memory_notes>\n");
+        // Cap the memory block to prevent a poisoned store from bloating the prompt
+        let capped = if memory_context.len() > 4096 {
+            &memory_context[..4096]
+        } else {
+            &memory_context
+        };
+        system.push_str(capped);
+        system.push_str("\n</memory_notes>");
     }
     if !web_context.is_empty() {
         system.push_str("\n\n## Current web search results\n");
@@ -70,7 +81,7 @@ pub async fn dispatch(
 /// Embed the incoming message and pull the top-N most relevant memory notes.
 /// Returns a formatted string to inject into the system prompt, or empty string
 /// if the pool is absent, embedding fails, or no notes exist yet.
-async fn load_memory_context(message: &str, pool: Option<&sqlx::PgPool>) -> String {
+pub(crate) async fn load_memory_context(message: &str, pool: Option<&sqlx::PgPool>) -> String {
     let Some(pool) = pool else {
         return String::new();
     };
@@ -95,6 +106,30 @@ async fn load_memory_context(message: &str, pool: Option<&sqlx::PgPool>) -> Stri
         .join("\n")
 }
 
+/// Simple heuristic: returns `true` if the message looks like it would benefit
+/// from a web search. Avoids burning Brave Search quota on greetings / short
+/// confirmations.
+fn should_search(message: &str) -> bool {
+    const SEARCH_KEYWORDS: &[&str] = &[
+        "search", "look up", "find", "what is", "what are", "who is", "who are", "when is",
+        "when was", "where is", "how to", "how do", "latest", "current", "news", "weather",
+        "price", "stock", "define", "explain",
+    ];
+
+    if message.contains('?') {
+        return true;
+    }
+
+    let lower = message.to_ascii_lowercase();
+    for kw in SEARCH_KEYWORDS {
+        if lower.contains(kw) {
+            return true;
+        }
+    }
+
+    false
+}
+
 /// Run a Brave web search for the message and format results for injection.
 /// Returns empty string if `BRAVE_API_KEY` is unset or the search returns nothing.
 async fn load_web_context(message: &str) -> String {
@@ -113,7 +148,7 @@ async fn load_web_context(message: &str) -> String {
 
 /// Load the core context file. Falls back to a minimal default if the env var
 /// is unset or the file cannot be read.
-fn load_core_context() -> String {
+pub(crate) fn load_core_context() -> String {
     let path = match std::env::var("GHOST_CORE_CONTEXT_PATH") {
         Ok(p) if !p.is_empty() => p,
         _ => return "You are GHOST, a personal AI assistant.".to_string(),
@@ -125,13 +160,11 @@ fn load_core_context() -> String {
 }
 
 async fn call_anthropic(api_key: &str, body: &serde_json::Value) -> Result<String, String> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(AI_TIMEOUT_SECS))
-        .build()
-        .map_err(|e| format!("HTTP client build error: {e}"))?;
+    let client = crate::http_client::shared_client();
 
     let resp = client
         .post(ANTHROPIC_MESSAGES_URL)
+        .timeout(Duration::from_secs(AI_TIMEOUT_SECS))
         .header("x-api-key", api_key)
         .header("anthropic-version", "2023-06-01")
         .json(body)

@@ -165,6 +165,29 @@ pub async fn update_job_failed(pool: &PgPool, id: &str, error: &str) {
     .await;
 }
 
+/// Mark jobs stuck in `running` for over 1 hour as `failed`.
+/// Called at startup and on each health-check cycle.
+pub async fn cleanup_stale_jobs(pool: &PgPool) {
+    let result = sqlx::query(
+        "UPDATE jobs
+         SET status = 'failed',
+             output = 'stale: daemon restarted or timed out',
+             completed_at = now(),
+             updated_at = now()
+         WHERE status = 'running'
+           AND created_at < now() - interval '1 hour'",
+    )
+    .execute(pool)
+    .await;
+
+    if let Ok(r) = result {
+        let n = r.rows_affected();
+        if n > 0 {
+            eprintln!("[ghost db] cleaned up {n} stale job(s)");
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Director config model
 // ---------------------------------------------------------------------------
@@ -277,7 +300,12 @@ fn vec_to_pgvector(v: &[f32]) -> String {
 /// Insert a new memory note. `embedding` may be `None` when `OPENAI_API_KEY`
 /// is absent — the note is stored without a vector and won't appear in
 /// semantic search results but will still show in the memory panel.
-pub async fn insert_note(pool: &PgPool, category: &str, content: &str, embedding: Option<&[f32]>) -> bool {
+pub async fn insert_note(
+    pool: &PgPool,
+    category: &str,
+    content: &str,
+    embedding: Option<&[f32]>,
+) -> bool {
     let id = uuid::Uuid::new_v4().to_string();
     if let Some(emb) = embedding {
         let embedding_str = vec_to_pgvector(emb);

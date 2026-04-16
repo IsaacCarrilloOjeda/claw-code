@@ -34,6 +34,9 @@ use tokio::net::{TcpListener, TcpStream};
 
 use crate::db;
 
+use std::collections::HashMap;
+use std::sync::Mutex;
+
 const DEFAULT_DAEMON_PORT: u16 = 7878;
 const PID_FILENAME: &str = "daemon.pid";
 const LOG_PREFIX: &str = "[ghost daemon]";
@@ -43,6 +46,50 @@ const READ_CHUNK: usize = 8 * 1024;
 const HEALTH_CHECK_INTERVAL_SECS: u64 = 300;
 /// Confidence decay runs once every 24 hours.
 const DECAY_INTERVAL_SECS: u64 = 86_400;
+/// Maximum POST requests per IP per 60s window.
+const RATE_LIMIT_MAX: u32 = 30;
+/// Rate limit window in seconds.
+const RATE_LIMIT_WINDOW_SECS: u64 = 60;
+
+/// Simple in-memory token-bucket rate limiter keyed by IP address.
+struct RateLimiter {
+    /// Map of IP → (remaining tokens, window start time).
+    buckets: Mutex<HashMap<String, (u32, Instant)>>,
+}
+
+impl RateLimiter {
+    fn new() -> Self {
+        Self {
+            buckets: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Returns `true` if the request is allowed, `false` if rate-limited.
+    fn check(&self, ip: &str) -> bool {
+        let mut buckets = self
+            .buckets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = Instant::now();
+        let entry = buckets
+            .entry(ip.to_string())
+            .or_insert((RATE_LIMIT_MAX, now));
+
+        // Reset window if expired
+        if now.duration_since(entry.1).as_secs() >= RATE_LIMIT_WINDOW_SECS {
+            entry.0 = RATE_LIMIT_MAX;
+            entry.1 = now;
+        }
+
+        if entry.0 > 0 {
+            entry.0 -= 1;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 const DEFAULT_CORS_ORIGINS: &[&str] = &[
     "http://localhost:5173",
     "http://127.0.0.1:5173",
@@ -60,6 +107,8 @@ struct DaemonConfig {
     allow_unsafe_prompt: bool,
     /// Postgres connection pool. `None` when `DATABASE_URL` is not set.
     db: Option<Arc<PgPool>>,
+    /// In-memory rate limiter for POST endpoints.
+    rate_limiter: Arc<RateLimiter>,
 }
 
 /// Entry point called from `run()` in main.rs.
@@ -79,6 +128,7 @@ pub fn run_daemon(
             port,
             allow_unsafe_prompt,
             db,
+            rate_limiter: Arc::new(RateLimiter::new()),
         };
         daemon_main(cfg).await
     })
@@ -93,6 +143,15 @@ async fn daemon_main(cfg: DaemonConfig) -> Result<(), Box<dyn std::error::Error>
         }
     }
 
+    // Public bind requires auth key — prevent accidental open deployment.
+    if cfg.host == "0.0.0.0" && configured_key().is_none() {
+        return Err(
+            "GHOST_DAEMON_KEY must be set when binding 0.0.0.0 (public deployment). \
+             Set the key or bind 127.0.0.1 for local dev."
+                .into(),
+        );
+    }
+
     let addr = format!("{}:{}", cfg.host, cfg.port);
     let listener = TcpListener::bind(&addr).await.map_err(|e| {
         format!("ghost daemon: cannot bind {addr}: {e} — is another daemon already running?")
@@ -100,8 +159,9 @@ async fn daemon_main(cfg: DaemonConfig) -> Result<(), Box<dyn std::error::Error>
 
     write_pid_file()?;
 
-    // Spawn circuit-breaker health-reset task (resets primary/fallback_healthy every 5 min).
+    // Clean up stale jobs at startup, then spawn circuit-breaker health-reset task.
     if let Some(pool) = cfg.db.clone() {
+        db::cleanup_stale_jobs(&pool).await;
         tokio::spawn(async move {
             let mut interval =
                 tokio::time::interval(std::time::Duration::from_secs(HEALTH_CHECK_INTERVAL_SECS));
@@ -109,6 +169,7 @@ async fn daemon_main(cfg: DaemonConfig) -> Result<(), Box<dyn std::error::Error>
             loop {
                 interval.tick().await;
                 db::reset_health_flags(&pool).await;
+                db::cleanup_stale_jobs(&pool).await;
                 eprintln!("{LOG_PREFIX} circuit breaker: health flags reset");
             }
         });
@@ -180,7 +241,8 @@ async fn daemon_main(cfg: DaemonConfig) -> Result<(), Box<dyn std::error::Error>
                 }
             };
 
-            let (status_line, body) = dispatch(&cfg, &raw, uptime).await;
+            let peer_ip = peer.ip().to_string();
+            let (status_line, body) = dispatch(&cfg, &raw, uptime, &peer_ip).await;
 
             // Echo Origin only if it's in the allow-list
             let origin = header_value(&raw, "origin");
@@ -239,17 +301,16 @@ async fn read_http_request(stream: &mut TcpStream) -> Result<String, RequestErro
     // Parse Content-Length from the headers we already have
     let header_block =
         std::str::from_utf8(&buf[..header_end]).map_err(|_| RequestError::Malformed)?;
-    let content_length = header_block
+    let content_length: usize = match header_block
         .lines()
-        .find_map(|line| {
-            let lower = line.to_ascii_lowercase();
-            if lower.starts_with("content-length:") {
-                line[15..].trim().parse::<usize>().ok()
-            } else {
-                None
-            }
-        })
-        .unwrap_or(0);
+        .find(|line| line.to_ascii_lowercase().starts_with("content-length:"))
+    {
+        Some(line) => line[15..]
+            .trim()
+            .parse()
+            .map_err(|_| RequestError::Malformed)?,
+        None => 0, // No Content-Length header is fine (GET requests)
+    };
 
     if content_length > MAX_REQUEST_BYTES {
         return Err(RequestError::TooLarge);
@@ -289,7 +350,11 @@ async fn write_response(
     let mut headers = format!(
         "HTTP/1.1 {status_line}\r\n\
          Content-Type: application/json\r\n\
-         Content-Length: {}\r\n",
+         Content-Length: {}\r\n\
+         X-Content-Type-Options: nosniff\r\n\
+         X-Frame-Options: DENY\r\n\
+         Content-Security-Policy: default-src 'none'\r\n\
+         Cache-Control: no-store\r\n",
         body.len()
     );
     if let Some(origin) = allowed_origin {
@@ -451,7 +516,12 @@ fn auth_matches(raw: &str) -> bool {
 // Request routing
 // ---------------------------------------------------------------------------
 
-async fn dispatch(cfg: &DaemonConfig, raw: &str, uptime_secs: u64) -> (&'static str, String) {
+async fn dispatch(
+    cfg: &DaemonConfig,
+    raw: &str,
+    uptime_secs: u64,
+    peer_ip: &str,
+) -> (&'static str, String) {
     let first_line = raw.lines().next().unwrap_or("");
     let parts: Vec<&str> = first_line.split_whitespace().collect();
 
@@ -467,6 +537,14 @@ async fn dispatch(cfg: &DaemonConfig, raw: &str, uptime_secs: u64) -> (&'static 
         return (
             "421 Misdirected Request",
             r#"{"error":"host header not allowed"}"#.to_owned(),
+        );
+    }
+
+    // Rate-limit POST endpoints (GET / OPTIONS / preflight are exempt).
+    if method == "POST" && !cfg.rate_limiter.check(peer_ip) {
+        return (
+            "429 Too Many Requests",
+            r#"{"error":"rate limited"}"#.to_owned(),
         );
     }
 
@@ -511,7 +589,7 @@ async fn dispatch(cfg: &DaemonConfig, raw: &str, uptime_secs: u64) -> (&'static 
         }
         ("POST", "/chat") => chat_handler(cfg, raw).await,
         ("POST", "/sms/inbound") => sms_inbound(cfg, raw).await,
-        ("POST", "/sms/send") => sms_send_handler(raw).await,
+        ("POST", "/sms/send") => sms_send_handler(raw, cfg).await,
         ("OPTIONS", _) => options_preflight(),
         _ => ("404 Not Found", r#"{"error":"not found"}"#.to_owned()),
     }
@@ -712,6 +790,7 @@ async fn run_prompt(raw: &str) -> (&'static str, String) {
         "OPENAI_API_KEY",
         "OPENAI_BASE_URL",
         "CLAW_CONFIG_HOME",
+        "GHOST_CONFIG_HOME",
     ] {
         if let Ok(val) = std::env::var(var) {
             cmd.env(var, val);
@@ -762,6 +841,10 @@ fn redact_secrets(s: &str) -> String {
         std::env::var("ANTHROPIC_API_KEY").ok(),
         std::env::var("ANTHROPIC_AUTH_TOKEN").ok(),
         std::env::var("OPENAI_API_KEY").ok(),
+        std::env::var("GHOST_DAEMON_KEY").ok(),
+        std::env::var("VOYAGE_API_KEY").ok(),
+        std::env::var("BRAVE_API_KEY").ok(),
+        std::env::var("TWILIO_AUTH_TOKEN").ok(),
         read_api_key_from_settings(),
     ];
     for secret in secret_sources.into_iter().flatten() {
@@ -801,16 +884,19 @@ async fn chat_handler(cfg: &DaemonConfig, raw: &str) -> (&'static str, String) {
         );
     };
 
-    let message = body["message"]
-        .as_str()
-        .unwrap_or("")
-        .trim()
-        .to_string();
+    let message = body["message"].as_str().unwrap_or("").trim().to_string();
 
     if message.is_empty() {
         return (
             "400 Bad Request",
             r#"{"error":"missing message"}"#.to_owned(),
+        );
+    }
+
+    if message.len() > 16_384 {
+        return (
+            "400 Bad Request",
+            r#"{"error":"message too long (max 16384 bytes)"}"#.to_owned(),
         );
     }
 
@@ -846,8 +932,7 @@ async fn chat_handler(cfg: &DaemonConfig, raw: &str) -> (&'static str, String) {
         ("chat_dispatcher", message.clone())
     };
 
-    let Some(job_id) =
-        db::create_job(pool_ref, &message, agent_name, "dashboard", None).await
+    let Some(job_id) = db::create_job(pool_ref, &message, agent_name, "dashboard", None).await
     else {
         return (
             "500 Internal Server Error",
@@ -856,7 +941,7 @@ async fn chat_handler(cfg: &DaemonConfig, raw: &str) -> (&'static str, String) {
     };
 
     let result = if agent_name == "director" {
-        crate::director::handle(&process_msg, &job_id).await
+        crate::director::handle(&process_msg, &job_id, Some(pool_ref)).await
     } else {
         crate::chat_dispatcher::dispatch(&process_msg, &history, &job_id, Some(pool_ref)).await
     };
@@ -885,6 +970,7 @@ async fn chat_handler(cfg: &DaemonConfig, raw: &str) -> (&'static str, String) {
 ///   - starts with `.` → ignore (reserved), return 200
 ///   - starts with `!` → Director stub (strip `!`)
 ///   - everything else → Chat dispatcher
+#[allow(clippy::too_many_lines)]
 async fn sms_inbound(cfg: &DaemonConfig, raw: &str) -> (&'static str, String) {
     let (headers_part, body_str) = raw
         .split_once("\r\n\r\n")
@@ -892,13 +978,18 @@ async fn sms_inbound(cfg: &DaemonConfig, raw: &str) -> (&'static str, String) {
         .map_or(("", ""), |(h, b)| (h, b));
 
     // Twilio sends application/x-www-form-urlencoded; Gateway sends JSON.
-    let is_form = headers_part
-        .lines()
-        .any(|l| l.to_ascii_lowercase().contains("application/x-www-form-urlencoded"));
+    let is_form = headers_part.lines().any(|l| {
+        l.to_ascii_lowercase()
+            .contains("application/x-www-form-urlencoded")
+    });
 
     let (message, phone_from) = if is_form {
         let fields = parse_urlencoded(body_str);
-        let msg = fields.get("Body").map_or("", String::as_str).trim().to_string();
+        let msg = fields
+            .get("Body")
+            .map_or("", String::as_str)
+            .trim()
+            .to_string();
         let from = fields.get("From").cloned().unwrap_or_default();
         (msg, from)
     } else {
@@ -931,9 +1022,15 @@ async fn sms_inbound(cfg: &DaemonConfig, raw: &str) -> (&'static str, String) {
     }
 
     // Whitelist check — only process messages from allowed numbers.
+    // Numbers are normalized (stripped to digits + leading +) before comparison
+    // so "+1-234-567-8900" matches "+12345678900".
     if let Ok(allowed) = std::env::var("GHOST_ALLOWED_NUMBERS") {
-        let allowed_list: Vec<&str> = allowed.split(',').map(str::trim).collect();
-        if !phone_from.is_empty() && !allowed_list.iter().any(|n| *n == phone_from) {
+        let normalized_from = normalize_phone(&phone_from);
+        let allowed_list: Vec<String> = allowed
+            .split(',')
+            .map(|n| normalize_phone(n.trim()))
+            .collect();
+        if !normalized_from.is_empty() && !allowed_list.contains(&normalized_from) {
             return ("200 OK", r#"{"status":"ignored"}"#.to_owned());
         }
     }
@@ -973,7 +1070,7 @@ async fn sms_inbound(cfg: &DaemonConfig, raw: &str) -> (&'static str, String) {
 
     tokio::spawn(async move {
         let result = if use_director {
-            crate::director::handle(&process_msg, &job_id_bg).await
+            crate::director::handle(&process_msg, &job_id_bg, Some(&pool_arc)).await
         } else {
             // SMS is single-turn — no conversation history.
             crate::chat_dispatcher::dispatch(&process_msg, &[], &job_id_bg, Some(&pool_arc)).await
@@ -1003,7 +1100,11 @@ async fn sms_inbound(cfg: &DaemonConfig, raw: &str) -> (&'static str, String) {
 /// `POST /sms/send` — internal helper to deliver an outbound SMS.
 ///
 /// Body: `{"to": "+1234567890", "body": "Hello"}`
-async fn sms_send_handler(raw: &str) -> (&'static str, String) {
+async fn sms_send_handler(raw: &str, _cfg: &DaemonConfig) -> (&'static str, String) {
+    if configured_key().is_some() && !auth_matches(raw) {
+        return ("401 Unauthorized", r#"{"error":"unauthorized"}"#.to_owned());
+    }
+
     let body_str = raw
         .split_once("\r\n\r\n")
         .or_else(|| raw.split_once("\n\n"))
@@ -1077,6 +1178,18 @@ async fn memory_delete(db: Option<&PgPool>, raw: &str, id: &str) -> (&'static st
 // ---------------------------------------------------------------------------
 // Form body helpers (Twilio inbound webhook)
 // ---------------------------------------------------------------------------
+
+/// Normalize a phone number for comparison: strip everything except digits and
+/// a leading `+`. E.g. `"+1-234-567-8900"` → `"+12345678900"`.
+fn normalize_phone(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for (i, c) in s.chars().enumerate() {
+        if c.is_ascii_digit() || (i == 0 && c == '+') {
+            out.push(c);
+        }
+    }
+    out
+}
 
 /// Parse `application/x-www-form-urlencoded` into key→value pairs.
 fn parse_urlencoded(s: &str) -> std::collections::HashMap<String, String> {
@@ -1199,7 +1312,9 @@ pub fn daemon_config_home_pub() -> std::path::PathBuf {
 }
 
 fn daemon_config_home() -> std::path::PathBuf {
-    std::env::var_os("CLAW_CONFIG_HOME")
+    // GHOST_ prefix takes precedence; fall back to legacy CLAW_ for backward compat.
+    std::env::var_os("GHOST_CONFIG_HOME")
+        .or_else(|| std::env::var_os("CLAW_CONFIG_HOME"))
         .map(std::path::PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".claw")))
         .or_else(|| {
@@ -1233,6 +1348,7 @@ mod tests {
             port: 7878,
             allow_unsafe_prompt: true,
             db: None,
+            rate_limiter: Arc::new(RateLimiter::new()),
         }
     }
 
@@ -1324,5 +1440,35 @@ mod tests {
         assert!(is_origin_allowed("http://127.0.0.1:5173"));
         assert!(is_origin_allowed("http://[::1]:5173"));
         assert!(!is_origin_allowed("http://evil.example"));
+    }
+
+    #[test]
+    fn normalize_phone_strips_formatting() {
+        assert_eq!(normalize_phone("+1-234-567-8900"), "+12345678900");
+        assert_eq!(normalize_phone("(234) 567-8900"), "2345678900");
+        assert_eq!(normalize_phone("+12345678900"), "+12345678900");
+        assert_eq!(normalize_phone(""), "");
+        assert_eq!(normalize_phone("  +1 234  "), "1234");
+    }
+
+    #[test]
+    fn rate_limiter_allows_within_budget() {
+        let rl = RateLimiter::new();
+        for _ in 0..RATE_LIMIT_MAX {
+            assert!(rl.check("1.2.3.4"));
+        }
+        // Next request should be denied
+        assert!(!rl.check("1.2.3.4"));
+        // Different IP is fine
+        assert!(rl.check("5.6.7.8"));
+    }
+
+    #[test]
+    fn redact_secrets_covers_daemon_key() {
+        std::env::set_var("GHOST_DAEMON_KEY", "supersecretkey123");
+        let output = redact_secrets("token is supersecretkey123 ok");
+        assert!(output.contains("***redacted***"));
+        assert!(!output.contains("supersecretkey123"));
+        std::env::remove_var("GHOST_DAEMON_KEY");
     }
 }
