@@ -51,7 +51,7 @@ pub async fn dispatch(
         system.push_str("\n</memory_notes>");
     }
     if !web_context.is_empty() {
-        system.push_str("\n\n## Current web search results\n");
+        system.push_str("\n\n## Current web search results\nUse these results to answer the user's question:\n");
         system.push_str(&web_context);
     }
 
