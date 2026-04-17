@@ -288,7 +288,7 @@ pub struct MemoryNote {
 }
 
 /// Format a float vector as a pgvector literal: `[v1,v2,...]`
-fn vec_to_pgvector(v: &[f32]) -> String {
+pub fn vec_to_pgvector(v: &[f32]) -> String {
     let inner = v
         .iter()
         .map(ToString::to_string)
@@ -686,6 +686,594 @@ pub async fn cleanup_response_cache(pool: &PgPool) {
             eprintln!("[ghost db] cleaned up {n} stale response cache entries");
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Bible Agent models (Phase B0)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BibleVerse {
+    pub id: String,
+    pub book: String,
+    pub chapter: i32,
+    pub verse: i32,
+    pub book_order: i32,
+    pub testament: String,
+    pub original_lang: String,
+    pub original_text: String,
+    pub kjv_text: String,
+    pub web_text: Option<String>,
+    pub strongs: Vec<String>,
+    pub morphology: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BiblePericope {
+    pub id: String,
+    pub title: String,
+    pub start_book: String,
+    pub start_chapter: i32,
+    pub start_verse: i32,
+    pub end_book: String,
+    pub end_chapter: i32,
+    pub end_verse: i32,
+    pub genre: Option<String>,
+    pub summary: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BibleCrossRef {
+    pub id: String,
+    pub source_book: String,
+    pub source_chapter: i32,
+    pub source_verse: i32,
+    pub target_book: String,
+    pub target_chapter: i32,
+    pub target_verse: i32,
+    pub rel_type: String,
+    pub source_dataset: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LexiconEntry {
+    pub strongs_id: String,
+    pub original_word: String,
+    pub transliteration: String,
+    pub lang: String,
+    pub root: Option<String>,
+    pub definition: String,
+    pub usage_count: i32,
+    pub semantic_range: Vec<String>,
+}
+
+fn row_to_bible_verse(row: &sqlx::postgres::PgRow) -> BibleVerse {
+    BibleVerse {
+        id: row.try_get("id").unwrap_or_default(),
+        book: row.try_get("book").unwrap_or_default(),
+        chapter: row.try_get("chapter").unwrap_or(0),
+        verse: row.try_get("verse").unwrap_or(0),
+        book_order: row.try_get("book_order").unwrap_or(0),
+        testament: row.try_get("testament").unwrap_or_default(),
+        original_lang: row.try_get("original_lang").unwrap_or_default(),
+        original_text: row.try_get("original_text").unwrap_or_default(),
+        kjv_text: row.try_get("kjv_text").unwrap_or_default(),
+        web_text: row.try_get("web_text").unwrap_or(None),
+        strongs: row.try_get::<Vec<String>, _>("strongs").unwrap_or_default(),
+        morphology: row.try_get("morphology").unwrap_or(None),
+    }
+}
+
+fn row_to_bible_pericope(row: &sqlx::postgres::PgRow) -> BiblePericope {
+    BiblePericope {
+        id: row.try_get("id").unwrap_or_default(),
+        title: row.try_get("title").unwrap_or_default(),
+        start_book: row.try_get("start_book").unwrap_or_default(),
+        start_chapter: row.try_get("start_chapter").unwrap_or(0),
+        start_verse: row.try_get("start_verse").unwrap_or(0),
+        end_book: row.try_get("end_book").unwrap_or_default(),
+        end_chapter: row.try_get("end_chapter").unwrap_or(0),
+        end_verse: row.try_get("end_verse").unwrap_or(0),
+        genre: row.try_get("genre").unwrap_or(None),
+        summary: row.try_get("summary").unwrap_or(None),
+    }
+}
+
+fn row_to_cross_ref(row: &sqlx::postgres::PgRow) -> BibleCrossRef {
+    BibleCrossRef {
+        id: row.try_get("id").unwrap_or_default(),
+        source_book: row.try_get("source_book").unwrap_or_default(),
+        source_chapter: row.try_get("source_chapter").unwrap_or(0),
+        source_verse: row.try_get("source_verse").unwrap_or(0),
+        target_book: row.try_get("target_book").unwrap_or_default(),
+        target_chapter: row.try_get("target_chapter").unwrap_or(0),
+        target_verse: row.try_get("target_verse").unwrap_or(0),
+        rel_type: row.try_get("rel_type").unwrap_or_default(),
+        source_dataset: row.try_get("source_dataset").unwrap_or_default(),
+    }
+}
+
+fn row_to_lexicon_entry(row: &sqlx::postgres::PgRow) -> LexiconEntry {
+    LexiconEntry {
+        strongs_id: row.try_get("strongs_id").unwrap_or_default(),
+        original_word: row.try_get("original_word").unwrap_or_default(),
+        transliteration: row.try_get("transliteration").unwrap_or_default(),
+        lang: row.try_get("lang").unwrap_or_default(),
+        root: row.try_get("root").unwrap_or(None),
+        definition: row.try_get("definition").unwrap_or_default(),
+        usage_count: row.try_get("usage_count").unwrap_or(0),
+        semantic_range: row
+            .try_get::<Vec<String>, _>("semantic_range")
+            .unwrap_or_default(),
+    }
+}
+
+/// Semantic search on `bible_verses` by embedding similarity. Returns (verse, distance).
+pub async fn search_bible_verses(
+    pool: &PgPool,
+    embedding: &[f32],
+    limit: i64,
+) -> Vec<(BibleVerse, f64)> {
+    let embedding_str = vec_to_pgvector(embedding);
+    let rows = sqlx::query(
+        "SELECT id::text, book, chapter, verse, book_order, testament, original_lang,
+                original_text, kjv_text, web_text, strongs, morphology,
+                (embedding <=> $1::vector) AS distance
+         FROM bible_verses
+         WHERE embedding IS NOT NULL
+         ORDER BY embedding <=> $1::vector
+         LIMIT $2",
+    )
+    .bind(&embedding_str)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    rows.iter()
+        .map(|row| {
+            let v = row_to_bible_verse(row);
+            let distance: f64 = row.try_get("distance").unwrap_or(1.0);
+            (v, distance)
+        })
+        .collect()
+}
+
+/// Semantic search on `bible_pericopes` by embedding similarity.
+pub async fn search_bible_pericopes(
+    pool: &PgPool,
+    embedding: &[f32],
+    limit: i64,
+) -> Vec<(BiblePericope, f64)> {
+    let embedding_str = vec_to_pgvector(embedding);
+    let rows = sqlx::query(
+        "SELECT id::text, title, start_book, start_chapter, start_verse,
+                end_book, end_chapter, end_verse, genre, summary,
+                (embedding <=> $1::vector) AS distance
+         FROM bible_pericopes
+         WHERE embedding IS NOT NULL
+         ORDER BY embedding <=> $1::vector
+         LIMIT $2",
+    )
+    .bind(&embedding_str)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    rows.iter()
+        .map(|row| {
+            let p = row_to_bible_pericope(row);
+            let distance: f64 = row.try_get("distance").unwrap_or(1.0);
+            (p, distance)
+        })
+        .collect()
+}
+
+/// Fetch a single verse by book/chapter/verse.
+pub async fn get_bible_verse(
+    pool: &PgPool,
+    book: &str,
+    chapter: i32,
+    verse: i32,
+) -> Option<BibleVerse> {
+    let row = sqlx::query(
+        "SELECT id::text, book, chapter, verse, book_order, testament, original_lang,
+                original_text, kjv_text, web_text, strongs, morphology
+         FROM bible_verses
+         WHERE book = $1 AND chapter = $2 AND verse = $3",
+    )
+    .bind(book)
+    .bind(chapter)
+    .bind(verse)
+    .fetch_optional(pool)
+    .await
+    .ok()??;
+
+    Some(row_to_bible_verse(&row))
+}
+
+/// Fetch a range of verses (e.g., Romans 8:28-30). Ordered by chapter, verse.
+pub async fn get_bible_verse_range(
+    pool: &PgPool,
+    book: &str,
+    start_chapter: i32,
+    start_verse: i32,
+    end_chapter: i32,
+    end_verse: i32,
+) -> Vec<BibleVerse> {
+    let rows = if start_chapter == end_chapter {
+        sqlx::query(
+            "SELECT id::text, book, chapter, verse, book_order, testament, original_lang,
+                    original_text, kjv_text, web_text, strongs, morphology
+             FROM bible_verses
+             WHERE book = $1 AND chapter = $2 AND verse >= $3 AND verse <= $4
+             ORDER BY chapter, verse",
+        )
+        .bind(book)
+        .bind(start_chapter)
+        .bind(start_verse)
+        .bind(end_verse)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default()
+    } else {
+        sqlx::query(
+            "SELECT id::text, book, chapter, verse, book_order, testament, original_lang,
+                    original_text, kjv_text, web_text, strongs, morphology
+             FROM bible_verses
+             WHERE book = $1
+               AND ((chapter = $2 AND verse >= $3)
+                    OR (chapter > $2 AND chapter < $4)
+                    OR (chapter = $4 AND verse <= $5))
+             ORDER BY chapter, verse",
+        )
+        .bind(book)
+        .bind(start_chapter)
+        .bind(start_verse)
+        .bind(end_chapter)
+        .bind(end_verse)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default()
+    };
+
+    rows.iter().map(row_to_bible_verse).collect()
+}
+
+/// Get all cross-references FROM a given verse (1-hop outbound).
+pub async fn get_cross_refs_from(
+    pool: &PgPool,
+    book: &str,
+    chapter: i32,
+    verse: i32,
+) -> Vec<BibleCrossRef> {
+    let rows = sqlx::query(
+        "SELECT id::text, source_book, source_chapter, source_verse,
+                target_book, target_chapter, target_verse, rel_type, source_dataset
+         FROM bible_cross_refs
+         WHERE source_book = $1 AND source_chapter = $2 AND source_verse = $3",
+    )
+    .bind(book)
+    .bind(chapter)
+    .bind(verse)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    rows.iter().map(row_to_cross_ref).collect()
+}
+
+/// Get all cross-references TO a given verse (1-hop inbound).
+pub async fn get_cross_refs_to(
+    pool: &PgPool,
+    book: &str,
+    chapter: i32,
+    verse: i32,
+) -> Vec<BibleCrossRef> {
+    let rows = sqlx::query(
+        "SELECT id::text, source_book, source_chapter, source_verse,
+                target_book, target_chapter, target_verse, rel_type, source_dataset
+         FROM bible_cross_refs
+         WHERE target_book = $1 AND target_chapter = $2 AND target_verse = $3",
+    )
+    .bind(book)
+    .bind(chapter)
+    .bind(verse)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    rows.iter().map(row_to_cross_ref).collect()
+}
+
+/// Look up a Strong's number (e.g., "H1254" or "G26").
+pub async fn get_lexicon_entry(pool: &PgPool, strongs_id: &str) -> Option<LexiconEntry> {
+    let row = sqlx::query(
+        "SELECT strongs_id, original_word, transliteration, lang, root,
+                definition, usage_count, semantic_range
+         FROM bible_lexicon
+         WHERE strongs_id = $1",
+    )
+    .bind(strongs_id)
+    .fetch_optional(pool)
+    .await
+    .ok()??;
+
+    Some(row_to_lexicon_entry(&row))
+}
+
+/// Find all verses containing a specific Strong's number.
+pub async fn search_verses_by_strongs(
+    pool: &PgPool,
+    strongs_id: &str,
+    limit: i64,
+) -> Vec<BibleVerse> {
+    let rows = sqlx::query(
+        "SELECT id::text, book, chapter, verse, book_order, testament, original_lang,
+                original_text, kjv_text, web_text, strongs, morphology
+         FROM bible_verses
+         WHERE $1 = ANY(strongs)
+         ORDER BY book_order, chapter, verse
+         LIMIT $2",
+    )
+    .bind(strongs_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    rows.iter().map(row_to_bible_verse).collect()
+}
+
+/// Find all lexicon entries sharing the same root.
+pub async fn search_lexicon_by_root(pool: &PgPool, root: &str) -> Vec<LexiconEntry> {
+    let rows = sqlx::query(
+        "SELECT strongs_id, original_word, transliteration, lang, root,
+                definition, usage_count, semantic_range
+         FROM bible_lexicon
+         WHERE root = $1",
+    )
+    .bind(root)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    rows.iter().map(row_to_lexicon_entry).collect()
+}
+
+/// Insert a verse. Returns true on success. Skips if (book, chapter, verse) already exists.
+#[allow(clippy::too_many_arguments)]
+pub async fn insert_bible_verse(
+    pool: &PgPool,
+    book: &str,
+    chapter: i32,
+    verse: i32,
+    book_order: i32,
+    testament: &str,
+    original_lang: &str,
+    original_text: &str,
+    kjv_text: &str,
+    web_text: Option<&str>,
+    strongs: &[String],
+    morphology: Option<&serde_json::Value>,
+    embedding: Option<&[f32]>,
+    pericope_id: Option<&str>,
+) -> bool {
+    let id = uuid::Uuid::new_v4().to_string();
+    if let Some(emb) = embedding {
+        let embedding_str = vec_to_pgvector(emb);
+        sqlx::query(
+            "INSERT INTO bible_verses (id, book, chapter, verse, book_order, testament,
+                    original_lang, original_text, kjv_text, web_text, strongs, morphology,
+                    embedding, pericope_id)
+             VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::vector, $14::uuid)
+             ON CONFLICT (book, chapter, verse) DO NOTHING",
+        )
+        .bind(&id)
+        .bind(book)
+        .bind(chapter)
+        .bind(verse)
+        .bind(book_order)
+        .bind(testament)
+        .bind(original_lang)
+        .bind(original_text)
+        .bind(kjv_text)
+        .bind(web_text)
+        .bind(strongs)
+        .bind(morphology)
+        .bind(&embedding_str)
+        .bind(pericope_id)
+        .execute(pool)
+        .await
+        .is_ok()
+    } else {
+        sqlx::query(
+            "INSERT INTO bible_verses (id, book, chapter, verse, book_order, testament,
+                    original_lang, original_text, kjv_text, web_text, strongs, morphology,
+                    pericope_id)
+             VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::uuid)
+             ON CONFLICT (book, chapter, verse) DO NOTHING",
+        )
+        .bind(&id)
+        .bind(book)
+        .bind(chapter)
+        .bind(verse)
+        .bind(book_order)
+        .bind(testament)
+        .bind(original_lang)
+        .bind(original_text)
+        .bind(kjv_text)
+        .bind(web_text)
+        .bind(strongs)
+        .bind(morphology)
+        .bind(pericope_id)
+        .execute(pool)
+        .await
+        .is_ok()
+    }
+}
+
+/// Insert a pericope. Returns the generated UUID.
+#[allow(clippy::too_many_arguments)]
+pub async fn insert_bible_pericope(
+    pool: &PgPool,
+    title: &str,
+    start_book: &str,
+    start_chapter: i32,
+    start_verse: i32,
+    end_book: &str,
+    end_chapter: i32,
+    end_verse: i32,
+    genre: Option<&str>,
+    summary: Option<&str>,
+    embedding: Option<&[f32]>,
+) -> Option<String> {
+    let id = uuid::Uuid::new_v4().to_string();
+    let result = if let Some(emb) = embedding {
+        let embedding_str = vec_to_pgvector(emb);
+        sqlx::query(
+            "INSERT INTO bible_pericopes (id, title, start_book, start_chapter, start_verse,
+                    end_book, end_chapter, end_verse, genre, summary, embedding)
+             VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::vector)",
+        )
+        .bind(&id)
+        .bind(title)
+        .bind(start_book)
+        .bind(start_chapter)
+        .bind(start_verse)
+        .bind(end_book)
+        .bind(end_chapter)
+        .bind(end_verse)
+        .bind(genre)
+        .bind(summary)
+        .bind(&embedding_str)
+        .execute(pool)
+        .await
+    } else {
+        sqlx::query(
+            "INSERT INTO bible_pericopes (id, title, start_book, start_chapter, start_verse,
+                    end_book, end_chapter, end_verse, genre, summary)
+             VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+        )
+        .bind(&id)
+        .bind(title)
+        .bind(start_book)
+        .bind(start_chapter)
+        .bind(start_verse)
+        .bind(end_book)
+        .bind(end_chapter)
+        .bind(end_verse)
+        .bind(genre)
+        .bind(summary)
+        .execute(pool)
+        .await
+    };
+
+    match result {
+        Ok(_) => Some(id),
+        Err(e) => {
+            eprintln!("[ghost db] insert_bible_pericope failed: {e}");
+            None
+        }
+    }
+}
+
+/// Insert a cross-reference. Skips duplicates silently.
+#[allow(clippy::too_many_arguments)]
+pub async fn insert_bible_cross_ref(
+    pool: &PgPool,
+    source_book: &str,
+    source_chapter: i32,
+    source_verse: i32,
+    target_book: &str,
+    target_chapter: i32,
+    target_verse: i32,
+    rel_type: &str,
+    source_dataset: &str,
+) -> bool {
+    let id = uuid::Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO bible_cross_refs (id, source_book, source_chapter, source_verse,
+                target_book, target_chapter, target_verse, rel_type, source_dataset)
+         VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9)",
+    )
+    .bind(&id)
+    .bind(source_book)
+    .bind(source_chapter)
+    .bind(source_verse)
+    .bind(target_book)
+    .bind(target_chapter)
+    .bind(target_verse)
+    .bind(rel_type)
+    .bind(source_dataset)
+    .execute(pool)
+    .await
+    .is_ok()
+}
+
+/// Insert a lexicon entry. Upserts on `strongs_id`.
+#[allow(clippy::too_many_arguments)]
+pub async fn insert_lexicon_entry(
+    pool: &PgPool,
+    strongs_id: &str,
+    original_word: &str,
+    transliteration: &str,
+    lang: &str,
+    root: Option<&str>,
+    definition: &str,
+    usage_count: i32,
+    semantic_range: &[String],
+) -> bool {
+    sqlx::query(
+        "INSERT INTO bible_lexicon (strongs_id, original_word, transliteration, lang, root,
+                definition, usage_count, semantic_range)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         ON CONFLICT (strongs_id) DO UPDATE
+         SET definition = EXCLUDED.definition,
+             usage_count = EXCLUDED.usage_count,
+             semantic_range = EXCLUDED.semantic_range",
+    )
+    .bind(strongs_id)
+    .bind(original_word)
+    .bind(transliteration)
+    .bind(lang)
+    .bind(root)
+    .bind(definition)
+    .bind(usage_count)
+    .bind(semantic_range)
+    .execute(pool)
+    .await
+    .is_ok()
+}
+
+/// Return counts of all Bible tables for health/status display.
+pub async fn bible_stats(pool: &PgPool) -> (i64, i64, i64, i64) {
+    let verse_count: i64 = sqlx::query("SELECT COUNT(*) AS cnt FROM bible_verses")
+        .fetch_one(pool)
+        .await
+        .map(|row| row.try_get("cnt").unwrap_or(0))
+        .unwrap_or(0);
+
+    let pericope_count: i64 = sqlx::query("SELECT COUNT(*) AS cnt FROM bible_pericopes")
+        .fetch_one(pool)
+        .await
+        .map(|row| row.try_get("cnt").unwrap_or(0))
+        .unwrap_or(0);
+
+    let crossref_count: i64 = sqlx::query("SELECT COUNT(*) AS cnt FROM bible_cross_refs")
+        .fetch_one(pool)
+        .await
+        .map(|row| row.try_get("cnt").unwrap_or(0))
+        .unwrap_or(0);
+
+    let lexicon_count: i64 = sqlx::query("SELECT COUNT(*) AS cnt FROM bible_lexicon")
+        .fetch_one(pool)
+        .await
+        .map(|row| row.try_get("cnt").unwrap_or(0))
+        .unwrap_or(0);
+
+    (verse_count, pericope_count, crossref_count, lexicon_count)
 }
 
 // ---------------------------------------------------------------------------
