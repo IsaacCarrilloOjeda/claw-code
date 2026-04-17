@@ -308,7 +308,7 @@ tokio::spawn(async move {
 
 # ============================================================
 # PHASE D1 — Orchestrator Module (Planning)
-# STATUS: NOT STARTED
+# STATUS: COMPLETE (2026-04-16)
 # ============================================================
 
 ## What You Are Building
@@ -406,7 +406,7 @@ Produce 3-15 items. If the task is simple enough for one step, output one [DO] i
 
 # ============================================================
 # PHASE D2 — Worker Execution + Checkpoints
-# STATUS: NOT STARTED (requires D1)
+# STATUS: COMPLETE (2026-04-16)
 # ============================================================
 
 ## What You Are Building
@@ -824,8 +824,8 @@ Format: [SPECULATE] description ||| hypothesis_a: worker_prompt_a ||| hypothesis
 | **A** | Cascade routing + filler stripping | — | ~200 lines | DONE |
 | **B** | Intake model (prompt polisher) | A | ~150 lines | 1 |
 | **C** | Scholar database | A | ~250 lines | 1 |
-| **D1** | Orchestrator module (planning) | A, B | ~250 lines | 1 |
-| **D2** | Worker execution + checkpoints | D1, C | ~300 lines | 1 |
+| **D1** | Orchestrator module (planning) | A, B | ~250 lines | DONE |
+| **D2** | Worker execution + checkpoints | D1, C | ~300 lines | DONE |
 | **E1** | Code macro system | D1, D2 | ~250 lines | 1 |
 | **E2** | Prompt compression (abbreviations) | A | ~100 lines | 1 |
 | **F1** | Token recycling (response cache) | C | ~200 lines | 1 |

@@ -17,6 +17,7 @@ mod http_client;
 mod init;
 mod input;
 mod memory;
+mod orchestrator;
 mod render;
 mod routing;
 mod search;
