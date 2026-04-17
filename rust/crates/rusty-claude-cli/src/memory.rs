@@ -102,6 +102,128 @@ async fn embed_openai(text: &str, api_key: &str) -> Result<Vec<f32>, String> {
     parse_embedding(&json["data"][0]["embedding"], "OpenAI")
 }
 
+/// Batch-embed multiple texts. Tries Voyage first (supports up to 128 inputs
+/// per call). Falls back to sequential individual `embed()` calls if batch API
+/// fails or keys are missing.
+pub async fn embed_batch(texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
+    if texts.is_empty() {
+        return Ok(vec![]);
+    }
+
+    // Try Voyage batch (supports up to 128 inputs per call)
+    if let Ok(key) = std::env::var("VOYAGE_API_KEY") {
+        match embed_batch_voyage(texts, &key).await {
+            Ok(embeddings) => return Ok(embeddings),
+            Err(e) => {
+                eprintln!("[ghost embed] batch Voyage failed ({e}), falling back to sequential");
+            }
+        }
+    }
+
+    // Try OpenAI batch
+    if let Ok(key) = std::env::var("OPENAI_API_KEY") {
+        match embed_batch_openai(texts, &key).await {
+            Ok(embeddings) => return Ok(embeddings),
+            Err(e) => {
+                eprintln!("[ghost embed] batch OpenAI failed ({e}), falling back to sequential");
+            }
+        }
+    }
+
+    // Fall back to sequential individual calls
+    let mut results = Vec::with_capacity(texts.len());
+    for text in texts {
+        match embed(text).await {
+            Ok(emb) => results.push(emb),
+            Err(e) => {
+                eprintln!("[ghost embed] individual embed failed: {e}");
+                results.push(vec![]);
+            }
+        }
+    }
+    Ok(results)
+}
+
+async fn embed_batch_voyage(texts: &[String], api_key: &str) -> Result<Vec<Vec<f32>>, String> {
+    let client = crate::http_client::shared_client();
+
+    let body = serde_json::json!({
+        "model": VOYAGE_EMBED_MODEL,
+        "input": texts,
+        "output_dimension": VOYAGE_OUTPUT_DIM,
+    });
+
+    let resp = client
+        .post(VOYAGE_EMBED_URL)
+        .timeout(Duration::from_secs(30))
+        .bearer_auth(api_key)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("Voyage batch embed request failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("Voyage batch embed error {status}: {body}"));
+    }
+
+    let json: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse Voyage batch response: {e}"))?;
+
+    let data = json["data"]
+        .as_array()
+        .ok_or_else(|| "missing data array in Voyage batch response".to_string())?;
+
+    let mut results = Vec::with_capacity(data.len());
+    for item in data {
+        results.push(parse_embedding(&item["embedding"], "Voyage")?);
+    }
+    Ok(results)
+}
+
+async fn embed_batch_openai(texts: &[String], api_key: &str) -> Result<Vec<Vec<f32>>, String> {
+    let client = crate::http_client::shared_client();
+
+    let body = serde_json::json!({
+        "model": OPENAI_EMBED_MODEL,
+        "input": texts,
+        "dimensions": VOYAGE_OUTPUT_DIM,
+    });
+
+    let resp = client
+        .post(OPENAI_EMBED_URL)
+        .timeout(Duration::from_secs(30))
+        .bearer_auth(api_key)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("OpenAI batch embed request failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("OpenAI batch embed error {status}: {body}"));
+    }
+
+    let json: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse OpenAI batch response: {e}"))?;
+
+    let data = json["data"]
+        .as_array()
+        .ok_or_else(|| "missing data array in OpenAI batch response".to_string())?;
+
+    let mut results = Vec::with_capacity(data.len());
+    for item in data {
+        results.push(parse_embedding(&item["embedding"], "OpenAI")?);
+    }
+    Ok(results)
+}
+
 fn parse_embedding(value: &serde_json::Value, provider: &str) -> Result<Vec<f32>, String> {
     let arr = value
         .as_array()

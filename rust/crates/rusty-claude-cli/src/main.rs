@@ -7,6 +7,7 @@
     clippy::unused_self
 )]
 mod bible;
+mod bible_ingest;
 mod chat_dispatcher;
 mod compress;
 mod constants;
@@ -292,6 +293,27 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             reasoning_effort,
             allow_broad_cwd,
         )?,
+        CliAction::BibleIngest { data_dir } => {
+            let rt = tokio::runtime::Runtime::new()
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+            rt.block_on(async {
+                let pool = crate::db::init_pool()
+                    .await
+                    .ok_or("DATABASE_URL not set or connection failed")?;
+                let stats = crate::bible_ingest::ingest_bible(&pool, data_dir.as_deref()).await?;
+                println!("Bible ingestion complete:");
+                println!(
+                    "  Verses:       {} ({} with embeddings)",
+                    stats.verses_total, stats.verses_embedded
+                );
+                println!("  Pericopes:    {}", stats.pericopes);
+                println!("  Cross-refs:   {}", stats.cross_refs);
+                println!("  Lexicon:      {}", stats.lexicon_entries);
+                println!("  Elapsed:      {}s", stats.elapsed_secs);
+                Ok::<(), String>(())
+            })
+            .map_err(|e: String| -> Box<dyn std::error::Error> { Box::from(e) })?;
+        }
         CliAction::Daemon {
             port,
             host,
@@ -382,6 +404,9 @@ enum CliAction {
         base_commit: Option<String>,
         reasoning_effort: Option<String>,
         allow_broad_cwd: bool,
+    },
+    BibleIngest {
+        data_dir: Option<String>,
     },
     Daemon {
         port: u16,
@@ -662,6 +687,14 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     let permission_mode = permission_mode_override.unwrap_or_else(default_permission_mode);
 
     match rest[0].as_str() {
+        "bible-ingest" => {
+            let data_dir = if rest.len() > 2 && rest[1] == "--data-dir" {
+                Some(rest[2].clone())
+            } else {
+                None
+            };
+            Ok(CliAction::BibleIngest { data_dir })
+        }
         "daemon" => parse_daemon_args(&rest[1..]),
         "dump-manifests" => parse_dump_manifests_args(&rest[1..], output_format),
         "bootstrap-plan" => Ok(CliAction::BootstrapPlan { output_format }),

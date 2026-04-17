@@ -47,7 +47,7 @@ All three must pass. Full-workspace clippy is blocked by Unix-only code in `runt
 
 # ============================================================
 # PHASE B0 — Bible Database Schema + Core DB Functions
-# STATUS: TODO
+# STATUS: DONE (commit a454129)
 # ESTIMATED: ~400 lines (migration + db functions + structs)
 # DEPENDS ON: nothing (can start immediately)
 # ============================================================
@@ -392,7 +392,7 @@ Instead, write tests in the new `bible.rs` module (Phase B2) for the parsing/for
 
 # ============================================================
 # PHASE B1 — Bible Data Ingestion Pipeline
-# STATUS: TODO
+# STATUS: DONE
 # ESTIMATED: ~500 lines (ingestion module + data parsing + CLI command)
 # DEPENDS ON: B0 (schema + db functions must exist)
 # ============================================================
@@ -631,7 +631,7 @@ Test the parsing logic (not the DB inserts — those need a live pool):
 
 # ============================================================
 # PHASE B2 — Bible Agent Module (Query Engine + AI Integration)
-# STATUS: TODO
+# STATUS: DONE (commit db5acc9)
 # ESTIMATED: ~450 lines (bible.rs module + chat dispatcher integration)
 # DEPENDS ON: B0 (schema), B1 (data must be ingested)
 # ============================================================
@@ -903,7 +903,7 @@ if bible_forced && !bible_context.is_empty() {
 
 # ============================================================
 # PHASE B3 — Bible Dashboard Endpoints + Data Prep Scripts
-# STATUS: TODO
+# STATUS: DONE
 # ESTIMATED: ~300 lines (daemon endpoints + scripts + dashboard wiring)
 # DEPENDS ON: B0 (schema), B1 (ingestion), B2 (bible.rs module)
 # ============================================================
@@ -1079,3 +1079,107 @@ Before running Phase B1, Isaac needs to source the data files. The download scri
 - **TSK cross-references:** github.com/nicholasgasior/bible-api-go or openbible.info/labs/cross-references
 
 All are public domain or freely licensed. The exact JSON format may need light transformation to match the expected schema — the download script or a small Python script can handle this.
+
+---
+
+# ============================================================
+# ISAAC'S MANUAL STEPS (before running `claw bible-ingest`)
+# ============================================================
+
+All code is built. Before the Bible Agent can work, you need to source the data files
+and place them in `.ghost/bible-data/`. Here's what to do:
+
+## Step 1: Auto-downloads (just run the script)
+
+```powershell
+.\scripts\download-bible-data.ps1
+```
+
+This downloads:
+- `kjv.json` from github.com/aruljohn/Bible-kjv (required)
+- `web.json` from github.com/nicholasgasior/bible-api-go (optional)
+
+**After downloading:** open `kjv.json` and verify the format is an array of
+`{"book": "Genesis", "chapter": 1, "verse": 1, "text": "..."}`. If it's a different
+shape (nested by book/chapter), you'll need a small conversion script.
+
+## Step 2: Hebrew WLC (optional, adds original Hebrew/Aramaic text)
+
+Source: https://github.com/openscriptures/morphhb
+
+The repo has OSIS XML files. You need to convert them to JSON:
+```json
+[{"book": "Genesis", "chapter": 1, "verse": 1,
+  "text": "...", "strongs": ["H7225", "H1254", ...],
+  "morphology": {"words": [{"word": "...", "strongs": "H7225", "morph": "Ncfsa"}]}}]
+```
+
+Options:
+- Write a Python script to parse the OSIS XML
+- Check if someone has already exported this (search GitHub for "morphhb json")
+- Save as `.ghost/bible-data/hebrew-wlc.json`
+
+## Step 3: Greek UGNT (optional, adds original Greek text)
+
+Source: https://github.com/unfoldingWord/en_ugnt
+
+Same format as Hebrew. The repo has USFM files that need conversion to JSON.
+Save as `.ghost/bible-data/greek-ugnt.json`
+
+## Step 4: Strong's Concordance (optional, enables word study features)
+
+Source: https://github.com/openscriptures/strongs
+
+Convert to two files:
+- `.ghost/bible-data/strongs-hebrew.json`
+- `.ghost/bible-data/strongs-greek.json`
+
+Format:
+```json
+[{"strongs_id": "H1254", "original_word": "...", "transliteration": "bara",
+  "definition": "to create, shape, form", "root": "...",
+  "semantic_range": ["create", "shape", "form"]}]
+```
+
+## Step 5: Cross-references (optional, enables cross-ref links)
+
+Source: https://www.openbible.info/labs/cross-references/
+
+Download the TSV file and reformat to:
+```
+source_book	source_chapter	source_verse	target_book	target_chapter	target_verse	rel_type
+Genesis	1	1	John	1	1	thematic
+```
+
+Save as `.ghost/bible-data/cross-refs.tsv`
+
+## Step 6: Pericopes (optional, enables thematic context)
+
+Create or find a dataset of thematic Bible sections. Format:
+```json
+[{"title": "The Creation", "start_book": "Genesis", "start_chapter": 1,
+  "start_verse": 1, "end_book": "Genesis", "end_chapter": 2,
+  "end_verse": 3, "genre": "narrative"}]
+```
+
+Valid genres: narrative, poetry, law, prophecy, epistle, apocalyptic, wisdom, gospel
+
+Save as `.ghost/bible-data/pericopes.json`
+
+## Step 7: Run ingestion
+
+```bash
+# Make sure DATABASE_URL and VOYAGE_API_KEY are set
+claw bible-ingest
+# or with a custom data directory:
+claw bible-ingest --data-dir /path/to/bible-data
+```
+
+This will:
+1. Parse all data files found in the directory
+2. Batch-embed verses via Voyage AI (128 at a time)
+3. Insert everything into Postgres
+4. Print stats when done
+
+**Minimum viable:** just `kjv.json` is required. Everything else adds depth but the
+agent works with KJV-only (just without original languages, Strong's, cross-refs, etc.).

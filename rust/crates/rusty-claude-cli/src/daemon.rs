@@ -591,6 +591,25 @@ async fn dispatch(
         ("POST", "/chat") => chat_handler(cfg, raw).await,
         ("POST", "/sms/inbound") => sms_inbound(cfg, raw).await,
         ("POST", "/sms/send") => sms_send_handler(raw, cfg).await,
+
+        // --- Bible endpoints ---
+        ("GET", "/bible/stats") => bible_stats_handler(cfg.db.as_deref()).await,
+        ("GET", p) if p.starts_with("/bible/verse/") => {
+            bible_verse_handler(cfg.db.as_deref(), &p["/bible/verse/".len()..]).await
+        }
+        ("GET", p) if p.starts_with("/bible/range/") => {
+            bible_range_handler(cfg.db.as_deref(), &p["/bible/range/".len()..]).await
+        }
+        ("GET", p) if p.starts_with("/bible/search") => {
+            bible_search_handler(cfg.db.as_deref(), p).await
+        }
+        ("GET", p) if p.starts_with("/bible/strongs/") => {
+            bible_strongs_handler(cfg.db.as_deref(), &p["/bible/strongs/".len()..]).await
+        }
+        ("GET", p) if p.starts_with("/bible/crossrefs/") => {
+            bible_crossrefs_handler(cfg.db.as_deref(), &p["/bible/crossrefs/".len()..]).await
+        }
+
         ("OPTIONS", _) => options_preflight(),
         _ => ("404 Not Found", r#"{"error":"not found"}"#.to_owned()),
     }
@@ -1174,6 +1193,209 @@ async fn memory_delete(db: Option<&PgPool>, raw: &str, id: &str) -> (&'static st
     } else {
         ("404 Not Found", r#"{"error":"not found"}"#.to_owned())
     }
+}
+
+// ---------------------------------------------------------------------------
+// Bible endpoints
+// ---------------------------------------------------------------------------
+
+/// `GET /bible/stats` -- table row counts.
+async fn bible_stats_handler(db: Option<&PgPool>) -> (&'static str, String) {
+    let Some(pool) = db else {
+        return (
+            "503 Service Unavailable",
+            r#"{"error":"database not configured"}"#.to_owned(),
+        );
+    };
+    let (verses, pericopes, cross_refs, lexicon) = db::bible_stats(pool).await;
+    (
+        "200 OK",
+        json!({
+            "verses": verses,
+            "pericopes": pericopes,
+            "cross_refs": cross_refs,
+            "lexicon_entries": lexicon,
+        })
+        .to_string(),
+    )
+}
+
+/// `GET /bible/verse/:book/:chapter/:verse` -- single verse lookup.
+async fn bible_verse_handler(db: Option<&PgPool>, path: &str) -> (&'static str, String) {
+    let Some(pool) = db else {
+        return (
+            "503 Service Unavailable",
+            r#"{"error":"database not configured"}"#.to_owned(),
+        );
+    };
+    // path = "Genesis/1/1" or "1%20John/3/16"
+    let parts: Vec<&str> = path.splitn(3, '/').collect();
+    if parts.len() != 3 {
+        return (
+            "400 Bad Request",
+            r#"{"error":"expected /bible/verse/:book/:chapter/:verse"}"#.to_owned(),
+        );
+    }
+    let book = url_decode(parts[0]);
+    let Ok(chapter) = parts[1].parse::<i32>() else {
+        return (
+            "400 Bad Request",
+            r#"{"error":"invalid chapter number"}"#.to_owned(),
+        );
+    };
+    let Ok(verse) = parts[2].parse::<i32>() else {
+        return (
+            "400 Bad Request",
+            r#"{"error":"invalid verse number"}"#.to_owned(),
+        );
+    };
+    match db::get_bible_verse(pool, &book, chapter, verse).await {
+        Some(v) => ("200 OK", json!(v).to_string()),
+        None => ("404 Not Found", r#"{"error":"verse not found"}"#.to_owned()),
+    }
+}
+
+/// `GET /bible/range/:book/:start_ch/:start_v/:end_ch/:end_v` -- verse range.
+async fn bible_range_handler(db: Option<&PgPool>, path: &str) -> (&'static str, String) {
+    let Some(pool) = db else {
+        return (
+            "503 Service Unavailable",
+            r#"{"error":"database not configured"}"#.to_owned(),
+        );
+    };
+    let parts: Vec<&str> = path.splitn(5, '/').collect();
+    if parts.len() != 5 {
+        return (
+            "400 Bad Request",
+            r#"{"error":"expected /bible/range/:book/:start_ch/:start_v/:end_ch/:end_v"}"#
+                .to_owned(),
+        );
+    }
+    let book = url_decode(parts[0]);
+    let nums: Vec<Option<i32>> = parts[1..].iter().map(|s| s.parse().ok()).collect();
+    if nums.iter().any(Option::is_none) {
+        return (
+            "400 Bad Request",
+            r#"{"error":"invalid chapter/verse numbers"}"#.to_owned(),
+        );
+    }
+    let verses = db::get_bible_verse_range(
+        pool,
+        &book,
+        nums[0].unwrap(),
+        nums[1].unwrap(),
+        nums[2].unwrap(),
+        nums[3].unwrap(),
+    )
+    .await;
+    ("200 OK", json!({ "verses": verses }).to_string())
+}
+
+/// `GET /bible/search?q=...` -- semantic verse search (requires embedding).
+async fn bible_search_handler(db: Option<&PgPool>, path: &str) -> (&'static str, String) {
+    let Some(pool) = db else {
+        return (
+            "503 Service Unavailable",
+            r#"{"error":"database not configured"}"#.to_owned(),
+        );
+    };
+    // Parse query string from path (e.g. "/bible/search?q=love+your+neighbor")
+    let query = path
+        .split_once('?')
+        .and_then(|(_, qs)| {
+            qs.split('&')
+                .find_map(|pair| pair.strip_prefix("q=").map(url_decode))
+        })
+        .unwrap_or_default();
+    if query.is_empty() {
+        return (
+            "400 Bad Request",
+            r#"{"error":"missing ?q= parameter"}"#.to_owned(),
+        );
+    }
+    match crate::memory::embed(&query).await {
+        Ok(emb) => {
+            let results = db::search_bible_verses(pool, &emb, 20).await;
+            let items: Vec<_> = results
+                .iter()
+                .map(|(v, dist)| json!({"verse": v, "distance": dist}))
+                .collect();
+            ("200 OK", json!({ "results": items }).to_string())
+        }
+        Err(_) => (
+            "503 Service Unavailable",
+            r#"{"error":"embedding provider unavailable"}"#.to_owned(),
+        ),
+    }
+}
+
+/// `GET /bible/strongs/:id` -- lexicon lookup + verses containing the Strong's number.
+async fn bible_strongs_handler(db: Option<&PgPool>, id: &str) -> (&'static str, String) {
+    let Some(pool) = db else {
+        return (
+            "503 Service Unavailable",
+            r#"{"error":"database not configured"}"#.to_owned(),
+        );
+    };
+    let strongs_id = url_decode(id);
+    let entry = db::get_lexicon_entry(pool, &strongs_id).await;
+    let verses = db::search_verses_by_strongs(pool, &strongs_id, 50).await;
+    match entry {
+        Some(e) => (
+            "200 OK",
+            json!({ "entry": e, "verses": verses }).to_string(),
+        ),
+        None => {
+            if verses.is_empty() {
+                (
+                    "404 Not Found",
+                    r#"{"error":"Strong's number not found"}"#.to_owned(),
+                )
+            } else {
+                // No lexicon entry but verses contain this Strong's
+                (
+                    "200 OK",
+                    json!({ "entry": null, "verses": verses }).to_string(),
+                )
+            }
+        }
+    }
+}
+
+/// `GET /bible/crossrefs/:book/:chapter/:verse` -- cross-references from a verse.
+async fn bible_crossrefs_handler(db: Option<&PgPool>, path: &str) -> (&'static str, String) {
+    let Some(pool) = db else {
+        return (
+            "503 Service Unavailable",
+            r#"{"error":"database not configured"}"#.to_owned(),
+        );
+    };
+    let parts: Vec<&str> = path.splitn(3, '/').collect();
+    if parts.len() != 3 {
+        return (
+            "400 Bad Request",
+            r#"{"error":"expected /bible/crossrefs/:book/:chapter/:verse"}"#.to_owned(),
+        );
+    }
+    let book = url_decode(parts[0]);
+    let Ok(chapter) = parts[1].parse::<i32>() else {
+        return (
+            "400 Bad Request",
+            r#"{"error":"invalid chapter number"}"#.to_owned(),
+        );
+    };
+    let Ok(verse) = parts[2].parse::<i32>() else {
+        return (
+            "400 Bad Request",
+            r#"{"error":"invalid verse number"}"#.to_owned(),
+        );
+    };
+    let from_refs = db::get_cross_refs_from(pool, &book, chapter, verse).await;
+    let to_refs = db::get_cross_refs_to(pool, &book, chapter, verse).await;
+    (
+        "200 OK",
+        json!({ "from": from_refs, "to": to_refs }).to_string(),
+    )
 }
 
 // ---------------------------------------------------------------------------

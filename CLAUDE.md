@@ -74,6 +74,12 @@ All return JSON. CORS header on every response.
 | POST | `/sms/send` | open | Internal: deliver outbound SMS. Body: `{"to":"+1...","body":"..."}`. |
 | GET | `/memories` | open | List up to 200 non-expired memory notes. 503 if DB not configured. |
 | DELETE | `/memories/:id` | **bearer** | Delete a single note by UUID. |
+| GET | `/bible/stats` | open | Row counts for all Bible tables. 503 if DB not configured. |
+| GET | `/bible/verse/:book/:ch/:v` | open | Single verse lookup. URL-encode book names with spaces (`1%20John`). |
+| GET | `/bible/range/:book/:sCh/:sV/:eCh/:eV` | open | Verse range (e.g., `Romans/8/28/8/30`). |
+| GET | `/bible/search?q=...` | open | Semantic verse search via embedding. Returns top 20 matches with distances. 503 if no embedding provider. |
+| GET | `/bible/strongs/:id` | open | Lexicon entry + verses containing the Strong's number. |
+| GET | `/bible/crossrefs/:book/:ch/:v` | open | Cross-references from and to a verse. |
 
 ### `/prompt` security model (mandatory — fails closed)
 `POST /prompt` shells out to a subprocess with `--dangerously-skip-permissions`, so it is hardened three ways:
@@ -154,6 +160,47 @@ director_notes (
 - Embeds `message`, pulls top-5 memory notes, injects as `## What you remember about Isaac` block.
 - Sends `[...history, {role: "user", content: message}]` to Claude Haiku (`claude-haiku-4-5-20251001`), max 1024 tokens.
 - After response: `tokio::spawn(extract_and_store(...))` — fire-and-forget, never blocks latency path.
+
+---
+
+## Bible Agent (`bible.rs` + `bible_ingest.rs`)
+
+**Files:**
+- `rust/crates/rusty-claude-cli/src/bible.rs` — query classification, context assembly
+- `rust/crates/rusty-claude-cli/src/bible_ingest.rs` — data ingestion pipeline
+- `rust/crates/rusty-claude-cli/src/db.rs` — Bible table queries (search, insert, stats)
+
+### How it works
+1. **Classification:** `classify_query()` categorizes incoming messages as `Reference` (e.g., "John 3:16"), `WordStudy` (e.g., "what does agape mean"), `Topical` (e.g., "what does the bible say about patience"), or `NotBible`.
+2. **Context loading:** `load_bible_context()` retrieves relevant verses, cross-refs, lexicon entries, and pericopes from Postgres, formatted as a context block injected into the system prompt.
+3. **Trigger:** Prefix messages with `bible:` to force Bible study mode. Otherwise, classification runs automatically.
+4. **Integration:** Chat dispatcher calls `load_bible_context()` after web context, before building the messages array. Bible study mode adds a preamble instructing the model to respond as a Bible scholar.
+
+### CLI: `claw bible-ingest`
+```bash
+claw bible-ingest [--data-dir path/to/bible-data]
+```
+Reads verse-aligned JSON/TSV from `.ghost/bible-data/` (or `--data-dir`), batch-embeds via Voyage AI, and bulk-inserts into the four Bible tables. Requires `DATABASE_URL` and `VOYAGE_API_KEY` (or `OPENAI_API_KEY` for embeddings).
+
+### Data files (in `.ghost/bible-data/`)
+| File | Required | Format |
+|------|----------|--------|
+| `kjv.json` | **yes** | `[{book, chapter, verse, text}, ...]` |
+| `web.json` | no | Same format as KJV |
+| `hebrew-wlc.json` | no | `[{book, chapter, verse, text, strongs[], morphology{}}]` |
+| `greek-ugnt.json` | no | Same as Hebrew |
+| `strongs-hebrew.json` | no | `[{strongs_id, original_word, transliteration, definition, root, semantic_range[]}]` |
+| `strongs-greek.json` | no | Same as Hebrew lexicon |
+| `cross-refs.tsv` | no | TSV: `source_book\tsource_chapter\tsource_verse\ttarget_book\ttarget_chapter\ttarget_verse\trel_type` |
+| `pericopes.json` | no | `[{title, start_book, start_chapter, start_verse, end_book, end_chapter, end_verse, genre}]` |
+
+### DB schema (migration `002_bible.sql`)
+```
+bible_verses    — 66 books, verse-level text + embeddings + Strong's + morphology
+bible_pericopes — thematic section boundaries with optional embeddings
+bible_cross_refs — verse-to-verse relationships (TSK, etc.)
+bible_lexicon   — Strong's concordance entries with semantic ranges
+```
 
 ---
 
