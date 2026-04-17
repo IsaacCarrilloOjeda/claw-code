@@ -78,7 +78,31 @@ pub async fn dispatch(
         String::new()
     };
 
+    // Bible context: classify message, load relevant verses/cross-refs/lexicon.
+    let (bible_msg, bible_forced) = crate::bible::strip_bible_prefix(&polished);
+    let bible_context = if bible_forced {
+        crate::bible::load_bible_context(&bible_msg, query_embedding.as_deref(), pool).await
+    } else {
+        crate::bible::load_bible_context(&polished, query_embedding.as_deref(), pool).await
+    };
+
     let mut system = core_context;
+
+    if bible_forced && !bible_context.is_empty() {
+        system.push_str("\n\n## Bible study mode\n\
+            You are GHOST's Bible study assistant. You have access to the original Hebrew, \
+            Aramaic, and Greek texts alongside KJV and WEB English translations.\n\
+            When answering Bible questions:\n\
+            1. Always cite the specific verse reference (Book Chapter:Verse)\n\
+            2. Show the original language text when it adds insight to the English\n\
+            3. Reference Strong's numbers for key terms (e.g., G26 agape)\n\
+            4. Note when English translations obscure or flatten the original meaning\n\
+            5. Use cross-references to show how themes connect across scripture\n\
+            6. Distinguish between what the text says (factual) and what it means (interpretive)\n\
+            7. For interpretive claims, note major scholarly positions rather than picking one\n\
+            8. The lexicon data is from public-domain sources (BDB, Thayer's) — treat as reference, not infallible");
+    }
+
     if !memory_context.is_empty() {
         system.push_str("\n\n## What you remember about Isaac\n<memory_notes>\n");
         // Cap the memory block to prevent a poisoned store from bloating the prompt
@@ -110,9 +134,19 @@ pub async fn dispatch(
         );
         system.push_str(&web_context);
     }
+    if !bible_context.is_empty() {
+        eprintln!(
+            "[ghost chat] injecting {} bytes of Bible context",
+            bible_context.len()
+        );
+        system.push_str("\n\n");
+        system.push_str(&bible_context);
+    }
 
+    // If !bible prefix was used, send the stripped message to the model
+    let user_message = if bible_forced { &bible_msg } else { &polished };
     let mut messages: Vec<serde_json::Value> = history.to_vec();
-    messages.push(serde_json::json!({"role": "user", "content": polished}));
+    messages.push(serde_json::json!({"role": "user", "content": user_message}));
 
     // Cascade: Haiku → Sonnet → Opus (escalate on low-confidence responses)
     let body = build_request_body(HAIKU_MODEL, &system, &messages);

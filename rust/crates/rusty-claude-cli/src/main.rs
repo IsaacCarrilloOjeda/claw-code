@@ -6,6 +6,7 @@
     clippy::unnecessary_wraps,
     clippy::unused_self
 )]
+mod bible;
 mod chat_dispatcher;
 mod compress;
 mod constants;
