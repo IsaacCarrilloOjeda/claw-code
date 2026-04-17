@@ -62,15 +62,24 @@ pub async fn web_search(query: &str) -> Result<Vec<SearchResult>, String> {
     // Log raw response structure for debugging
     let web_obj = &json["web"];
     if web_obj.is_null() {
-        eprintln!("[ghost search] Brave response has no 'web' key. Top-level keys: {:?}",
-            json.as_object().map(|o| o.keys().collect::<Vec<_>>()).unwrap_or_default());
+        eprintln!(
+            "[ghost search] Brave response has no 'web' key. Top-level keys: {:?}",
+            json.as_object()
+                .map(|o| o.keys().collect::<Vec<_>>())
+                .unwrap_or_default()
+        );
         return Ok(vec![]);
     }
 
     let results_arr = web_obj["results"].as_array();
     if results_arr.is_none() {
-        eprintln!("[ghost search] Brave 'web' object has no 'results' array. Keys: {:?}",
-            web_obj.as_object().map(|o| o.keys().collect::<Vec<_>>()).unwrap_or_default());
+        eprintln!(
+            "[ghost search] Brave 'web' object has no 'results' array. Keys: {:?}",
+            web_obj
+                .as_object()
+                .map(|o| o.keys().collect::<Vec<_>>())
+                .unwrap_or_default()
+        );
         return Ok(vec![]);
     }
 
@@ -94,7 +103,10 @@ pub async fn web_search(query: &str) -> Result<Vec<SearchResult>, String> {
         })
         .collect();
 
-    eprintln!("[ghost search] parsed {} result(s) from Brave response", results.len());
+    eprintln!(
+        "[ghost search] parsed {} result(s) from Brave response",
+        results.len()
+    );
     Ok(results)
 }
 

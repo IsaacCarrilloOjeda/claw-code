@@ -7,6 +7,7 @@
     clippy::unused_self
 )]
 mod chat_dispatcher;
+mod compress;
 mod constants;
 mod daemon;
 mod db;

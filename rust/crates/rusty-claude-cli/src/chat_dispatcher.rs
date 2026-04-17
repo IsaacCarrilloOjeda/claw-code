@@ -7,7 +7,7 @@
 
 use std::time::Duration;
 
-use crate::constants::{ANTHROPIC_MESSAGES_URL, HAIKU_MODEL};
+use crate::constants::{ANTHROPIC_MESSAGES_URL, HAIKU_MODEL, OPUS_MODEL, SONNET_MODEL};
 
 const AI_TIMEOUT_SECS: u64 = 60;
 const MEMORY_SEARCH_LIMIT: i64 = 5;
@@ -28,12 +28,15 @@ pub async fn dispatch(
     let api_key =
         std::env::var("ANTHROPIC_API_KEY").map_err(|_| "ANTHROPIC_API_KEY not set".to_string())?;
 
+    // Strip filler greetings/sign-offs before any API call.
+    let cleaned = crate::compress::strip_filler(message);
+
     let core_context = load_core_context();
-    let memory_context = load_memory_context(message, pool).await;
-    let do_search = should_search(message);
+    let memory_context = load_memory_context(&cleaned, pool).await;
+    let do_search = should_search(&cleaned);
     eprintln!("[ghost chat] should_search={do_search} for: {message}");
     let web_context = if do_search {
-        load_web_context(message).await
+        load_web_context(&cleaned).await
     } else {
         String::new()
     };
@@ -50,27 +53,45 @@ pub async fn dispatch(
         system.push_str(capped);
         system.push_str("\n</memory_notes>");
     }
-    if !web_context.is_empty() {
-        eprintln!("[ghost chat] injecting {} bytes of web context", web_context.len());
-        system.push_str("\n\n## Current web search results\nUse these results to answer the user's question:\n");
-        system.push_str(&web_context);
-    } else {
+    if web_context.is_empty() {
         eprintln!("[ghost chat] web_context is empty — nothing to inject");
+    } else {
+        eprintln!(
+            "[ghost chat] injecting {} bytes of web context",
+            web_context.len()
+        );
+        system.push_str(
+            "\n\n## Current web search results\nUse these results to answer the user's question:\n",
+        );
+        system.push_str(&web_context);
     }
 
     let mut messages: Vec<serde_json::Value> = history.to_vec();
-    messages.push(serde_json::json!({"role": "user", "content": message}));
+    messages.push(serde_json::json!({"role": "user", "content": cleaned}));
 
-    let request_body = serde_json::json!({
-        "model": HAIKU_MODEL,
-        "max_tokens": 1024,
-        "system": system,
-        "messages": messages,
-    });
+    // Cascade: Haiku → Sonnet → Opus (escalate on low-confidence responses)
+    let body = build_request_body(HAIKU_MODEL, &system, &messages);
+    let mut response = call_anthropic(&api_key, &body).await?;
+    let mut tier = "haiku";
 
-    let response = call_anthropic(&api_key, &request_body).await?;
+    if crate::compress::is_low_confidence(&response) {
+        eprintln!("[ghost chat] haiku low-confidence, escalating to sonnet");
+        let body = build_request_body(SONNET_MODEL, &system, &messages);
+        response = call_anthropic(&api_key, &body).await?;
+        tier = "sonnet";
+
+        if crate::compress::is_low_confidence(&response) {
+            eprintln!("[ghost chat] sonnet low-confidence, escalating to opus");
+            let body = build_request_body(OPUS_MODEL, &system, &messages);
+            response = call_anthropic(&api_key, &body).await?;
+            tier = "opus";
+        }
+    }
+
+    eprintln!("[ghost chat] tier={tier} for: {message}");
 
     // Fire-and-forget: extract facts from this turn and store them.
+    // Uses the original message (not cleaned) for accurate memory extraction.
     if let Some(p) = pool {
         let pool_owned = p.clone();
         let msg = message.to_string();
@@ -161,6 +182,19 @@ pub(crate) fn load_core_context() -> String {
     std::fs::read_to_string(&path).unwrap_or_else(|e| {
         eprintln!("[ghost chat] failed to read core context from {path}: {e}");
         "You are GHOST, a personal AI assistant.".to_string()
+    })
+}
+
+fn build_request_body(
+    model: &str,
+    system: &str,
+    messages: &[serde_json::Value],
+) -> serde_json::Value {
+    serde_json::json!({
+        "model": model,
+        "max_tokens": 1024,
+        "system": system,
+        "messages": messages,
     })
 }
 
