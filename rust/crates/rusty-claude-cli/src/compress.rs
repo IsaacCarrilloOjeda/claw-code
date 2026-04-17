@@ -96,6 +96,109 @@ pub fn strip_filler(input: &str) -> String {
     result
 }
 
+// ── Intake (prompt polisher) ──────────────────────────────────────────
+
+const AMBIGUITY_SIGNALS: &[&str] = &[
+    "or something",
+    "kind of",
+    "sort of",
+    "maybe",
+    "i think",
+    "i guess",
+    "not sure",
+    "somehow",
+    "whatever",
+    "stuff",
+    "things",
+    "the thing",
+    "you know",
+    "like ",
+    "basically",
+    "idk",
+    "i dunno",
+];
+
+pub fn needs_intake(message: &str) -> bool {
+    let word_count = message.split_whitespace().count();
+
+    if word_count < 15 {
+        return false;
+    }
+
+    if word_count >= 50 {
+        return true;
+    }
+
+    // 15-49 words: check for ambiguity signals
+    let lower = message.to_lowercase();
+    AMBIGUITY_SIGNALS.iter().any(|s| lower.contains(s))
+}
+
+pub async fn intake_polish(message: &str) -> Result<String, String> {
+    if !needs_intake(message) {
+        return Ok(message.to_string());
+    }
+
+    let api_key =
+        std::env::var("ANTHROPIC_API_KEY").map_err(|_| "ANTHROPIC_API_KEY not set".to_string())?;
+
+    let system = "You are a prompt polisher. Your ONLY job is to rewrite the user's message \
+        as a clear, unambiguous request. Rules:\n\
+        1. Remove filler, hedging, and repeated ideas\n\
+        2. Make implicit requests explicit\n\
+        3. If the user mentions multiple things, list them as numbered items\n\
+        4. Keep the user's intent exactly — do NOT add requirements they didn't mention\n\
+        5. Return ONLY the rewritten message. No preamble, no quotes, no explanation.\n\
+        6. If the message is already clear, return it unchanged.\n\
+        7. Never exceed 2x the original word count.";
+
+    let body = serde_json::json!({
+        "model": crate::constants::HAIKU_MODEL,
+        "max_tokens": 512,
+        "system": system,
+        "messages": [{"role": "user", "content": message}],
+    });
+
+    let client = crate::http_client::shared_client();
+    let resp = client
+        .post(crate::constants::ANTHROPIC_MESSAGES_URL)
+        .timeout(std::time::Duration::from_secs(15))
+        .header("x-api-key", &api_key)
+        .header("anthropic-version", "2023-06-01")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("intake API failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("intake API error: {}", resp.status()));
+    }
+
+    let json: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("intake parse failed: {e}"))?;
+
+    let polished = json["content"][0]["text"]
+        .as_str()
+        .unwrap_or(message)
+        .to_string();
+
+    // Safety: if polished is way longer, model hallucinated — use original
+    if polished.split_whitespace().count() > message.split_whitespace().count() * 2 {
+        eprintln!("[ghost intake] polished too long, using original");
+        return Ok(message.to_string());
+    }
+
+    eprintln!(
+        "[ghost intake] polished: {} -> {} words",
+        message.split_whitespace().count(),
+        polished.split_whitespace().count()
+    );
+
+    Ok(polished)
+}
+
 /// Heuristic check: returns `true` if the response looks like the model
 /// punted or produced a low-quality answer worth escalating to a higher tier.
 pub fn is_low_confidence(response: &str) -> bool {
@@ -206,5 +309,46 @@ mod tests {
         assert!(is_low_confidence(
             "As an AI language model, I don't have personal experiences or real-time information."
         ));
+    }
+
+    // ── needs_intake ─────────────────────────────────────────────
+
+    #[test]
+    fn needs_intake_short_message() {
+        assert!(!needs_intake("what time is it in boston"));
+    }
+
+    #[test]
+    fn needs_intake_long_message() {
+        let msg = "word ".repeat(50);
+        assert!(needs_intake(msg.trim()));
+    }
+
+    #[test]
+    fn needs_intake_medium_with_ambiguity() {
+        assert!(needs_intake(
+            "I think maybe we should update the daemon file or something because it has been kind of broken lately and stuff"
+        ));
+    }
+
+    #[test]
+    fn needs_intake_medium_without_ambiguity() {
+        assert!(!needs_intake(
+            "update the daemon endpoint to return the correct status code when the database connection pool is exhausted"
+        ));
+    }
+
+    #[test]
+    fn needs_intake_exactly_fifteen_no_signal() {
+        // exactly 15 words, no ambiguity signal → in range but no signal, so false
+        assert!(!needs_intake(
+            "please update the daemon endpoint to return the correct status code when pool is down"
+        ));
+    }
+
+    #[test]
+    fn needs_intake_exactly_fifty_words() {
+        let msg = "word ".repeat(50);
+        assert!(needs_intake(msg.trim()));
     }
 }

@@ -31,12 +31,21 @@ pub async fn dispatch(
     // Strip filler greetings/sign-offs before any API call.
     let cleaned = crate::compress::strip_filler(message);
 
+    // Intake polish: rewrite ambiguous/complex prompts into tight specs.
+    // Failure is never fatal — falls through with cleaned message.
+    let polished = crate::compress::intake_polish(&cleaned)
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("[ghost intake] failed: {e}, using cleaned message");
+            cleaned.clone()
+        });
+
     let core_context = load_core_context();
-    let memory_context = load_memory_context(&cleaned, pool).await;
-    let do_search = should_search(&cleaned);
+    let memory_context = load_memory_context(&polished, pool).await;
+    let do_search = should_search(&polished);
     eprintln!("[ghost chat] should_search={do_search} for: {message}");
     let web_context = if do_search {
-        load_web_context(&cleaned).await
+        load_web_context(&polished).await
     } else {
         String::new()
     };
@@ -67,7 +76,7 @@ pub async fn dispatch(
     }
 
     let mut messages: Vec<serde_json::Value> = history.to_vec();
-    messages.push(serde_json::json!({"role": "user", "content": cleaned}));
+    messages.push(serde_json::json!({"role": "user", "content": polished}));
 
     // Cascade: Haiku → Sonnet → Opus (escalate on low-confidence responses)
     let body = build_request_body(HAIKU_MODEL, &system, &messages);
