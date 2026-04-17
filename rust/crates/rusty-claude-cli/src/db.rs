@@ -419,6 +419,164 @@ pub async fn decay_notes_confidence(pool: &PgPool) {
 }
 
 // ---------------------------------------------------------------------------
+// Scholar solutions model (Phase 3)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, serde::Serialize)]
+pub struct ScholarSolution {
+    pub id: String,
+    pub problem_sig: String,
+    pub solution: String,
+    pub solution_lang: Option<String>,
+    pub context_file: Option<String>,
+    pub failed_attempts: Vec<String>,
+    pub success_count: i32,
+    pub last_used_at: String,
+}
+
+/// Semantic search on `scholar_solutions` by cosine similarity on `problem_embed`.
+pub async fn search_scholar(pool: &PgPool, embedding: &[f32], limit: i64) -> Vec<ScholarSolution> {
+    let embedding_str = vec_to_pgvector(embedding);
+    let rows = sqlx::query(
+        "SELECT id::text, problem_sig, solution, solution_lang, context_file,
+                failed_attempts, success_count, last_used_at::text,
+                (problem_embed <=> $1::vector) AS distance
+         FROM scholar_solutions
+         WHERE problem_embed IS NOT NULL
+         ORDER BY problem_embed <=> $1::vector
+         LIMIT $2",
+    )
+    .bind(&embedding_str)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    rows.iter()
+        .map(|row| ScholarSolution {
+            id: row.try_get("id").unwrap_or_default(),
+            problem_sig: row.try_get("problem_sig").unwrap_or_default(),
+            solution: row.try_get("solution").unwrap_or_default(),
+            solution_lang: row.try_get("solution_lang").unwrap_or(None),
+            context_file: row.try_get("context_file").unwrap_or(None),
+            failed_attempts: row
+                .try_get::<Vec<String>, _>("failed_attempts")
+                .unwrap_or_default(),
+            success_count: row.try_get("success_count").unwrap_or(1),
+            last_used_at: row.try_get("last_used_at").unwrap_or_default(),
+        })
+        .collect()
+}
+
+/// Semantic search returning results with their cosine distance for threshold checks.
+pub async fn search_scholar_with_distance(
+    pool: &PgPool,
+    embedding: &[f32],
+    limit: i64,
+) -> Vec<(ScholarSolution, f64)> {
+    let embedding_str = vec_to_pgvector(embedding);
+    let rows = sqlx::query(
+        "SELECT id::text, problem_sig, solution, solution_lang, context_file,
+                failed_attempts, success_count, last_used_at::text,
+                (problem_embed <=> $1::vector) AS distance
+         FROM scholar_solutions
+         WHERE problem_embed IS NOT NULL
+         ORDER BY problem_embed <=> $1::vector
+         LIMIT $2",
+    )
+    .bind(&embedding_str)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    rows.iter()
+        .map(|row| {
+            let sol = ScholarSolution {
+                id: row.try_get("id").unwrap_or_default(),
+                problem_sig: row.try_get("problem_sig").unwrap_or_default(),
+                solution: row.try_get("solution").unwrap_or_default(),
+                solution_lang: row.try_get("solution_lang").unwrap_or(None),
+                context_file: row.try_get("context_file").unwrap_or(None),
+                failed_attempts: row
+                    .try_get::<Vec<String>, _>("failed_attempts")
+                    .unwrap_or_default(),
+                success_count: row.try_get("success_count").unwrap_or(1),
+                last_used_at: row.try_get("last_used_at").unwrap_or_default(),
+            };
+            let distance: f64 = row.try_get("distance").unwrap_or(1.0);
+            (sol, distance)
+        })
+        .collect()
+}
+
+/// Insert a new scholar solution. Returns true on success.
+pub async fn insert_scholar(
+    pool: &PgPool,
+    problem_sig: &str,
+    problem_embed: Option<&[f32]>,
+    solution: &str,
+    solution_lang: Option<&str>,
+    context_file: Option<&str>,
+) -> bool {
+    let id = uuid::Uuid::new_v4().to_string();
+    if let Some(emb) = problem_embed {
+        let embedding_str = vec_to_pgvector(emb);
+        sqlx::query(
+            "INSERT INTO scholar_solutions (id, problem_sig, problem_embed, solution, solution_lang, context_file)
+             VALUES ($1::uuid, $2, $3::vector, $4, $5, $6)",
+        )
+        .bind(&id)
+        .bind(problem_sig)
+        .bind(&embedding_str)
+        .bind(solution)
+        .bind(solution_lang)
+        .bind(context_file)
+        .execute(pool)
+        .await
+        .is_ok()
+    } else {
+        sqlx::query(
+            "INSERT INTO scholar_solutions (id, problem_sig, solution, solution_lang, context_file)
+             VALUES ($1::uuid, $2, $3, $4, $5)",
+        )
+        .bind(&id)
+        .bind(problem_sig)
+        .bind(solution)
+        .bind(solution_lang)
+        .bind(context_file)
+        .execute(pool)
+        .await
+        .is_ok()
+    }
+}
+
+/// Bump `success_count` and update `last_used_at` for a scholar solution.
+pub async fn increment_scholar_success(pool: &PgPool, id: &str) {
+    let _ = sqlx::query(
+        "UPDATE scholar_solutions
+         SET success_count = success_count + 1, last_used_at = now()
+         WHERE id = $1::uuid",
+    )
+    .bind(id)
+    .execute(pool)
+    .await;
+}
+
+/// Append a failed attempt description to a scholar solution.
+pub async fn add_scholar_failed_attempt(pool: &PgPool, id: &str, attempt: &str) {
+    let _ = sqlx::query(
+        "UPDATE scholar_solutions
+         SET failed_attempts = array_append(failed_attempts, $2)
+         WHERE id = $1::uuid",
+    )
+    .bind(id)
+    .bind(attempt)
+    .execute(pool)
+    .await;
+}
+
+// ---------------------------------------------------------------------------
 // Circuit breaker helpers
 // ---------------------------------------------------------------------------
 

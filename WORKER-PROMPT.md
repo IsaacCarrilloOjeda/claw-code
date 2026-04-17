@@ -62,7 +62,7 @@ Phase A has been implemented. See `compress.rs` for `strip_filler()` + `is_low_c
 
 # ============================================================
 # PHASE B — Intake Model (Prompt Polisher)
-# STATUS: NOT STARTED
+# STATUS: COMPLETE (2026-04-16)
 # ============================================================
 
 ## What You Are Building
@@ -205,7 +205,7 @@ polished = intake_polish(&cleaned).await.unwrap_or_else(|e| {
 
 # ============================================================
 # PHASE C — Scholar Database
-# STATUS: NOT STARTED
+# STATUS: COMPLETE (2026-04-16)
 # ============================================================
 
 ## What You Are Building

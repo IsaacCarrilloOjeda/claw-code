@@ -11,6 +11,10 @@ use crate::constants::{ANTHROPIC_MESSAGES_URL, HAIKU_MODEL, OPUS_MODEL, SONNET_M
 
 const AI_TIMEOUT_SECS: u64 = 60;
 const MEMORY_SEARCH_LIMIT: i64 = 5;
+const SCHOLAR_SEARCH_LIMIT: i64 = 3;
+const SCHOLAR_SOLUTION_THRESHOLD: f64 = 0.15;
+const SCHOLAR_FAILED_THRESHOLD: f64 = 0.25;
+const SCHOLAR_DEDUP_THRESHOLD: f64 = 0.10;
 
 /// Dispatch a no-prefix message to Claude Haiku. Returns the response text.
 ///
@@ -41,7 +45,17 @@ pub async fn dispatch(
         });
 
     let core_context = load_core_context();
-    let memory_context = load_memory_context(&polished, pool).await;
+
+    // Embed the polished message once; reuse for memory search + scholar search.
+    let query_embedding = crate::memory::embed(&polished).await.ok();
+
+    let memory_context = load_memory_context_with_embedding(query_embedding.as_deref(), pool).await;
+    let scholar_context = if let Some(ref emb) = query_embedding {
+        load_scholar_context(&polished, emb, pool).await
+    } else {
+        String::new()
+    };
+
     let do_search = should_search(&polished);
     eprintln!("[ghost chat] should_search={do_search} for: {message}");
     let web_context = if do_search {
@@ -61,6 +75,10 @@ pub async fn dispatch(
         };
         system.push_str(capped);
         system.push_str("\n</memory_notes>");
+    }
+    if !scholar_context.is_empty() {
+        system.push_str("\n\n");
+        system.push_str(&scholar_context);
     }
     if web_context.is_empty() {
         eprintln!("[ghost chat] web_context is empty — nothing to inject");
@@ -108,6 +126,14 @@ pub async fn dispatch(
         tokio::spawn(async move {
             crate::memory::extract_and_store(pool_owned, msg, resp).await;
         });
+
+        // Store problem+solution in scholar DB for future cache hits.
+        let pool_scholar = p.clone();
+        let msg_scholar = polished.clone();
+        let resp_scholar = response.clone();
+        tokio::spawn(async move {
+            store_scholar_solution(pool_scholar, msg_scholar, resp_scholar).await;
+        });
     }
 
     Ok(response)
@@ -139,6 +165,128 @@ pub(crate) async fn load_memory_context(message: &str, pool: Option<&sqlx::PgPoo
         .map(|n| format!("- [{}] {}", n.category, n.content))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Like `load_memory_context` but takes a pre-computed embedding to avoid
+/// redundant API calls when the caller already embedded the message.
+async fn load_memory_context_with_embedding(
+    embedding: Option<&[f32]>,
+    pool: Option<&sqlx::PgPool>,
+) -> String {
+    let Some(pool) = pool else {
+        return String::new();
+    };
+    let Some(embedding) = embedding else {
+        return String::new();
+    };
+
+    let notes = crate::db::search_notes(pool, embedding, MEMORY_SEARCH_LIMIT).await;
+    if notes.is_empty() {
+        return String::new();
+    }
+
+    notes
+        .iter()
+        .map(|n| format!("- [{}] {}", n.category, n.content))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Search the scholar DB for previously solved similar problems and known-bad
+/// approaches. Returns formatted context to inject into the system prompt.
+async fn load_scholar_context(
+    message: &str,
+    embedding: &[f32],
+    pool: Option<&sqlx::PgPool>,
+) -> String {
+    let Some(pool) = pool else {
+        return String::new();
+    };
+
+    let results =
+        crate::db::search_scholar_with_distance(pool, embedding, SCHOLAR_SEARCH_LIMIT).await;
+    if results.is_empty() {
+        return String::new();
+    }
+
+    let mut sections = Vec::new();
+
+    // Inject successful solutions (high similarity, well-tested)
+    for (sol, distance) in &results {
+        if *distance < SCHOLAR_SOLUTION_THRESHOLD && sol.success_count >= 3 {
+            let mut block = format!(
+                "## Previously solved similar problem\nProblem: {}\n",
+                sol.problem_sig
+            );
+            block.push_str(&sol.solution);
+            sections.push(block);
+            eprintln!(
+                "[ghost scholar] solution hit (dist={distance:.3}, count={}): {}",
+                sol.success_count, sol.problem_sig
+            );
+            break; // only inject the best match
+        }
+    }
+
+    // Inject failed attempts (looser threshold)
+    let mut failed_lines = Vec::new();
+    for (sol, distance) in &results {
+        if *distance < SCHOLAR_FAILED_THRESHOLD && !sol.failed_attempts.is_empty() {
+            for attempt in &sol.failed_attempts {
+                failed_lines.push(format!("- {attempt}"));
+            }
+            eprintln!(
+                "[ghost scholar] failed-attempts hit (dist={distance:.3}): {} attempt(s)",
+                sol.failed_attempts.len()
+            );
+        }
+    }
+    if !failed_lines.is_empty() {
+        let mut block = "## Known bad approaches for similar problems\nDO NOT TRY:\n".to_string();
+        block.push_str(&failed_lines.join("\n"));
+        sections.push(block);
+    }
+
+    let _ = message; // used for logging context if needed later
+    sections.join("\n\n")
+}
+
+/// Store a problem+solution pair in the scholar DB (fire-and-forget).
+async fn store_scholar_solution(pool: sqlx::PgPool, message: String, response: String) {
+    let embedding = match crate::memory::embed(&message).await {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("[ghost scholar] embed failed, skipping store: {e}");
+            return;
+        }
+    };
+
+    // Check for near-duplicate — if very similar problem exists, bump its count
+    let existing = crate::db::search_scholar_with_distance(&pool, &embedding, 1).await;
+    if let Some((sol, distance)) = existing.first() {
+        if *distance < SCHOLAR_DEDUP_THRESHOLD {
+            eprintln!(
+                "[ghost scholar] dedup hit (dist={distance:.3}), incrementing {}",
+                sol.id
+            );
+            crate::db::increment_scholar_success(&pool, &sol.id).await;
+            return;
+        }
+    }
+
+    let stored = crate::db::insert_scholar(
+        &pool,
+        &message,
+        Some(&embedding),
+        &response,
+        None, // solution_lang
+        None, // context_file
+    )
+    .await;
+
+    if stored {
+        eprintln!("[ghost scholar] stored new solution for: {message}");
+    }
 }
 
 /// Simple heuristic: returns `true` if the message looks like it would benefit
