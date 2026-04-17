@@ -185,7 +185,8 @@ async fn daemon_main(cfg: DaemonConfig) -> Result<(), Box<dyn std::error::Error>
             loop {
                 interval.tick().await;
                 db::decay_notes_confidence(&pool).await;
-                eprintln!("{LOG_PREFIX} memory: confidence decay applied");
+                db::cleanup_response_cache(&pool).await;
+                eprintln!("{LOG_PREFIX} memory: confidence decay + cache cleanup applied");
             }
         });
     }

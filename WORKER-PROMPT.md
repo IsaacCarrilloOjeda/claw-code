@@ -678,7 +678,7 @@ abbreviated = apply_abbreviations(&polished)
 
 # ============================================================
 # PHASE F1 — Token Recycling (Response Cache)
-# STATUS: NOT STARTED (requires C for embedding infrastructure)
+# STATUS: COMPLETE (2026-04-16)
 # ============================================================
 
 ## What You Are Building
@@ -742,7 +742,7 @@ Add to the existing 24-hour decay background task: delete response_cache entries
 
 # ============================================================
 # PHASE F2 — Speculative Parallel Execution
-# STATUS: NOT STARTED (requires D1+D2)
+# STATUS: COMPLETE (2026-04-16)
 # ============================================================
 
 ## What You Are Building
@@ -828,8 +828,8 @@ Format: [SPECULATE] description ||| hypothesis_a: worker_prompt_a ||| hypothesis
 | **D2** | Worker execution + checkpoints | D1, C | ~300 lines | DONE |
 | **E1** | Code macro system | D1, D2 | ~250 lines | DONE |
 | **E2** | Prompt compression (abbreviations) | A | ~100 lines | DONE |
-| **F1** | Token recycling (response cache) | C | ~200 lines | 1 |
-| **F2** | Speculative parallel execution | D1, D2 | ~200 lines | 1 |
+| **F1** | Token recycling (response cache) | C | ~200 lines | DONE |
+| **F2** | Speculative parallel execution | D1, D2 | ~200 lines | DONE |
 
 **Total remaining: 8 worker sessions.**
 

@@ -5,6 +5,7 @@
 //! items. `execute_plan` then runs workers in parallel, checkpoints their
 //! output, and assembles the final result.
 
+use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 
 use crate::constants::{ANTHROPIC_MESSAGES_URL, HAIKU_MODEL, OPUS_MODEL, SONNET_MODEL};
@@ -21,6 +22,14 @@ pub enum WorkerStatus {
 }
 
 #[derive(Debug, Clone)]
+pub struct SpecBranch {
+    pub hypothesis: String,
+    pub worker_prompt: String,
+    pub output: Option<String>,
+    pub status: WorkerStatus,
+}
+
+#[derive(Debug, Clone)]
 pub enum PlanItem {
     Critical {
         description: String,
@@ -31,6 +40,11 @@ pub enum PlanItem {
         worker_prompt: String,
         output: Option<String>,
         status: WorkerStatus,
+    },
+    Speculative {
+        description: String,
+        branches: Vec<SpecBranch>,
+        winner: Option<usize>,
     },
 }
 
@@ -49,6 +63,7 @@ You are a task planner. Given a specification, produce a plan.
 For each item, decide:
 - [DO] -- you handle this yourself (architecture, design, glue logic, anything requiring full context)
 - [DELEGATE] -- a cheap, fast model handles this (isolated code, simple transforms, boilerplate)
+- [SPECULATE] -- when you're unsure between 2-3 approaches and verification is cheap
 
 DELEGATE prompts must be hyper-specific:
 - Exact function signature if applicable
@@ -59,6 +74,7 @@ DELEGATE prompts must be hyper-specific:
 Format each line:
 [DO] description of what you're doing, then your actual output
 [DELEGATE] description ||| the exact prompt to send to the worker model
+[SPECULATE] description ||| hypothesis_a: worker_prompt_a ||| hypothesis_b: worker_prompt_b
 
 Produce 3-15 items. If the task is simple enough for one step, output one [DO] item.";
 
@@ -75,6 +91,7 @@ const HEDGING: &[&str] = &[
 
 // ── Plan parsing ─────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_lines)]
 pub fn parse_plan(response: &str) -> Vec<PlanItem> {
     let mut items = Vec::new();
 
@@ -89,6 +106,83 @@ pub fn parse_plan(response: &str) -> Vec<PlanItem> {
                 description: rest.trim().to_string(),
                 output: Some(rest.trim().to_string()),
             });
+        } else if let Some(rest) = strip_tag(trimmed, "[SPECULATE]") {
+            let rest = rest.trim();
+            let segments: Vec<&str> = rest.split("|||").collect();
+            if segments.len() >= 3 {
+                let desc = segments[0].trim().to_string();
+                let branches: Vec<SpecBranch> = segments[1..]
+                    .iter()
+                    .filter_map(|seg| {
+                        let seg = seg.trim();
+                        if seg.is_empty() {
+                            return None;
+                        }
+                        let (hypothesis, prompt) = if let Some(colon_idx) = seg.find(':') {
+                            (
+                                seg[..colon_idx].trim().to_string(),
+                                seg[colon_idx + 1..].trim().to_string(),
+                            )
+                        } else {
+                            (seg.to_string(), seg.to_string())
+                        };
+                        Some(SpecBranch {
+                            hypothesis,
+                            worker_prompt: prompt,
+                            output: None,
+                            status: WorkerStatus::Pending,
+                        })
+                    })
+                    .collect();
+
+                if branches.len() >= 2 {
+                    items.push(PlanItem::Speculative {
+                        description: desc,
+                        branches,
+                        winner: None,
+                    });
+                } else {
+                    // Speculation needs 2+ branches — fall back to Delegate with first branch
+                    if let Some(branch) = branches.into_iter().next() {
+                        items.push(PlanItem::Delegate {
+                            description: desc,
+                            worker_prompt: branch.worker_prompt,
+                            output: None,
+                            status: WorkerStatus::Pending,
+                        });
+                    } else {
+                        items.push(PlanItem::Critical {
+                            description: desc,
+                            output: None,
+                        });
+                    }
+                }
+            } else {
+                // Not enough segments — fall back to Delegate or Critical
+                let rest_str = rest.to_string();
+                if let Some(sep_idx) = rest_str.find("|||") {
+                    let desc = rest_str[..sep_idx].trim().to_string();
+                    let prompt = rest_str[sep_idx + 3..].trim().to_string();
+                    if prompt.is_empty() {
+                        items.push(PlanItem::Critical {
+                            description: desc,
+                            output: None,
+                        });
+                    } else {
+                        items.push(PlanItem::Delegate {
+                            description: desc,
+                            worker_prompt: prompt,
+                            output: None,
+                            status: WorkerStatus::Pending,
+                        });
+                    }
+                } else {
+                    items.push(PlanItem::Critical {
+                        description: rest_str,
+                        output: None,
+                    });
+                }
+            }
         } else if let Some(rest) = strip_tag(trimmed, "[DELEGATE]") {
             let rest = rest.trim();
             if let Some(sep_idx) = rest.find("|||") {
@@ -116,7 +210,7 @@ pub fn parse_plan(response: &str) -> Vec<PlanItem> {
                 });
             }
         }
-        // Lines not starting with [DO] or [DELEGATE] are ignored (freeform text from the model).
+        // Lines not starting with [DO], [DELEGATE], or [SPECULATE] are ignored.
     }
 
     items
@@ -186,7 +280,7 @@ pub async fn orchestrate(spec: &str, _pool: Option<&sqlx::PgPool>) -> Result<Pla
     let items = parse_plan(&response_text);
 
     eprintln!(
-        "[ghost orchestrator] plan: {} items ({} critical, {} delegate)",
+        "[ghost orchestrator] plan: {} items ({} critical, {} delegate, {} speculative)",
         items.len(),
         items
             .iter()
@@ -195,6 +289,10 @@ pub async fn orchestrate(spec: &str, _pool: Option<&sqlx::PgPool>) -> Result<Pla
         items
             .iter()
             .filter(|i| matches!(i, PlanItem::Delegate { .. }))
+            .count(),
+        items
+            .iter()
+            .filter(|i| matches!(i, PlanItem::Speculative { .. }))
             .count(),
     );
 
@@ -326,6 +424,7 @@ pub async fn execute_plan(plan: &mut Plan, pool: Option<&sqlx::PgPool>) -> Resul
         std::env::var("ANTHROPIC_API_KEY").map_err(|_| "ANTHROPIC_API_KEY not set".to_string())?;
 
     run_delegate_workers(plan, &api_key, pool).await;
+    run_speculative_items(plan, &api_key).await;
     escalate_failed_items(plan, &api_key).await;
     assemble_plan_output(plan)
 }
@@ -401,6 +500,15 @@ async fn run_delegate_workers(plan: &mut Plan, api_key: &str, pool: Option<&sqlx
     }
 }
 
+/// Process all pending Speculative items in the plan.
+async fn run_speculative_items(plan: &mut Plan, api_key: &str) {
+    for item in &mut plan.items {
+        if matches!(item, PlanItem::Speculative { .. }) {
+            execute_speculative(item, api_key).await;
+        }
+    }
+}
+
 /// Handle escalated items: call Sonnet with original prompt + failed output context.
 async fn escalate_failed_items(plan: &mut Plan, api_key: &str) {
     for item in &mut plan.items {
@@ -435,6 +543,15 @@ fn assemble_plan_output(plan: &Plan) -> Result<String, String> {
         .iter()
         .filter_map(|item| match item {
             PlanItem::Critical { output, .. } | PlanItem::Delegate { output, .. } => output.clone(),
+            PlanItem::Speculative {
+                branches, winner, ..
+            } => {
+                if let Some(idx) = winner {
+                    branches.get(*idx).and_then(|b| b.output.clone())
+                } else {
+                    None
+                }
+            }
         })
         .collect();
 
@@ -451,6 +568,81 @@ fn assemble_plan_output(plan: &Plan) -> Result<String, String> {
     );
 
     Ok(result)
+}
+
+/// Execute a speculative plan item: spawn all branches in parallel, take the
+/// first one that passes checkpoint. If none pass, escalate all to Sonnet.
+async fn execute_speculative(item: &mut PlanItem, api_key: &str) {
+    let PlanItem::Speculative {
+        branches, winner, ..
+    } = item
+    else {
+        return;
+    };
+
+    let mut handles = Vec::new();
+    for (idx, branch) in branches.iter().enumerate() {
+        let key = api_key.to_string();
+        let prompt = branch.worker_prompt.clone();
+        let handle = tokio::spawn(async move {
+            let result = call_worker(&key, &prompt).await;
+            (idx, prompt, result)
+        });
+        handles.push(handle);
+    }
+
+    // Collect all results
+    let mut results: Vec<(usize, String, Result<String, String>)> = Vec::new();
+    for handle in handles {
+        if let Ok(r) = handle.await {
+            results.push(r);
+        }
+    }
+
+    // Find the first branch that passes checkpoint
+    for (idx, prompt, result) in &results {
+        if let Ok(output) = result {
+            if checkpoint(output, prompt) {
+                branches[*idx].output = Some(output.clone());
+                branches[*idx].status = WorkerStatus::Done;
+                *winner = Some(*idx);
+                eprintln!(
+                    "[ghost orchestrator] speculative winner: branch {} ({})",
+                    idx, branches[*idx].hypothesis
+                );
+                return;
+            }
+        }
+    }
+
+    // No branch passed — escalate: send all branch outputs to Sonnet
+    eprintln!("[ghost orchestrator] no speculative branch passed, escalating to sonnet");
+    let mut context = String::from("Multiple approaches were tried but none passed validation:\n");
+    for (idx, _, result) in &results {
+        let output = match result {
+            Ok(o) => o.as_str(),
+            Err(e) => e.as_str(),
+        };
+        let _ = write!(
+            context,
+            "\n--- Branch {} ({}) ---\n{}\n",
+            idx, branches[*idx].hypothesis, output
+        );
+    }
+
+    // Pick the first branch's prompt as the base for escalation
+    let base_prompt = &branches[0].worker_prompt;
+    match call_escalation(api_key, base_prompt, &context).await {
+        Ok(escalated_output) => {
+            branches[0].output = Some(escalated_output);
+            branches[0].status = WorkerStatus::Done;
+            *winner = Some(0);
+        }
+        Err(e) => {
+            eprintln!("[ghost orchestrator] speculative escalation failed: {e}");
+            branches[0].status = WorkerStatus::Failed(e);
+        }
+    }
 }
 
 enum WorkerResult {
@@ -689,5 +881,77 @@ More context";
             "The result is { some value that trails off",
             "explain the concept"
         ));
+    }
+
+    // ── speculative parsing tests (Phase F2) ────────────────────────
+
+    #[test]
+    fn parse_speculate_two_branches() {
+        let response =
+            "[SPECULATE] Choose sort algorithm ||| bubble_sort: Write a bubble sort fn ||| quick_sort: Write a quicksort fn";
+        let items = parse_plan(response);
+        assert_eq!(items.len(), 1);
+        match &items[0] {
+            PlanItem::Speculative {
+                description,
+                branches,
+                winner,
+            } => {
+                assert!(description.contains("sort algorithm"));
+                assert_eq!(branches.len(), 2);
+                assert_eq!(branches[0].hypothesis, "bubble_sort");
+                assert!(branches[0].worker_prompt.contains("bubble sort"));
+                assert_eq!(branches[1].hypothesis, "quick_sort");
+                assert!(branches[1].worker_prompt.contains("quicksort"));
+                assert!(winner.is_none());
+            }
+            other => panic!("expected Speculative, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_speculate_three_branches() {
+        let response = "[SPECULATE] Pick approach ||| a: prompt a ||| b: prompt b ||| c: prompt c";
+        let items = parse_plan(response);
+        assert_eq!(items.len(), 1);
+        match &items[0] {
+            PlanItem::Speculative { branches, .. } => {
+                assert_eq!(branches.len(), 3);
+            }
+            other => panic!("expected Speculative, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_speculate_one_branch_falls_back_to_delegate() {
+        // Speculation needs 2+ branches — single branch falls back to Delegate
+        let response = "[SPECULATE] Only one option ||| only_branch: do the thing";
+        let items = parse_plan(response);
+        assert_eq!(items.len(), 1);
+        assert!(
+            matches!(&items[0], PlanItem::Delegate { .. }),
+            "single-branch speculate should fall back to Delegate"
+        );
+    }
+
+    #[test]
+    fn parse_speculate_no_separator_falls_back() {
+        let response = "[SPECULATE] no branches at all";
+        let items = parse_plan(response);
+        assert_eq!(items.len(), 1);
+        assert!(matches!(&items[0], PlanItem::Critical { .. }));
+    }
+
+    #[test]
+    fn parse_mixed_with_speculate() {
+        let response = "\
+[DO] Design the architecture
+[SPECULATE] Choose implementation ||| approach_a: Write it with HashMap ||| approach_b: Write it with BTreeMap
+[DELEGATE] Write tests ||| Write unit tests for the sort module";
+        let items = parse_plan(response);
+        assert_eq!(items.len(), 3);
+        assert!(matches!(&items[0], PlanItem::Critical { .. }));
+        assert!(matches!(&items[1], PlanItem::Speculative { .. }));
+        assert!(matches!(&items[2], PlanItem::Delegate { .. }));
     }
 }

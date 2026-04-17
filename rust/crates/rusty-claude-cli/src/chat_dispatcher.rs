@@ -15,6 +15,10 @@ const SCHOLAR_SEARCH_LIMIT: i64 = 3;
 const SCHOLAR_SOLUTION_THRESHOLD: f64 = 0.15;
 const SCHOLAR_FAILED_THRESHOLD: f64 = 0.25;
 const SCHOLAR_DEDUP_THRESHOLD: f64 = 0.10;
+const CACHE_HIT_THRESHOLD: f64 = 0.05;
+const CACHE_HIT_MIN_COUNT: i32 = 2;
+const CACHE_DEDUP_THRESHOLD: f64 = 0.03;
+const CACHE_SEARCH_LIMIT: i64 = 1;
 
 /// Dispatch a no-prefix message to Claude Haiku. Returns the response text.
 ///
@@ -23,6 +27,7 @@ const SCHOLAR_DEDUP_THRESHOLD: f64 = 0.10;
 ///
 /// If `pool` is provided, semantic memory search runs before the call and
 /// note extraction runs asynchronously after.
+#[allow(clippy::too_many_lines)]
 pub async fn dispatch(
     message: &str,
     history: &[serde_json::Value],
@@ -59,6 +64,12 @@ pub async fn dispatch(
         String::new()
     };
 
+    let cache_context = if let Some(ref emb) = query_embedding {
+        load_response_cache_context(emb, pool).await
+    } else {
+        String::new()
+    };
+
     let do_search = should_search(&polished);
     eprintln!("[ghost chat] should_search={do_search} for: {message}");
     let web_context = if do_search {
@@ -82,6 +93,10 @@ pub async fn dispatch(
     if !scholar_context.is_empty() {
         system.push_str("\n\n");
         system.push_str(&scholar_context);
+    }
+    if !cache_context.is_empty() {
+        system.push_str("\n\n");
+        system.push_str(&cache_context);
     }
     if web_context.is_empty() {
         eprintln!("[ghost chat] web_context is empty — nothing to inject");
@@ -136,6 +151,14 @@ pub async fn dispatch(
         let resp_scholar = response.clone();
         tokio::spawn(async move {
             store_scholar_solution(pool_scholar, msg_scholar, resp_scholar).await;
+        });
+
+        // Store query+response in response cache for token recycling.
+        let pool_cache = p.clone();
+        let msg_cache = polished.clone();
+        let resp_cache = response.clone();
+        tokio::spawn(async move {
+            store_response_cache(pool_cache, msg_cache, resp_cache).await;
         });
     }
 
@@ -289,6 +312,65 @@ async fn store_scholar_solution(pool: sqlx::PgPool, message: String, response: S
 
     if stored {
         eprintln!("[ghost scholar] stored new solution for: {message}");
+    }
+}
+
+/// Search the response cache for a very similar prior query. Returns formatted
+/// context to inject into the system prompt if a good match is found.
+async fn load_response_cache_context(embedding: &[f32], pool: Option<&sqlx::PgPool>) -> String {
+    let Some(pool) = pool else {
+        return String::new();
+    };
+
+    let results = crate::db::search_response_cache(pool, embedding, CACHE_SEARCH_LIMIT).await;
+    if results.is_empty() {
+        return String::new();
+    }
+
+    for (cached, distance) in &results {
+        if *distance < CACHE_HIT_THRESHOLD && cached.hit_count >= CACHE_HIT_MIN_COUNT {
+            eprintln!(
+                "[ghost cache] response cache hit (dist={distance:.3}, hits={}): {}",
+                cached.hit_count,
+                &cached.query_text[..cached.query_text.len().min(80)]
+            );
+            crate::db::increment_cache_hit(pool, &cached.id).await;
+            return format!(
+                "## Similar previous response\nYou previously answered a similar question:\n{}",
+                &cached.response_text[..cached.response_text.len().min(4096)]
+            );
+        }
+    }
+
+    String::new()
+}
+
+/// Store a query+response pair in the response cache (fire-and-forget).
+async fn store_response_cache(pool: sqlx::PgPool, query: String, response: String) {
+    let embedding = match crate::memory::embed(&query).await {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("[ghost cache] embed failed, skipping cache store: {e}");
+            return;
+        }
+    };
+
+    // Check for near-duplicate — if very similar query exists, bump its hit count
+    let existing = crate::db::search_response_cache(&pool, &embedding, 1).await;
+    if let Some((cached, distance)) = existing.first() {
+        if *distance < CACHE_DEDUP_THRESHOLD {
+            eprintln!(
+                "[ghost cache] dedup hit (dist={distance:.3}), incrementing {}",
+                cached.id
+            );
+            crate::db::increment_cache_hit(&pool, &cached.id).await;
+            return;
+        }
+    }
+
+    let stored = crate::db::insert_response_cache(&pool, &query, Some(&embedding), &response).await;
+    if stored {
+        eprintln!("[ghost cache] stored new response for: {query}");
     }
 }
 

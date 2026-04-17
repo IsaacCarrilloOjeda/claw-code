@@ -577,6 +577,118 @@ pub async fn add_scholar_failed_attempt(pool: &PgPool, id: &str, attempt: &str) 
 }
 
 // ---------------------------------------------------------------------------
+// Response cache model (Phase F1 — token recycling)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, serde::Serialize)]
+pub struct CachedResponse {
+    pub id: String,
+    pub query_text: String,
+    pub response_text: String,
+    pub hit_count: i32,
+}
+
+/// Semantic search on `response_cache` by cosine similarity on `query_embed`.
+pub async fn search_response_cache(
+    pool: &PgPool,
+    embedding: &[f32],
+    limit: i64,
+) -> Vec<(CachedResponse, f64)> {
+    let embedding_str = vec_to_pgvector(embedding);
+    let rows = sqlx::query(
+        "SELECT id::text, query_text, response_text, hit_count,
+                (query_embed <=> $1::vector) AS distance
+         FROM response_cache
+         WHERE query_embed IS NOT NULL
+         ORDER BY query_embed <=> $1::vector
+         LIMIT $2",
+    )
+    .bind(&embedding_str)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    rows.iter()
+        .map(|row| {
+            let cached = CachedResponse {
+                id: row.try_get("id").unwrap_or_default(),
+                query_text: row.try_get("query_text").unwrap_or_default(),
+                response_text: row.try_get("response_text").unwrap_or_default(),
+                hit_count: row.try_get("hit_count").unwrap_or(0),
+            };
+            let distance: f64 = row.try_get("distance").unwrap_or(1.0);
+            (cached, distance)
+        })
+        .collect()
+}
+
+/// Insert a new response cache entry. Returns true on success.
+pub async fn insert_response_cache(
+    pool: &PgPool,
+    query_text: &str,
+    query_embed: Option<&[f32]>,
+    response_text: &str,
+) -> bool {
+    let id = uuid::Uuid::new_v4().to_string();
+    if let Some(emb) = query_embed {
+        let embedding_str = vec_to_pgvector(emb);
+        sqlx::query(
+            "INSERT INTO response_cache (id, query_text, query_embed, response_text)
+             VALUES ($1::uuid, $2, $3::vector, $4)",
+        )
+        .bind(&id)
+        .bind(query_text)
+        .bind(&embedding_str)
+        .bind(response_text)
+        .execute(pool)
+        .await
+        .is_ok()
+    } else {
+        sqlx::query(
+            "INSERT INTO response_cache (id, query_text, response_text)
+             VALUES ($1::uuid, $2, $3)",
+        )
+        .bind(&id)
+        .bind(query_text)
+        .bind(response_text)
+        .execute(pool)
+        .await
+        .is_ok()
+    }
+}
+
+/// Bump `hit_count` and update `last_hit_at` for a cached response.
+pub async fn increment_cache_hit(pool: &PgPool, id: &str) {
+    let _ = sqlx::query(
+        "UPDATE response_cache
+         SET hit_count = hit_count + 1, last_hit_at = now()
+         WHERE id = $1::uuid",
+    )
+    .bind(id)
+    .execute(pool)
+    .await;
+}
+
+/// Delete stale response cache entries: older than 90 days with fewer than 3 hits.
+pub async fn cleanup_response_cache(pool: &PgPool) {
+    let result = sqlx::query(
+        "DELETE FROM response_cache
+         WHERE created_at < now() - interval '90 days'
+           AND hit_count < 3",
+    )
+    .execute(pool)
+    .await;
+
+    if let Ok(r) = result {
+        let n = r.rows_affected();
+        if n > 0 {
+            eprintln!("[ghost db] cleaned up {n} stale response cache entries");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Circuit breaker helpers
 // ---------------------------------------------------------------------------
 
