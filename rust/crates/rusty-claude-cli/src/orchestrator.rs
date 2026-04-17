@@ -332,6 +332,8 @@ pub async fn execute_plan(plan: &mut Plan, pool: Option<&sqlx::PgPool>) -> Resul
 
 /// Spawn parallel Haiku workers for all pending DELEGATE items and collect results.
 async fn run_delegate_workers(plan: &mut Plan, api_key: &str, pool: Option<&sqlx::PgPool>) {
+    let macros = crate::macros::load_macros();
+
     let mut delegate_tasks: Vec<(usize, String)> = Vec::new();
     for (idx, item) in plan.items.iter().enumerate() {
         if let PlanItem::Delegate {
@@ -347,8 +349,10 @@ async fn run_delegate_workers(plan: &mut Plan, api_key: &str, pool: Option<&sqlx
     let mut handles = Vec::new();
     for (idx, prompt) in delegate_tasks {
         let key = api_key.to_string();
-        let p = prompt.clone();
+        // Inject macro dictionary into the worker prompt
+        let p = crate::macros::inject_macro_dictionary(&prompt, &macros);
         let pool_clone = pool.cloned();
+        let macros_clone = macros.clone();
 
         let scholar_context = if let Some(ref db_pool) = pool_clone {
             load_scholar_hints(&p, db_pool).await
@@ -362,10 +366,19 @@ async fn run_delegate_workers(plan: &mut Plan, api_key: &str, pool: Option<&sqlx
             p.clone()
         };
 
-        let handle =
-            tokio::spawn(
-                async move { (idx, run_worker_with_retry(&key, &enriched_prompt, &p).await) },
-            );
+        let handle = tokio::spawn(async move {
+            let result = run_worker_with_retry(&key, &enriched_prompt, &p).await;
+            // Expand any macro references in worker output
+            let result = match result {
+                WorkerResult::Done(output) => {
+                    WorkerResult::Done(crate::macros::expand_macros(&output, &macros_clone))
+                }
+                WorkerResult::Escalated(output) => {
+                    WorkerResult::Escalated(crate::macros::expand_macros(&output, &macros_clone))
+                }
+            };
+            (idx, result)
+        });
         handles.push(handle);
     }
 

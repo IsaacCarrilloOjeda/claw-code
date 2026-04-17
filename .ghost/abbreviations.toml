@@ -1,0 +1,19 @@
+# Project-aware abbreviations -- maps Isaac's natural language to precise terms.
+# Applied before any API call. Grows as GHOST learns Isaac's vocabulary.
+
+[abbreviations]
+"the daemon file" = "daemon.rs"
+"the daemon" = "daemon.rs"
+"the dashboard" = "dashboard/src/App.jsx"
+"the memory stuff" = "director_notes table + memory.rs"
+"the memory thing" = "director_notes table + memory.rs"
+"the auth thing" = "validate_bearer in daemon.rs"
+"the auth" = "validate_bearer in daemon.rs"
+"the routing" = "routing.rs"
+"the routing thing" = "routing.rs"
+"the search" = "search.rs (Brave Search)"
+"the search thing" = "search.rs (Brave Search)"
+"the context file" = "ghost-context.txt (GHOST_CORE_CONTEXT_PATH)"
+"the pipeline" = "PIPELINE.md cost-intelligence pipeline"
+"scholar db" = "scholar_solutions table"
+"the scholar" = "scholar_solutions table"

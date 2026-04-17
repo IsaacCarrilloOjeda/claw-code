@@ -44,6 +44,9 @@ pub async fn dispatch(
             cleaned.clone()
         });
 
+    // Apply project-aware abbreviations (Phase E2).
+    let polished = crate::compress::apply_abbreviations(&polished);
+
     let core_context = load_core_context();
 
     // Embed the polished message once; reuse for memory search + scholar search.

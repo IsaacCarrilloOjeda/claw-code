@@ -1,0 +1,56 @@
+# GHOST Code Macros -- shorthand patterns for AI output
+# AI writes: MACRO_NAME("param1", "param2")
+# Post-processor expands to full code block with params substituted.
+
+[macros.CORS_PREFLIGHT]
+params = ["allowed_origins"]
+expansion = """
+fn write_cors_headers(response: &mut Response, origin: &str) {
+    response.headers_mut().insert("Access-Control-Allow-Origin", origin.parse().unwrap());
+    response.headers_mut().insert("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS".parse().unwrap());
+    response.headers_mut().insert("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Claw-Key".parse().unwrap());
+    response.headers_mut().insert("Access-Control-Allow-Private-Network", "true".parse().unwrap());
+}
+"""
+
+[macros.AUTH_BEARER]
+params = ["key_var"]
+expansion = """
+let expected = std::env::var("{key_var}").unwrap_or_default();
+if !validate_bearer(&auth_header, &expected) {
+    return write_response(stream, 401, r#"{{"error":"unauthorized"}}"#, origin).await;
+}
+"""
+
+[macros.DB_QUERY_EMBED]
+params = ["table", "embed_col", "limit"]
+expansion = """
+sqlx::query(
+    &format!("SELECT * FROM {table} WHERE {embed_col} IS NOT NULL ORDER BY {embed_col} <=> $1::vector LIMIT {limit}")
+)
+.bind(&embedding_str)
+.fetch_all(pool)
+.await
+.unwrap_or_default()
+"""
+
+[macros.HAIKU_CALL]
+params = ["system_prompt", "max_tokens"]
+expansion = """
+let body = serde_json::json!({{
+    "model": crate::constants::HAIKU_MODEL,
+    "max_tokens": {max_tokens},
+    "system": {system_prompt},
+    "messages": messages,
+}});
+let client = crate::http_client::shared_client();
+let resp = client
+    .post(crate::constants::ANTHROPIC_MESSAGES_URL)
+    .timeout(std::time::Duration::from_secs(60))
+    .header("x-api-key", &api_key)
+    .header("anthropic-version", "2023-06-01")
+    .json(&body)
+    .send()
+    .await
+    .map_err(|e| format!("API failed: {{e}}"))?;
+"""

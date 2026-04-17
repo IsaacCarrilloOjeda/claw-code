@@ -16,6 +16,7 @@ mod gerald;
 mod http_client;
 mod init;
 mod input;
+mod macros;
 mod memory;
 mod orchestrator;
 mod render;

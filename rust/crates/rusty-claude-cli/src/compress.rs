@@ -1,4 +1,7 @@
-//! Filler stripping and response confidence heuristics for the cascade dispatcher.
+//! Filler stripping, response confidence heuristics, and prompt compression
+//! for the cascade dispatcher.
+
+use std::sync::OnceLock;
 
 const FILLER_PREFIXES: &[&str] = &[
     "okay so ", "hey so ", "ok so ", "hello ", "hey ", "umm ", "uhh ", "hmm ", "hi ", "so ", "um ",
@@ -212,6 +215,101 @@ pub fn is_low_confidence(response: &str) -> bool {
     HEDGING_PHRASES.iter().any(|h| lower.contains(h))
 }
 
+// ── Abbreviations (Phase E2 — prompt compression) ───────────────────────
+
+/// Cached abbreviation pairs, loaded once per process lifetime.
+static ABBREVIATIONS: OnceLock<Vec<(String, String)>> = OnceLock::new();
+
+/// Load abbreviation pairs from `.ghost/abbreviations.toml` (or `GHOST_ABBREVIATIONS_PATH`).
+/// Returns pairs sorted by pattern length descending so longer matches take priority.
+/// Cached in a `OnceLock` — the file is only read once per daemon lifetime.
+pub fn load_abbreviations() -> &'static [(String, String)] {
+    ABBREVIATIONS.get_or_init(|| {
+        let path = std::env::var("GHOST_ABBREVIATIONS_PATH").unwrap_or_else(|_| {
+            let mut p = std::env::current_dir().unwrap_or_default();
+            p.push(".ghost");
+            p.push("abbreviations.toml");
+            p.to_string_lossy().to_string()
+        });
+
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[ghost abbreviations] failed to read {path}: {e}");
+                return Vec::new();
+            }
+        };
+
+        parse_abbreviations_toml(&content)
+    })
+}
+
+/// Parse abbreviation pairs from a TOML string. Exported for testing.
+pub fn parse_abbreviations_toml(content: &str) -> Vec<(String, String)> {
+    let table: toml::Value = match content.parse() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[ghost abbreviations] TOML parse error: {e}");
+            return Vec::new();
+        }
+    };
+
+    let Some(abbr_table) = table.get("abbreviations").and_then(|v| v.as_table()) else {
+        return Vec::new();
+    };
+
+    let mut pairs: Vec<(String, String)> = abbr_table
+        .iter()
+        .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string()))
+        .filter(|(_, v)| !v.is_empty())
+        .collect();
+
+    // Sort by pattern length descending — longest match first
+    pairs.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+    pairs
+}
+
+/// Apply abbreviations: case-insensitive replacement of known phrases.
+/// Longest patterns match first to avoid partial replacements.
+pub fn apply_abbreviations(message: &str) -> String {
+    apply_abbreviations_with(message, load_abbreviations())
+}
+
+/// Inner function that accepts abbreviation pairs directly (for testing).
+pub fn apply_abbreviations_with(message: &str, pairs: &[(String, String)]) -> String {
+    if pairs.is_empty() {
+        return message.to_string();
+    }
+
+    let mut result = message.to_string();
+    for (pattern, replacement) in pairs {
+        result = case_insensitive_replace(&result, pattern, replacement);
+    }
+    result
+}
+
+/// Replace all case-insensitive occurrences of `pattern` in `text` with `replacement`.
+fn case_insensitive_replace(text: &str, pattern: &str, replacement: &str) -> String {
+    let lower_text = text.to_lowercase();
+    let lower_pattern = pattern.to_lowercase();
+    let pattern_len = pattern.len();
+
+    let mut result = String::with_capacity(text.len());
+    let mut last_end = 0;
+
+    for (start, _) in lower_text.match_indices(&lower_pattern) {
+        if start < last_end {
+            continue; // skip overlapping matches
+        }
+        result.push_str(&text[last_end..start]);
+        result.push_str(replacement);
+        last_end = start + pattern_len;
+    }
+
+    result.push_str(&text[last_end..]);
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -350,5 +448,62 @@ mod tests {
     fn needs_intake_exactly_fifty_words() {
         let msg = "word ".repeat(50);
         assert!(needs_intake(msg.trim()));
+    }
+
+    // ── apply_abbreviations ─────────────────────────────────────
+
+    fn test_pairs() -> Vec<(String, String)> {
+        parse_abbreviations_toml(
+            r#"
+[abbreviations]
+"the daemon file" = "daemon.rs"
+"the daemon" = "daemon.rs"
+"the memory stuff" = "director_notes table + memory.rs"
+"the memory" = "memory.rs"
+"#,
+        )
+    }
+
+    #[test]
+    fn abbreviation_known_replaced() {
+        let pairs = test_pairs();
+        let result = apply_abbreviations_with("update the daemon", &pairs);
+        assert_eq!(result, "update daemon.rs");
+    }
+
+    #[test]
+    fn abbreviation_case_insensitive() {
+        let pairs = test_pairs();
+        let result = apply_abbreviations_with("check The Daemon for issues", &pairs);
+        assert_eq!(result, "check daemon.rs for issues");
+    }
+
+    #[test]
+    fn abbreviation_unknown_unchanged() {
+        let pairs = test_pairs();
+        let result = apply_abbreviations_with("update the frobnicator", &pairs);
+        assert_eq!(result, "update the frobnicator");
+    }
+
+    #[test]
+    fn abbreviation_longer_pattern_priority() {
+        let pairs = test_pairs();
+        // "the memory stuff" (longer) should match before "the memory"
+        let result = apply_abbreviations_with("fix the memory stuff", &pairs);
+        assert_eq!(result, "fix director_notes table + memory.rs");
+    }
+
+    #[test]
+    fn abbreviation_in_sentence_context() {
+        let pairs = test_pairs();
+        let result =
+            apply_abbreviations_with("please update the daemon file and restart it", &pairs);
+        assert_eq!(result, "please update daemon.rs and restart it");
+    }
+
+    #[test]
+    fn abbreviation_empty_pairs() {
+        let result = apply_abbreviations_with("nothing to replace here", &[]);
+        assert_eq!(result, "nothing to replace here");
     }
 }

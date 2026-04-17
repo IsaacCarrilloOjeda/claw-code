@@ -477,7 +477,7 @@ For now, this is called only when explicitly triggered (future: Director routes 
 
 # ============================================================
 # PHASE E1 — Code Macro System
-# STATUS: NOT STARTED (requires D1+D2)
+# STATUS: COMPLETE (2026-04-16)
 # ============================================================
 
 ## What You Are Building
@@ -610,7 +610,7 @@ In `execute_plan`:
 
 # ============================================================
 # PHASE E2 — Prompt Compression (Project-Aware Abbreviation)
-# STATUS: NOT STARTED (can be built independently)
+# STATUS: COMPLETE (2026-04-16)
 # ============================================================
 
 ## What You Are Building
@@ -826,8 +826,8 @@ Format: [SPECULATE] description ||| hypothesis_a: worker_prompt_a ||| hypothesis
 | **C** | Scholar database | A | ~250 lines | 1 |
 | **D1** | Orchestrator module (planning) | A, B | ~250 lines | DONE |
 | **D2** | Worker execution + checkpoints | D1, C | ~300 lines | DONE |
-| **E1** | Code macro system | D1, D2 | ~250 lines | 1 |
-| **E2** | Prompt compression (abbreviations) | A | ~100 lines | 1 |
+| **E1** | Code macro system | D1, D2 | ~250 lines | DONE |
+| **E2** | Prompt compression (abbreviations) | A | ~100 lines | DONE |
 | **F1** | Token recycling (response cache) | C | ~200 lines | 1 |
 | **F2** | Speculative parallel execution | D1, D2 | ~200 lines | 1 |
 
