@@ -1020,7 +1020,7 @@ async fn sms_inbound(cfg: &DaemonConfig, raw: &str) -> (&'static str, String) {
             );
         };
         // Android SMS Gateway wraps data in a `payload` object:
-        //   { "payload": { "message": "...", "sender": "..." }, ... }
+        //   { "payload": { "message": "...", "phoneNumber": "..." }, "event": "sms:received", ... }
         // Also support flat format for direct API calls:
         //   { "message": "...", "phoneNumber": "..." }
         let payload = &body["payload"];
@@ -1031,8 +1031,9 @@ async fn sms_inbound(cfg: &DaemonConfig, raw: &str) -> (&'static str, String) {
             .unwrap_or("")
             .trim()
             .to_string();
-        let from = payload["sender"]
+        let from = payload["phoneNumber"]
             .as_str()
+            .or_else(|| payload["sender"].as_str())
             .or_else(|| body["phoneNumber"].as_str())
             .or_else(|| body["from"].as_str())
             .unwrap_or("")
