@@ -1568,7 +1568,7 @@ function SmsPanel({ daemonKey }) {
   async function loadSchedule() {
     try {
       const data = await apiFetch('/schedule', {}, daemonKey)
-      setScheduleEntries(data)
+      setScheduleEntries(Array.isArray(data) ? data : data.entries || [])
     } catch { /* ignore */ }
   }
 
@@ -2090,7 +2090,7 @@ function SmsSchedulePanel({ daemonKey, entries, setEntries, onClose }) {
       }, daemonKey)
       // Reload
       const data = await apiFetch('/schedule', {}, daemonKey)
-      setEntries(data)
+      setEntries(Array.isArray(data) ? data : data.entries || [])
     } catch { /* ignore */ }
     setAdding(false)
   }
