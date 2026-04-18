@@ -1019,15 +1019,21 @@ async fn sms_inbound(cfg: &DaemonConfig, raw: &str) -> (&'static str, String) {
                 r#"{"error":"body must be JSON or form-encoded"}"#.to_owned(),
             );
         };
-        // Android SMS Gateway may use either field name.
-        let msg = body["message"]
+        // Android SMS Gateway wraps data in a `payload` object:
+        //   { "payload": { "message": "...", "sender": "..." }, ... }
+        // Also support flat format for direct API calls:
+        //   { "message": "...", "phoneNumber": "..." }
+        let payload = &body["payload"];
+        let msg = payload["message"]
             .as_str()
+            .or_else(|| body["message"].as_str())
             .or_else(|| body["text"].as_str())
             .unwrap_or("")
             .trim()
             .to_string();
-        let from = body["phoneNumber"]
+        let from = payload["sender"]
             .as_str()
+            .or_else(|| body["phoneNumber"].as_str())
             .or_else(|| body["from"].as_str())
             .unwrap_or("")
             .to_string();

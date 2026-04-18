@@ -47,10 +47,20 @@ async fn send_via_gateway(to: &str, body: &str) -> Result<(), String> {
 
     let client = crate::http_client::shared_client();
 
-    let resp = client
+    let mut req = client
         .post(&url)
         .timeout(Duration::from_secs(SMS_TIMEOUT_SECS))
-        .json(&payload)
+        .json(&payload);
+
+    // Cloud API requires basic auth (GHOST_SMS_GATEWAY_USER / GHOST_SMS_GATEWAY_PASS).
+    if let (Ok(user), Ok(pass)) = (
+        std::env::var("GHOST_SMS_GATEWAY_USER"),
+        std::env::var("GHOST_SMS_GATEWAY_PASS"),
+    ) {
+        req = req.basic_auth(&user, Some(&pass));
+    }
+
+    let resp = req
         .send()
         .await
         .map_err(|e| format!("Gateway request failed: {e}"))?;
