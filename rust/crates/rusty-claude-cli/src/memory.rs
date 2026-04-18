@@ -318,7 +318,29 @@ fn validate_note(category: &str, content: &str) -> Option<(String, String)> {
 /// Each extracted note is validated before storage: category must be from the
 /// allowed set, content is sanitized and length-capped, instruction-like
 /// patterns are rejected.
+/// Optional phone number: when provided (SMS path), the user message will be
+/// flagged as loadbearing if any notes are extracted from this turn.
 pub async fn extract_and_store(pool: sqlx::PgPool, message: String, response: String) {
+    extract_and_store_inner(pool, message, response, None).await;
+}
+
+/// Same as `extract_and_store` but flags the user message as loadbearing in
+/// `sms_history` when notes are extracted.
+pub async fn extract_and_store_sms(
+    pool: sqlx::PgPool,
+    message: String,
+    response: String,
+    phone: String,
+) {
+    extract_and_store_inner(pool, message, response, Some(phone)).await;
+}
+
+async fn extract_and_store_inner(
+    pool: sqlx::PgPool,
+    message: String,
+    response: String,
+    phone: Option<String>,
+) {
     let Ok(api_key) = std::env::var("ANTHROPIC_API_KEY") else {
         return;
     };
@@ -377,6 +399,8 @@ pub async fn extract_and_store(pool: sqlx::PgPool, message: String, response: St
         None => return,
     };
 
+    let mut notes_stored = 0u32;
+
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -400,6 +424,15 @@ pub async fn extract_and_store(pool: sqlx::PgPool, message: String, response: St
                 eprintln!("[ghost memory] embed failed, storing without vector: {e}");
                 crate::db::insert_note(&pool, &category, &content, None).await;
             }
+        }
+        notes_stored += 1;
+    }
+
+    // If notes were extracted and this came from SMS, flag the user message as
+    // loadbearing so it stays in context beyond the recency window.
+    if notes_stored > 0 {
+        if let Some(ref ph) = phone {
+            crate::db::flag_sms_loadbearing(&pool, ph, "user", &message).await;
         }
     }
 }

@@ -45,7 +45,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **Dashboard DAEMON_URL**: set `VITE_DAEMON_URL=https://<your-service>.railway.app` in the dashboard's Vite env (`.env.production` or Railway build env) to point at the deployed daemon.
 - **OPENAI_API_KEY is OpenRouter here**: the user routes non-Anthropic models through OpenRouter using `OPENAI_API_KEY`. OpenRouter does NOT support the embeddings endpoint — do not use it for embeddings. Use `VOYAGE_API_KEY` instead.
 - **Embeddings provider**: `VOYAGE_API_KEY` → Voyage AI `voyage-3` with `output_dimension=1536` (matches DB schema). Falls back to `OPENAI_API_KEY` → OpenAI `text-embedding-3-small` (1536 dims). If neither key is set, notes store with `NULL` embedding and still appear in the memory panel — semantic injection just stays empty.
-- **Conversation history cap**: `POST /chat` accepts optional `history: [{role, content}]`. Daemon validates and caps at 6 entries (3 exchanges). Each content field capped at 8192 chars. SMS path always sends empty history (single-turn by nature).
+- **Conversation history cap**: `POST /chat` accepts optional `history: [{role, content}]`. Daemon validates and caps at 10 entries (5 exchanges). Each content field capped at 8192 chars. SMS path loads last 10 messages + any loadbearing-flagged messages from `sms_history`.
+- **Loadbearing messages**: Messages that produce memory notes during extraction are auto-flagged `loadbearing=TRUE` in `sms_history`. These are always included in SMS context regardless of recency, merged before the recent window. Migration `007_sms_loadbearing.sql`.
+- **SMS auto-reply gate**: `sms_contacts.auto_reply` defaults to `FALSE`. Inbound SMS from allowed numbers is always stored in `sms_history`, but GHOST only replies if `auto_reply=TRUE` for that contact. Toggle via `POST /sms/contacts/{phone}/auto-reply`. Migration `008_sms_contacts.sql`.
+- **Schedule context injection**: `sms_schedule` table stores daily and persistent schedule entries. `load_schedule_context()` formats them and injects into the system prompt (after sender identity, before memory notes) so GHOST knows Isaac's availability.
 
 ---
 
@@ -70,8 +73,15 @@ All return JSON. CORS header on every response.
 | POST | `/director/config` | **bearer** | Swap primary or fallback model. Body: `{"primary_model":"...","fallback_model":"..."}`. |
 | POST | `/prompt` | **flag + key + bearer** | Runs a one-shot prompt via `claw prompt` subprocess. Body: `{"prompt":"...","model":"..."}` |
 | POST | `/chat` | **bearer** (when key set) | Synchronous chat via `chat_dispatcher`. Body: `{"message":"...","history":[{role,content}]}`. Returns `{"response":"...","job_id":"..."}`. 503 if DB not configured. |
-| POST | `/sms/inbound` | open | Accept SMS from Android Gateway (JSON) or Twilio (form-encoded). Spawns background task, returns 200 immediately. |
-| POST | `/sms/send` | open | Internal: deliver outbound SMS. Body: `{"to":"+1...","body":"..."}`. |
+| POST | `/sms/inbound` | open | Accept SMS from Android Gateway (JSON) or Twilio (form-encoded). Spawns background task, returns 200 immediately. Auto-reply gate checks `sms_contacts.auto_reply` before responding. |
+| POST | `/sms/send` | **bearer** | Deliver outbound SMS + store in `sms_history`. Body: `{"to":"+1...","body":"..."}`. Returns `{"status":"sent","message_id":"..."}`. |
+| GET | `/sms/contacts` | **bearer** | List contacts with auto-reply status + message counts. |
+| GET | `/sms/history/{phone}` | **bearer** | Paginated message history for a contact. Query: `?limit=30&before=uuid`. |
+| POST | `/sms/contacts/{phone}/auto-reply` | **bearer** | Toggle auto-reply. Body: `{"enabled": bool}`. |
+| PUT | `/sms/contacts/{phone}/name` | **bearer** | Set display name. Body: `{"name": "..."}`. |
+| GET | `/schedule` | **bearer** | List all schedule entries (persistent + daily). |
+| POST | `/schedule` | **bearer** | Add entry. Body: `{"kind":"daily/persistent","day_date":"...","content":"..."}`. |
+| DELETE | `/schedule/{id}` | **bearer** | Delete a schedule entry by UUID. |
 | GET | `/memories` | open | List up to 200 non-expired memory notes. 503 if DB not configured. |
 | DELETE | `/memories/:id` | **bearer** | Delete a single note by UUID. |
 | GET | `/bible/stats` | open | Row counts for all Bible tables. 503 if DB not configured. |

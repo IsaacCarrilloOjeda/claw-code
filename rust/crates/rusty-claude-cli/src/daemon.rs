@@ -226,6 +226,7 @@ async fn daemon_main(cfg: DaemonConfig) -> Result<(), Box<dyn std::error::Error>
                         "413 Payload Too Large",
                         "{\"error\":\"request too large\"}",
                         None,
+                        "application/json",
                     )
                     .await;
                     return;
@@ -236,6 +237,7 @@ async fn daemon_main(cfg: DaemonConfig) -> Result<(), Box<dyn std::error::Error>
                         "400 Bad Request",
                         "{\"error\":\"bad request\"}",
                         None,
+                        "application/json",
                     )
                     .await;
                     return;
@@ -250,7 +252,19 @@ async fn daemon_main(cfg: DaemonConfig) -> Result<(), Box<dyn std::error::Error>
             let allowed_origin =
                 origin.and_then(|o| if is_origin_allowed(&o) { Some(o) } else { None });
 
-            write_response(&mut stream, status_line, &body, allowed_origin.as_deref()).await;
+            let ct = if body.starts_with("<!DOCTYPE") {
+                "text/html; charset=utf-8"
+            } else {
+                "application/json"
+            };
+            write_response(
+                &mut stream,
+                status_line,
+                &body,
+                allowed_origin.as_deref(),
+                ct,
+            )
+            .await;
             eprintln!(
                 "{LOG_PREFIX} {} {}",
                 peer,
@@ -347,14 +361,20 @@ async fn write_response(
     status_line: &str,
     body: &str,
     allowed_origin: Option<&str>,
+    content_type: &str,
 ) {
+    let csp = if content_type.starts_with("text/html") {
+        "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'"
+    } else {
+        "default-src 'none'"
+    };
     let mut headers = format!(
         "HTTP/1.1 {status_line}\r\n\
-         Content-Type: application/json\r\n\
+         Content-Type: {content_type}\r\n\
          Content-Length: {}\r\n\
          X-Content-Type-Options: nosniff\r\n\
          X-Frame-Options: DENY\r\n\
-         Content-Security-Policy: default-src 'none'\r\n\
+         Content-Security-Policy: {csp}\r\n\
          Cache-Control: no-store\r\n",
         body.len()
     );
@@ -362,7 +382,7 @@ async fn write_response(
         use std::fmt::Write as _;
         let _ = write!(headers, "Access-Control-Allow-Origin: {origin}\r\n");
         headers.push_str("Vary: Origin\r\n");
-        headers.push_str("Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n");
+        headers.push_str("Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS\r\n");
         headers
             .push_str("Access-Control-Allow-Headers: Content-Type, Authorization, X-Claw-Key\r\n");
         headers.push_str("Access-Control-Max-Age: 86400\r\n");
@@ -517,6 +537,7 @@ fn auth_matches(raw: &str) -> bool {
 // Request routing
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_lines)]
 async fn dispatch(
     cfg: &DaemonConfig,
     raw: &str,
@@ -558,6 +579,10 @@ async fn dispatch(
             let id = &p["/jobs/".len()..];
             job_get(cfg.db.as_deref(), id).await
         }
+        ("GET", p) if p.starts_with("/read/") => {
+            let id = &p["/read/".len()..];
+            read_page(cfg.db.as_deref(), id).await
+        }
         ("GET", "/director/config") => director_config_get(cfg.db.as_deref()).await,
         ("POST", "/director/config") => {
             if !auth_matches(raw) {
@@ -591,6 +616,36 @@ async fn dispatch(
         ("POST", "/chat") => chat_handler(cfg, raw).await,
         ("POST", "/sms/inbound") => sms_inbound(cfg, raw).await,
         ("POST", "/sms/send") => sms_send_handler(raw, cfg).await,
+
+        // --- SMS contacts + history endpoints ---
+        ("GET", "/sms/contacts") => sms_contacts_list(cfg, raw).await,
+        ("GET", p) if p.starts_with("/sms/history/") => {
+            let phone_encoded = &p["/sms/history/".len()..];
+            // Strip query string from phone segment
+            let phone_seg = phone_encoded.split('?').next().unwrap_or(phone_encoded);
+            let phone = url_decode(phone_seg);
+            // Parse query params
+            let qs = p.split_once('?').map_or("", |(_, q)| q);
+            sms_history_handler(cfg, raw, &phone, qs).await
+        }
+        ("POST", p) if p.starts_with("/sms/contacts/") && p.ends_with("/auto-reply") => {
+            let mid = &p["/sms/contacts/".len()..p.len() - "/auto-reply".len()];
+            let phone = url_decode(mid);
+            sms_auto_reply_handler(cfg, raw, &phone).await
+        }
+        ("PUT", p) if p.starts_with("/sms/contacts/") && p.ends_with("/name") => {
+            let mid = &p["/sms/contacts/".len()..p.len() - "/name".len()];
+            let phone = url_decode(mid);
+            sms_contact_name_handler(cfg, raw, &phone).await
+        }
+
+        // --- Schedule endpoints ---
+        ("GET", "/schedule") => schedule_list(cfg, raw).await,
+        ("POST", "/schedule") => schedule_create(cfg, raw).await,
+        ("DELETE", p) if p.starts_with("/schedule/") => {
+            let id = &p["/schedule/".len()..];
+            schedule_delete(cfg, raw, id).await
+        }
 
         // --- Bible endpoints ---
         ("GET", "/bible/stats") => bible_stats_handler(cfg.db.as_deref()).await,
@@ -675,6 +730,105 @@ async fn job_get(db: Option<&PgPool>, id: &str) -> (&'static str, String) {
             ("200 OK", body)
         }
         None => ("404 Not Found", r#"{"error":"job not found"}"#.to_owned()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Read page — HTML view for SMS "read more" links
+// ---------------------------------------------------------------------------
+
+const READ_PAGE_TEMPLATE: &str = r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Message</title>
+<style>
+  :root { --bg: #0a0a0a; --text: #e0e0e0; --muted: #888; --border: #222; }
+  .light { --bg: #fafafa; --text: #1a1a1a; --muted: #666; --border: #ddd; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 15px; line-height: 1.7;
+    padding: 20px; min-height: 100vh;
+    transition: background 0.2s, color 0.2s;
+  }
+  .toggle {
+    position: fixed; top: 12px; right: 12px;
+    background: var(--border); border: none; color: var(--muted);
+    padding: 6px 12px; border-radius: 6px; font-size: 12px;
+    cursor: pointer; z-index: 10;
+  }
+  .toggle:hover { color: var(--text); }
+  .content {
+    max-width: 640px; margin: 40px auto 60px;
+    white-space: pre-wrap; word-break: break-word;
+    font-size: 15px; line-height: 1.7;
+  }
+  .meta {
+    color: var(--muted); font-size: 11px;
+    margin-top: 40px; padding-top: 12px;
+    border-top: 1px solid var(--border);
+  }
+</style>
+</head>
+<body>
+  <button class="toggle" onclick="toggleTheme()">light</button>
+  <div class="content">{{MESSAGE_BODY}}</div>
+  <div class="meta">Sent via GHOST</div>
+  <script>
+    const saved = localStorage.getItem('ghost-read-theme');
+    if (saved === 'light') { document.body.classList.add('light'); document.querySelector('.toggle').textContent = 'dark'; }
+    function toggleTheme() {
+      const isLight = document.body.classList.toggle('light');
+      document.querySelector('.toggle').textContent = isLight ? 'dark' : 'light';
+      localStorage.setItem('ghost-read-theme', isLight ? 'light' : 'dark');
+    }
+  </script>
+</body>
+</html>"#;
+
+/// Escape HTML special characters to prevent XSS.
+fn html_escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// Build a minimal HTML error page (dark theme, centered message).
+fn html_error_page(message: &str) -> String {
+    let escaped = html_escape(message);
+    format!(
+        "<!DOCTYPE html><html><head><meta charset=\"utf-8\">\
+         <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
+         <title>Error</title>\
+         <style>body{{background:#0a0a0a;color:#e0e0e0;\
+         font-family:-apple-system,sans-serif;\
+         display:flex;align-items:center;justify-content:center;\
+         min-height:100vh;margin:0}}p{{font-size:16px;color:#888}}</style>\
+         </head><body><p>{escaped}</p></body></html>"
+    )
+}
+
+/// `GET /read/:id` — serves a mobile-friendly HTML page with the full
+/// job response. Public (no auth) because SMS recipients need to open it
+/// without logging in; the UUID is unguessable.
+async fn read_page(db: Option<&PgPool>, id: &str) -> (&'static str, String) {
+    let Some(pool) = db else {
+        return (
+            "503 Service Unavailable",
+            html_error_page("Service temporarily unavailable."),
+        );
+    };
+    match db::get_job(pool, id).await {
+        Some(job) => {
+            let content = job.output.as_deref().unwrap_or("(no content)");
+            let html = READ_PAGE_TEMPLATE.replace("{{MESSAGE_BODY}}", &html_escape(content));
+            ("200 OK", html)
+        }
+        None => ("404 Not Found", html_error_page("Message not found.")),
     }
 }
 
@@ -920,7 +1074,7 @@ async fn chat_handler(cfg: &DaemonConfig, raw: &str) -> (&'static str, String) {
         );
     }
 
-    // Parse optional conversation history — at most 6 entries (3 exchanges), each
+    // Parse optional conversation history — at most 10 entries (5 exchanges), each
     // validated to have a known role and non-empty content under 8 KiB.
     let history: Vec<serde_json::Value> = body["history"]
         .as_array()
@@ -933,7 +1087,7 @@ async fn chat_handler(cfg: &DaemonConfig, raw: &str) -> (&'static str, String) {
                         && !content.is_empty()
                         && content.len() <= 8192
                 })
-                .take(6)
+                .take(10)
                 .cloned()
                 .collect()
         })
@@ -1097,16 +1251,20 @@ async fn sms_inbound(cfg: &DaemonConfig, raw: &str) -> (&'static str, String) {
     let use_director = agent_name == "director";
 
     tokio::spawn(async move {
-        // Send immediate ack to non-owner contacts so they know the message was received.
-        if !crate::contacts::is_owner(&phone_from) {
-            crate::sms::send_ack(&phone_from).await;
-        }
-
         // Store inbound message in conversation history.
         db::insert_sms_history(&pool_arc, &phone_from, "user", &process_msg).await;
 
-        // Load recent conversation history for this contact (last 3 exchanges = 6 messages).
-        let history = db::load_sms_history(&pool_arc, &phone_from, 6).await;
+        // Check auto-reply setting. If disabled, store the message but don't respond.
+        if !db::is_auto_reply_enabled(&pool_arc, &phone_from).await {
+            eprintln!("[ghost sms] auto-reply disabled for {phone_from}, storing message only");
+            db::update_job_done(&pool_arc, &job_id_bg, "(auto-reply disabled)").await;
+            return;
+        }
+
+        // Load recent conversation history (last 10 messages + any loadbearing).
+        let mut history = db::load_sms_history(&pool_arc, &phone_from, 10).await;
+        let loadbearing = db::load_loadbearing_history(&pool_arc, &phone_from).await;
+        merge_loadbearing(&mut history, loadbearing);
 
         let result = if use_director {
             crate::director::handle(&process_msg, &job_id_bg, Some(&pool_arc)).await
@@ -1169,11 +1327,12 @@ async fn sms_inbound(cfg: &DaemonConfig, raw: &str) -> (&'static str, String) {
     ("200 OK", resp)
 }
 
-/// `POST /sms/send` — internal helper to deliver an outbound SMS.
+/// `POST /sms/send` — deliver an outbound SMS and store in history.
 ///
 /// Body: `{"to": "+1234567890", "body": "Hello"}`
-async fn sms_send_handler(raw: &str, _cfg: &DaemonConfig) -> (&'static str, String) {
-    if configured_key().is_some() && !auth_matches(raw) {
+/// Requires bearer auth. Stores the outbound message in `sms_history`.
+async fn sms_send_handler(raw: &str, cfg: &DaemonConfig) -> (&'static str, String) {
+    if !auth_matches(raw) {
         return ("401 Unauthorized", r#"{"error":"unauthorized"}"#.to_owned());
     }
 
@@ -1204,11 +1363,256 @@ async fn sms_send_handler(raw: &str, _cfg: &DaemonConfig) -> (&'static str, Stri
     };
 
     match crate::sms::send_response(to, msg_body, "manual").await {
-        Ok(()) => ("200 OK", r#"{"status":"sent"}"#.to_owned()),
+        Ok(()) => {
+            // Store outbound message in sms_history.
+            let message_id = if let Some(pool) = cfg.db.as_deref() {
+                db::insert_sms_history_returning_id(pool, to, "assistant", msg_body).await
+            } else {
+                None
+            };
+            let resp = json!({"status": "sent", "message_id": message_id}).to_string();
+            ("200 OK", resp)
+        }
         Err(e) => {
             let resp = serde_json::json!({"error": e}).to_string();
             ("502 Bad Gateway", resp)
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SMS contacts + history handlers (Phase 5)
+// ---------------------------------------------------------------------------
+
+/// `GET /sms/contacts` -- list contacts with auto-reply status + message counts.
+async fn sms_contacts_list(cfg: &DaemonConfig, raw: &str) -> (&'static str, String) {
+    if !auth_matches(raw) {
+        return ("401 Unauthorized", r#"{"error":"unauthorized"}"#.to_owned());
+    }
+    let Some(pool) = cfg.db.as_deref() else {
+        return (
+            "503 Service Unavailable",
+            r#"{"error":"database not configured"}"#.to_owned(),
+        );
+    };
+    let contacts = db::list_sms_contacts(pool).await;
+    ("200 OK", json!({ "contacts": contacts }).to_string())
+}
+
+/// `GET /sms/history/{phone}?limit=30&before={id}` -- paginated message history.
+async fn sms_history_handler(
+    cfg: &DaemonConfig,
+    raw: &str,
+    phone: &str,
+    query_string: &str,
+) -> (&'static str, String) {
+    if !auth_matches(raw) {
+        return ("401 Unauthorized", r#"{"error":"unauthorized"}"#.to_owned());
+    }
+    let Some(pool) = cfg.db.as_deref() else {
+        return (
+            "503 Service Unavailable",
+            r#"{"error":"database not configured"}"#.to_owned(),
+        );
+    };
+
+    // Parse query params.
+    let params = parse_urlencoded(query_string);
+    let limit: i64 = params
+        .get("limit")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30)
+        .min(100);
+    let before_id = params.get("before").map(String::as_str);
+
+    let messages = db::load_sms_history_page(pool, phone, limit, before_id).await;
+    let has_more = usize::try_from(limit)
+        .map(|l| messages.len() == l)
+        .unwrap_or(false);
+
+    (
+        "200 OK",
+        json!({ "messages": messages, "has_more": has_more }).to_string(),
+    )
+}
+
+/// `POST /sms/contacts/{phone}/auto-reply` -- toggle auto-reply.
+async fn sms_auto_reply_handler(
+    cfg: &DaemonConfig,
+    raw: &str,
+    phone: &str,
+) -> (&'static str, String) {
+    if !auth_matches(raw) {
+        return ("401 Unauthorized", r#"{"error":"unauthorized"}"#.to_owned());
+    }
+    let Some(pool) = cfg.db.as_deref() else {
+        return (
+            "503 Service Unavailable",
+            r#"{"error":"database not configured"}"#.to_owned(),
+        );
+    };
+
+    let body_str = raw
+        .split_once("\r\n\r\n")
+        .or_else(|| raw.split_once("\n\n"))
+        .map_or("", |(_, b)| b);
+
+    let Ok(body) = serde_json::from_str::<serde_json::Value>(body_str) else {
+        return (
+            "400 Bad Request",
+            r#"{"error":"body must be JSON"}"#.to_owned(),
+        );
+    };
+
+    let Some(enabled) = body["enabled"].as_bool() else {
+        return (
+            "400 Bad Request",
+            r#"{"error":"missing field: enabled (bool)"}"#.to_owned(),
+        );
+    };
+
+    db::set_auto_reply(pool, phone, enabled).await;
+    (
+        "200 OK",
+        json!({"status": "ok", "auto_reply": enabled}).to_string(),
+    )
+}
+
+/// `PUT /sms/contacts/{phone}/name` -- update display name.
+async fn sms_contact_name_handler(
+    cfg: &DaemonConfig,
+    raw: &str,
+    phone: &str,
+) -> (&'static str, String) {
+    if !auth_matches(raw) {
+        return ("401 Unauthorized", r#"{"error":"unauthorized"}"#.to_owned());
+    }
+    let Some(pool) = cfg.db.as_deref() else {
+        return (
+            "503 Service Unavailable",
+            r#"{"error":"database not configured"}"#.to_owned(),
+        );
+    };
+
+    let body_str = raw
+        .split_once("\r\n\r\n")
+        .or_else(|| raw.split_once("\n\n"))
+        .map_or("", |(_, b)| b);
+
+    let Ok(body) = serde_json::from_str::<serde_json::Value>(body_str) else {
+        return (
+            "400 Bad Request",
+            r#"{"error":"body must be JSON"}"#.to_owned(),
+        );
+    };
+
+    let Some(name) = body["name"].as_str() else {
+        return (
+            "400 Bad Request",
+            r#"{"error":"missing field: name"}"#.to_owned(),
+        );
+    };
+
+    db::set_contact_name(pool, phone, name).await;
+    ("200 OK", json!({"status": "ok"}).to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Schedule handlers (Phase 5)
+// ---------------------------------------------------------------------------
+
+/// `GET /schedule` -- list all schedule entries.
+async fn schedule_list(cfg: &DaemonConfig, raw: &str) -> (&'static str, String) {
+    if !auth_matches(raw) {
+        return ("401 Unauthorized", r#"{"error":"unauthorized"}"#.to_owned());
+    }
+    let Some(pool) = cfg.db.as_deref() else {
+        return (
+            "503 Service Unavailable",
+            r#"{"error":"database not configured"}"#.to_owned(),
+        );
+    };
+    let entries = db::list_schedule_entries(pool).await;
+    ("200 OK", json!({ "entries": entries }).to_string())
+}
+
+/// `POST /schedule` -- add a new schedule entry.
+async fn schedule_create(cfg: &DaemonConfig, raw: &str) -> (&'static str, String) {
+    if !auth_matches(raw) {
+        return ("401 Unauthorized", r#"{"error":"unauthorized"}"#.to_owned());
+    }
+    let Some(pool) = cfg.db.as_deref() else {
+        return (
+            "503 Service Unavailable",
+            r#"{"error":"database not configured"}"#.to_owned(),
+        );
+    };
+
+    let body_str = raw
+        .split_once("\r\n\r\n")
+        .or_else(|| raw.split_once("\n\n"))
+        .map_or("", |(_, b)| b);
+
+    let Ok(body) = serde_json::from_str::<serde_json::Value>(body_str) else {
+        return (
+            "400 Bad Request",
+            r#"{"error":"body must be JSON"}"#.to_owned(),
+        );
+    };
+
+    let Some(kind) = body["kind"].as_str() else {
+        return (
+            "400 Bad Request",
+            r#"{"error":"missing field: kind"}"#.to_owned(),
+        );
+    };
+
+    if kind != "daily" && kind != "persistent" {
+        return (
+            "400 Bad Request",
+            r#"{"error":"kind must be 'daily' or 'persistent'"}"#.to_owned(),
+        );
+    }
+
+    let day_date = body["day_date"].as_str();
+    if kind == "daily" && day_date.is_none() {
+        return (
+            "400 Bad Request",
+            r#"{"error":"day_date is required for daily entries"}"#.to_owned(),
+        );
+    }
+
+    let Some(content) = body["content"].as_str() else {
+        return (
+            "400 Bad Request",
+            r#"{"error":"missing field: content"}"#.to_owned(),
+        );
+    };
+
+    match db::insert_schedule(pool, kind, day_date, content).await {
+        Some(id) => ("200 OK", json!({"id": id}).to_string()),
+        None => (
+            "500 Internal Server Error",
+            r#"{"error":"failed to create schedule entry"}"#.to_owned(),
+        ),
+    }
+}
+
+/// `DELETE /schedule/{id}` -- delete a schedule entry.
+async fn schedule_delete(cfg: &DaemonConfig, raw: &str, id: &str) -> (&'static str, String) {
+    if !auth_matches(raw) {
+        return ("401 Unauthorized", r#"{"error":"unauthorized"}"#.to_owned());
+    }
+    let Some(pool) = cfg.db.as_deref() else {
+        return (
+            "503 Service Unavailable",
+            r#"{"error":"database not configured"}"#.to_owned(),
+        );
+    };
+    if db::delete_schedule(pool, id).await {
+        ("200 OK", r#"{"status":"deleted"}"#.to_owned())
+    } else {
+        ("404 Not Found", r#"{"error":"not found"}"#.to_owned())
     }
 }
 
@@ -1448,6 +1852,37 @@ async fn bible_crossrefs_handler(db: Option<&PgPool>, path: &str) -> (&'static s
         "200 OK",
         json!({ "from": from_refs, "to": to_refs }).to_string(),
     )
+}
+
+// ---------------------------------------------------------------------------
+// History helpers
+// ---------------------------------------------------------------------------
+
+/// Merge loadbearing messages into the recent history, deduplicating by content.
+/// Loadbearing messages that already appear in `recent` are skipped. The rest
+/// are prepended (oldest first) so the model sees them as earlier context.
+fn merge_loadbearing(recent: &mut Vec<serde_json::Value>, loadbearing: Vec<(i64, String, String)>) {
+    if loadbearing.is_empty() {
+        return;
+    }
+
+    // Collect content strings already present in recent history for dedup.
+    let existing: std::collections::HashSet<String> = recent
+        .iter()
+        .filter_map(|m| m["content"].as_str().map(String::from))
+        .collect();
+
+    let mut extra: Vec<serde_json::Value> = loadbearing
+        .into_iter()
+        .filter(|(_, _, content)| !existing.contains(content.as_str()))
+        .map(|(_, role, content)| serde_json::json!({"role": role, "content": content}))
+        .collect();
+
+    if !extra.is_empty() {
+        // Prepend loadbearing messages before the recent window.
+        extra.append(recent);
+        *recent = extra;
+    }
 }
 
 // ---------------------------------------------------------------------------

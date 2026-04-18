@@ -96,6 +96,18 @@ pub async fn dispatch(
         system.push_str(&sender_block);
     }
 
+    // Schedule context: inject Isaac's current schedule so GHOST can tell people
+    // where he is and when he'll be available.
+    let schedule_context = if let Some(p) = pool {
+        crate::db::load_schedule_context(p).await
+    } else {
+        String::new()
+    };
+    if !schedule_context.is_empty() {
+        system.push_str("\n\n");
+        system.push_str(&schedule_context);
+    }
+
     if bible_forced && !bible_context.is_empty() {
         system.push_str("\n\n## Bible study mode\n\
             You are GHOST's Bible study assistant. You have access to the original Hebrew, \
@@ -179,12 +191,19 @@ pub async fn dispatch(
 
     // Fire-and-forget: extract facts from this turn and store them.
     // Uses the original message (not cleaned) for accurate memory extraction.
+    // When sender_phone is present (SMS path), also flags the user message as
+    // loadbearing if notes are extracted.
     if let Some(p) = pool {
         let pool_owned = p.clone();
         let msg = message.to_string();
         let resp = response.clone();
+        let phone_owned = sender_phone.map(String::from);
         tokio::spawn(async move {
-            crate::memory::extract_and_store(pool_owned, msg, resp).await;
+            if let Some(ph) = phone_owned {
+                crate::memory::extract_and_store_sms(pool_owned, msg, resp, ph).await;
+            } else {
+                crate::memory::extract_and_store(pool_owned, msg, resp).await;
+            }
         });
 
         // Store problem+solution in scholar DB for future cache hits.

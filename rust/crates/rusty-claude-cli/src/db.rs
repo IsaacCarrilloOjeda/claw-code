@@ -1294,10 +1294,10 @@ pub async fn insert_sms_history(pool: &PgPool, phone: &str, role: &str, content:
         eprintln!("[ghost db] failed to insert sms_history: {e}");
     }
 
-    // Prune old messages — keep only the last 20 per phone number.
+    // Prune old messages — keep last 50 per phone number (loadbearing are exempt).
     let prune = sqlx::query(
-        "DELETE FROM sms_history WHERE phone = $1 AND id NOT IN (
-            SELECT id FROM sms_history WHERE phone = $1 ORDER BY created_at DESC LIMIT 20
+        "DELETE FROM sms_history WHERE phone = $1 AND loadbearing = FALSE AND id NOT IN (
+            SELECT id FROM sms_history WHERE phone = $1 ORDER BY created_at DESC LIMIT 50
         )",
     )
     .bind(&normalized)
@@ -1309,7 +1309,8 @@ pub async fn insert_sms_history(pool: &PgPool, phone: &str, role: &str, content:
     }
 }
 
-/// Load recent SMS history for a phone number.
+/// Load recent SMS history for a phone number (excludes loadbearing — those
+/// are loaded separately via `load_loadbearing_history` and merged).
 /// Returns messages in chronological order (oldest first) as `{role, content}`
 /// JSON values suitable for passing to `dispatch()` as the history parameter.
 pub async fn load_sms_history(pool: &PgPool, phone: &str, limit: i64) -> Vec<serde_json::Value> {
@@ -1331,6 +1332,400 @@ pub async fn load_sms_history(pool: &PgPool, phone: &str, limit: i64) -> Vec<ser
         .rev()
         .map(|(role, content)| serde_json::json!({"role": role, "content": content}))
         .collect()
+}
+
+/// Load all loadbearing messages for a phone number.
+/// Returns `(created_at_epoch_ms, role, content)` in chronological order.
+pub async fn load_loadbearing_history(pool: &PgPool, phone: &str) -> Vec<(i64, String, String)> {
+    let normalized = crate::daemon::normalize_phone(phone);
+
+    sqlx::query_as::<_, (i64, String, String)>(
+        "SELECT EXTRACT(EPOCH FROM created_at)::bigint * 1000, role, content
+         FROM sms_history
+         WHERE phone = $1 AND loadbearing = TRUE
+         ORDER BY created_at ASC",
+    )
+    .bind(&normalized)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default()
+}
+
+/// Flag a specific SMS history row as loadbearing by its content + phone + role.
+/// Called from the post-response extraction task.
+pub async fn flag_sms_loadbearing(pool: &PgPool, phone: &str, role: &str, content: &str) {
+    let normalized = crate::daemon::normalize_phone(phone);
+    let result = sqlx::query(
+        "UPDATE sms_history SET loadbearing = TRUE
+         WHERE id = (
+           SELECT id FROM sms_history
+           WHERE phone = $1 AND role = $2 AND content = $3 AND loadbearing = FALSE
+           ORDER BY created_at DESC LIMIT 1
+         )",
+    )
+    .bind(&normalized)
+    .bind(role)
+    .bind(content)
+    .execute(pool)
+    .await;
+
+    match result {
+        Ok(r) if r.rows_affected() > 0 => {
+            eprintln!(
+                "[ghost db] flagged loadbearing: [{role}] {}",
+                &content[..content.len().min(60)]
+            );
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("[ghost db] failed to flag loadbearing: {e}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SMS contacts + schedule (Phase 5)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, serde::Serialize)]
+pub struct SmsContact {
+    pub phone: String,
+    pub display_name: Option<String>,
+    pub auto_reply: bool,
+    pub last_message_at: Option<String>,
+    pub message_count: i64,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct SmsMessage {
+    pub id: String,
+    pub phone: String,
+    pub role: String,
+    pub content: String,
+    pub loadbearing: bool,
+    pub created_at: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct ScheduleEntry {
+    pub id: String,
+    pub kind: String,
+    pub day_date: Option<String>,
+    pub content: String,
+    pub created_at: String,
+}
+
+/// List all distinct phone numbers from `sms_history`, joined with `sms_contacts`
+/// for `display_name` and `auto_reply` status. Returns contacts sorted by most
+/// recent message.
+pub async fn list_sms_contacts(pool: &PgPool) -> Vec<SmsContact> {
+    let rows = sqlx::query(
+        "SELECT
+            h.phone,
+            c.display_name,
+            COALESCE(c.auto_reply, FALSE) as auto_reply,
+            MAX(h.created_at)::text as last_message_at,
+            COUNT(*) as message_count
+         FROM sms_history h
+         LEFT JOIN sms_contacts c ON c.phone = h.phone
+         GROUP BY h.phone, c.display_name, c.auto_reply
+         ORDER BY MAX(h.created_at) DESC",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    rows.iter()
+        .map(|row| SmsContact {
+            phone: row.try_get("phone").unwrap_or_default(),
+            display_name: row.try_get("display_name").unwrap_or(None),
+            auto_reply: row.try_get("auto_reply").unwrap_or(false),
+            last_message_at: row.try_get("last_message_at").unwrap_or(None),
+            message_count: row.try_get("message_count").unwrap_or(0),
+        })
+        .collect()
+}
+
+/// Get or create a contact record. If the phone doesn't exist in `sms_contacts`,
+/// inserts a default row (`auto_reply`=false, `display_name`=NULL).
+pub async fn get_sms_contact(pool: &PgPool, phone: &str) -> Option<SmsContact> {
+    let normalized = crate::daemon::normalize_phone(phone);
+
+    // Upsert: insert if not exists, do nothing on conflict.
+    let _ = sqlx::query(
+        "INSERT INTO sms_contacts (phone) VALUES ($1)
+         ON CONFLICT (phone) DO NOTHING",
+    )
+    .bind(&normalized)
+    .execute(pool)
+    .await;
+
+    let row = sqlx::query(
+        "SELECT
+            c.phone,
+            c.display_name,
+            c.auto_reply,
+            (SELECT MAX(created_at)::text FROM sms_history WHERE phone = c.phone) as last_message_at,
+            (SELECT COUNT(*) FROM sms_history WHERE phone = c.phone) as message_count
+         FROM sms_contacts c
+         WHERE c.phone = $1",
+    )
+    .bind(&normalized)
+    .fetch_optional(pool)
+    .await
+    .ok()??;
+
+    Some(SmsContact {
+        phone: row.try_get("phone").unwrap_or_default(),
+        display_name: row.try_get("display_name").unwrap_or(None),
+        auto_reply: row.try_get("auto_reply").unwrap_or(false),
+        last_message_at: row.try_get("last_message_at").unwrap_or(None),
+        message_count: row.try_get("message_count").unwrap_or(0),
+    })
+}
+
+/// Update `auto_reply` flag for a contact. Upserts if the contact doesn't exist.
+pub async fn set_auto_reply(pool: &PgPool, phone: &str, enabled: bool) {
+    let normalized = crate::daemon::normalize_phone(phone);
+    let _ = sqlx::query(
+        "INSERT INTO sms_contacts (phone, auto_reply, updated_at) VALUES ($1, $2, now())
+         ON CONFLICT (phone) DO UPDATE SET auto_reply = $2, updated_at = now()",
+    )
+    .bind(&normalized)
+    .bind(enabled)
+    .execute(pool)
+    .await;
+}
+
+/// Update `display_name` for a contact. Upserts if the contact doesn't exist.
+pub async fn set_contact_name(pool: &PgPool, phone: &str, name: &str) {
+    let normalized = crate::daemon::normalize_phone(phone);
+    let _ = sqlx::query(
+        "INSERT INTO sms_contacts (phone, display_name, updated_at) VALUES ($1, $2, now())
+         ON CONFLICT (phone) DO UPDATE SET display_name = $2, updated_at = now()",
+    )
+    .bind(&normalized)
+    .bind(name)
+    .execute(pool)
+    .await;
+}
+
+/// Check if `auto_reply` is enabled for a phone number.
+/// Returns false if the phone is not in `sms_contacts` (default off).
+pub async fn is_auto_reply_enabled(pool: &PgPool, phone: &str) -> bool {
+    let normalized = crate::daemon::normalize_phone(phone);
+    sqlx::query("SELECT auto_reply FROM sms_contacts WHERE phone = $1")
+        .bind(&normalized)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|row| row.try_get::<bool, _>("auto_reply").unwrap_or(false))
+}
+
+/// Load SMS history for a phone number with cursor-based pagination.
+/// Returns messages in chronological order (oldest first within the page).
+/// `before_id` is the UUID of the oldest message from the previous page --
+/// load messages older than this one. NULL = load most recent.
+pub async fn load_sms_history_page(
+    pool: &PgPool,
+    phone: &str,
+    limit: i64,
+    before_id: Option<&str>,
+) -> Vec<SmsMessage> {
+    let normalized = crate::daemon::normalize_phone(phone);
+
+    let rows = if let Some(cursor_id) = before_id {
+        // Validate UUID
+        if uuid::Uuid::parse_str(cursor_id).is_err() {
+            return Vec::new();
+        }
+        sqlx::query(
+            "SELECT id::text, phone, role, content, loadbearing, created_at::text
+             FROM sms_history
+             WHERE phone = $1 AND created_at < (SELECT created_at FROM sms_history WHERE id = $3::uuid)
+             ORDER BY created_at DESC
+             LIMIT $2",
+        )
+        .bind(&normalized)
+        .bind(limit)
+        .bind(cursor_id)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default()
+    } else {
+        sqlx::query(
+            "SELECT id::text, phone, role, content, loadbearing, created_at::text
+             FROM sms_history
+             WHERE phone = $1
+             ORDER BY created_at DESC
+             LIMIT $2",
+        )
+        .bind(&normalized)
+        .bind(limit)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default()
+    };
+
+    // Reverse so oldest is first (chronological order).
+    rows.iter()
+        .rev()
+        .map(|row| SmsMessage {
+            id: row.try_get("id").unwrap_or_default(),
+            phone: row.try_get("phone").unwrap_or_default(),
+            role: row.try_get("role").unwrap_or_default(),
+            content: row.try_get("content").unwrap_or_default(),
+            loadbearing: row.try_get("loadbearing").unwrap_or(false),
+            created_at: row.try_get("created_at").unwrap_or_default(),
+        })
+        .collect()
+}
+
+/// Load today's schedule context: all 'persistent' entries + 'daily' entries
+/// for today's date. Returns a formatted string for system prompt injection.
+/// Returns empty string if there are no entries.
+pub async fn load_schedule_context(pool: &PgPool) -> String {
+    use std::fmt::Write as _;
+
+    let persistent_rows = sqlx::query(
+        "SELECT content FROM sms_schedule WHERE kind = 'persistent' ORDER BY created_at",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    let daily_rows = sqlx::query(
+        "SELECT content FROM sms_schedule WHERE kind = 'daily' AND day_date = CURRENT_DATE ORDER BY created_at",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    if persistent_rows.is_empty() && daily_rows.is_empty() {
+        return String::new();
+    }
+
+    let mut out = "## Isaac's current schedule".to_string();
+
+    if !persistent_rows.is_empty() {
+        out.push_str("\n### Always (recurring)");
+        for row in &persistent_rows {
+            let content: String = row.try_get("content").unwrap_or_default();
+            let _ = write!(out, "\n- {content}");
+        }
+    }
+
+    if !daily_rows.is_empty() {
+        // Get today's day name for the header.
+        let today = chrono::Local::now().format("%A, %B %-d").to_string();
+        let _ = write!(out, "\n### Today ({today})");
+        for row in &daily_rows {
+            let content: String = row.try_get("content").unwrap_or_default();
+            let _ = write!(out, "\n- {content}");
+        }
+    }
+
+    out
+}
+
+/// List all schedule entries (for dashboard display).
+/// Returns persistent entries first, then daily entries sorted by date desc.
+pub async fn list_schedule_entries(pool: &PgPool) -> Vec<ScheduleEntry> {
+    let rows = sqlx::query(
+        "SELECT id::text, kind, day_date::text, content, created_at::text
+         FROM sms_schedule
+         ORDER BY
+           CASE WHEN kind = 'persistent' THEN 0 ELSE 1 END,
+           day_date DESC NULLS FIRST,
+           created_at DESC",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    rows.iter()
+        .map(|row| ScheduleEntry {
+            id: row.try_get("id").unwrap_or_default(),
+            kind: row.try_get("kind").unwrap_or_default(),
+            day_date: row.try_get("day_date").unwrap_or(None),
+            content: row.try_get("content").unwrap_or_default(),
+            created_at: row.try_get("created_at").unwrap_or_default(),
+        })
+        .collect()
+}
+
+/// Add a schedule entry. Returns the new UUID on success.
+pub async fn insert_schedule(
+    pool: &PgPool,
+    kind: &str,
+    day_date: Option<&str>,
+    content: &str,
+) -> Option<String> {
+    let id = uuid::Uuid::new_v4().to_string();
+    let result = if let Some(date) = day_date {
+        sqlx::query(
+            "INSERT INTO sms_schedule (id, kind, day_date, content)
+             VALUES ($1::uuid, $2, $3::date, $4)",
+        )
+        .bind(&id)
+        .bind(kind)
+        .bind(date)
+        .bind(content)
+        .execute(pool)
+        .await
+    } else {
+        sqlx::query(
+            "INSERT INTO sms_schedule (id, kind, content)
+             VALUES ($1::uuid, $2, $3)",
+        )
+        .bind(&id)
+        .bind(kind)
+        .bind(content)
+        .execute(pool)
+        .await
+    };
+
+    match result {
+        Ok(_) => Some(id),
+        Err(e) => {
+            eprintln!("[ghost db] insert_schedule failed: {e}");
+            None
+        }
+    }
+}
+
+/// Delete a schedule entry by ID. Returns true if a row was deleted.
+pub async fn delete_schedule(pool: &PgPool, id: &str) -> bool {
+    if uuid::Uuid::parse_str(id).is_err() {
+        return false;
+    }
+    sqlx::query("DELETE FROM sms_schedule WHERE id = $1::uuid")
+        .bind(id)
+        .execute(pool)
+        .await
+        .map(|r| r.rows_affected() > 0)
+        .unwrap_or(false)
+}
+
+/// Store an outbound SMS in `sms_history` and return the new row's UUID.
+pub async fn insert_sms_history_returning_id(
+    pool: &PgPool,
+    phone: &str,
+    role: &str,
+    content: &str,
+) -> Option<String> {
+    let normalized = crate::daemon::normalize_phone(phone);
+    let row = sqlx::query(
+        "INSERT INTO sms_history (phone, role, content) VALUES ($1, $2, $3)
+         RETURNING id::text",
+    )
+    .bind(&normalized)
+    .bind(role)
+    .bind(content)
+    .fetch_optional(pool)
+    .await
+    .ok()?;
+
+    row.and_then(|r| r.try_get("id").ok())
 }
 
 // ---------------------------------------------------------------------------
