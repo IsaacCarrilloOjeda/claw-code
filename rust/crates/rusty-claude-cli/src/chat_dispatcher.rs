@@ -33,6 +33,7 @@ pub async fn dispatch(
     history: &[serde_json::Value],
     _job_id: &str,
     pool: Option<&sqlx::PgPool>,
+    sender_phone: Option<&str>,
 ) -> Result<String, String> {
     let api_key =
         std::env::var("ANTHROPIC_API_KEY").map_err(|_| "ANTHROPIC_API_KEY not set".to_string())?;
@@ -87,6 +88,13 @@ pub async fn dispatch(
     };
 
     let mut system = core_context;
+
+    // Inject sender identity so GHOST knows who it's talking to.
+    if let Some(phone) = sender_phone {
+        let sender_block = crate::contacts::sender_context(phone);
+        system.push_str("\n\n");
+        system.push_str(&sender_block);
+    }
 
     if bible_forced && !bible_context.is_empty() {
         system.push_str("\n\n## Bible study mode\n\

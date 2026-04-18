@@ -963,7 +963,8 @@ async fn chat_handler(cfg: &DaemonConfig, raw: &str) -> (&'static str, String) {
     let result = if agent_name == "director" {
         crate::director::handle(&process_msg, &job_id, Some(pool_ref)).await
     } else {
-        crate::chat_dispatcher::dispatch(&process_msg, &history, &job_id, Some(pool_ref)).await
+        crate::chat_dispatcher::dispatch(&process_msg, &history, &job_id, Some(pool_ref), None)
+            .await
     };
 
     match result {
@@ -1096,23 +1097,67 @@ async fn sms_inbound(cfg: &DaemonConfig, raw: &str) -> (&'static str, String) {
     let use_director = agent_name == "director";
 
     tokio::spawn(async move {
+        // Send immediate ack to non-owner contacts so they know the message was received.
+        if !crate::contacts::is_owner(&phone_from) {
+            crate::sms::send_ack(&phone_from).await;
+        }
+
+        // Store inbound message in conversation history.
+        db::insert_sms_history(&pool_arc, &phone_from, "user", &process_msg).await;
+
+        // Load recent conversation history for this contact (last 3 exchanges = 6 messages).
+        let history = db::load_sms_history(&pool_arc, &phone_from, 6).await;
+
         let result = if use_director {
             crate::director::handle(&process_msg, &job_id_bg, Some(&pool_arc)).await
         } else {
-            // SMS is single-turn — no conversation history.
-            crate::chat_dispatcher::dispatch(&process_msg, &[], &job_id_bg, Some(&pool_arc)).await
+            crate::chat_dispatcher::dispatch(
+                &process_msg,
+                &history,
+                &job_id_bg,
+                Some(&pool_arc),
+                Some(&phone_from),
+            )
+            .await
         };
 
         match result {
-            Ok(text) => match crate::sms::send_response(&phone_from, &text, &job_id_bg).await {
-                Ok(()) => {
-                    db::update_job_done(&pool_arc, &job_id_bg, &text).await;
+            Ok(text) => {
+                // Guard check — review outbound reply before sending.
+                let verdict = crate::guard::check(&process_msg, &text, &phone_from).await;
+                let (send_text, was_blocked) = match verdict {
+                    crate::guard::GuardVerdict::Allow => (text.clone(), false),
+                    crate::guard::GuardVerdict::Block(reason) => {
+                        eprintln!(
+                            "[ghost guard] blocked reply for job {job_id_bg}: {reason}\n\
+                             [ghost guard] original reply was: {text}"
+                        );
+                        (crate::guard::BLOCKED_FALLBACK.to_string(), true)
+                    }
+                };
+
+                match crate::sms::send_response(&phone_from, &send_text, &job_id_bg).await {
+                    Ok(()) => {
+                        // Store outbound reply in conversation history.
+                        db::insert_sms_history(&pool_arc, &phone_from, "assistant", &send_text)
+                            .await;
+
+                        if was_blocked {
+                            let blocked_note = format!(
+                                "[BLOCKED BY GUARD]\nOriginal reply: {text}\n\
+                                 Sent instead: {send_text}"
+                            );
+                            db::update_job_done(&pool_arc, &job_id_bg, &blocked_note).await;
+                        } else {
+                            db::update_job_done(&pool_arc, &job_id_bg, &send_text).await;
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[ghost sms] send failed for job {job_id_bg}: {e}");
+                        db::update_job_failed(&pool_arc, &job_id_bg, &e).await;
+                    }
                 }
-                Err(e) => {
-                    eprintln!("[ghost sms] send failed for job {job_id_bg}: {e}");
-                    db::update_job_failed(&pool_arc, &job_id_bg, &e).await;
-                }
-            },
+            }
             Err(e) => {
                 eprintln!("[ghost] processing failed for job {job_id_bg}: {e}");
                 db::update_job_failed(&pool_arc, &job_id_bg, &e).await;
@@ -1411,7 +1456,7 @@ async fn bible_crossrefs_handler(db: Option<&PgPool>, path: &str) -> (&'static s
 
 /// Normalize a phone number for comparison: strip everything except digits and
 /// a leading `+`. E.g. `"+1-234-567-8900"` → `"+12345678900"`.
-fn normalize_phone(s: &str) -> String {
+pub(crate) fn normalize_phone(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for (i, c) in s.chars().enumerate() {
         if c.is_ascii_digit() || (i == 0 && c == '+') {

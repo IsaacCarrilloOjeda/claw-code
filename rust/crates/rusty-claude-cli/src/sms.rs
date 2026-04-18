@@ -13,6 +13,17 @@ const SMS_TIMEOUT_SECS: u64 = 10;
 const RESPONSE_CHAR_LIMIT: usize = 500;
 const TRUNCATE_AT: usize = 497;
 
+/// Send a brief acknowledgment SMS. Best-effort — failures are logged but
+/// don't affect the main pipeline.
+pub async fn send_ack(to: &str) {
+    let body = "Got it -- one sec.";
+    if let Err(e) = send_via_gateway(to, body).await {
+        if let Err(e2) = send_via_twilio(to, body).await {
+            eprintln!("[ghost sms] ack failed (gateway: {e}, twilio: {e2})");
+        }
+    }
+}
+
 /// Format + send a response SMS. Returns `Ok(())` on delivery, `Err(reason)`
 /// if both Gateway and Twilio fail.
 pub async fn send_response(to: &str, text: &str, job_id: &str) -> Result<(), String> {

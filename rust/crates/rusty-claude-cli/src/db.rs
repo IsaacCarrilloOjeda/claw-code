@@ -1277,6 +1277,63 @@ pub async fn bible_stats(pool: &PgPool) -> (i64, i64, i64, i64) {
 }
 
 // ---------------------------------------------------------------------------
+// SMS conversation history (Phase 3)
+// ---------------------------------------------------------------------------
+
+/// Store an SMS message in the conversation history.
+pub async fn insert_sms_history(pool: &PgPool, phone: &str, role: &str, content: &str) {
+    let normalized = crate::daemon::normalize_phone(phone);
+    let result = sqlx::query("INSERT INTO sms_history (phone, role, content) VALUES ($1, $2, $3)")
+        .bind(&normalized)
+        .bind(role)
+        .bind(content)
+        .execute(pool)
+        .await;
+
+    if let Err(e) = result {
+        eprintln!("[ghost db] failed to insert sms_history: {e}");
+    }
+
+    // Prune old messages — keep only the last 20 per phone number.
+    let prune = sqlx::query(
+        "DELETE FROM sms_history WHERE phone = $1 AND id NOT IN (
+            SELECT id FROM sms_history WHERE phone = $1 ORDER BY created_at DESC LIMIT 20
+        )",
+    )
+    .bind(&normalized)
+    .execute(pool)
+    .await;
+
+    if let Err(e) = prune {
+        eprintln!("[ghost db] failed to prune sms_history: {e}");
+    }
+}
+
+/// Load recent SMS history for a phone number.
+/// Returns messages in chronological order (oldest first) as `{role, content}`
+/// JSON values suitable for passing to `dispatch()` as the history parameter.
+pub async fn load_sms_history(pool: &PgPool, phone: &str, limit: i64) -> Vec<serde_json::Value> {
+    let normalized = crate::daemon::normalize_phone(phone);
+
+    let rows = sqlx::query_as::<_, (String, String)>(
+        "SELECT role, content FROM sms_history
+         WHERE phone = $1
+         ORDER BY created_at DESC
+         LIMIT $2",
+    )
+    .bind(&normalized)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    rows.into_iter()
+        .rev()
+        .map(|(role, content)| serde_json::json!({"role": role, "content": content}))
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
 // Circuit breaker helpers
 // ---------------------------------------------------------------------------
 
