@@ -1467,7 +1467,7 @@ function SmsPanel({ daemonKey }) {
     setLoading(true)
     try {
       const data = await apiFetch('/sms/contacts', {}, daemonKey)
-      setContacts(data)
+      setContacts(Array.isArray(data) ? data : data.contacts || [])
     } catch { /* ignore */ }
     setLoading(false)
   }
