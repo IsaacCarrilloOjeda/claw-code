@@ -1460,8 +1460,21 @@ function SmsPanel({ daemonKey }) {
   const [showAddForm, setShowAddForm] = useState(false)
   const [convos, setConvos] = useState({}) // { [phone]: { messages: [], hasMore: bool, loading: bool } }
   const [scheduleEntries, setScheduleEntries] = useState([])
+  const selectedPhoneRef = useRef(null)
+
+  // Keep ref in sync for polling callback
+  useEffect(() => { selectedPhoneRef.current = selectedPhone }, [selectedPhone])
 
   useEffect(() => { loadContacts() }, [])
+
+  // Auto-poll every 20s for new messages
+  useEffect(() => {
+    const interval = setInterval(() => {
+      loadContacts()
+      if (selectedPhoneRef.current) loadConversation(selectedPhoneRef.current)
+    }, 20000)
+    return () => clearInterval(interval)
+  }, [])
 
   async function loadContacts() {
     setLoading(true)
@@ -1475,7 +1488,11 @@ function SmsPanel({ daemonKey }) {
   async function loadConversation(phone, before = null) {
     const key = phone
     if (!before) {
-      setConvos(prev => ({ ...prev, [key]: { messages: [], hasMore: true, loading: true } }))
+      // Only show loading spinner if no messages cached yet (prevents flash on poll/refresh)
+      setConvos(prev => {
+        const existing = prev[key]?.messages || []
+        return { ...prev, [key]: { messages: existing, hasMore: true, loading: existing.length === 0 } }
+      })
     } else {
       setConvos(prev => ({ ...prev, [key]: { ...prev[key], loading: true } }))
     }
@@ -1565,6 +1582,17 @@ function SmsPanel({ daemonKey }) {
     loadConversation(phone)
   }
 
+  async function updateContactNotes(phone, notes) {
+    try {
+      await apiFetch(`/sms/contacts/${encodeURIComponent(phone)}/notes`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ notes }),
+      }, daemonKey)
+      setContacts(prev => prev.map(c => c.phone === phone ? { ...c, notes } : c))
+    } catch { /* ignore */ }
+  }
+
   async function loadSchedule() {
     try {
       const data = await apiFetch('/schedule', {}, daemonKey)
@@ -1575,6 +1603,9 @@ function SmsPanel({ daemonKey }) {
   function handleSelectContact(phone) {
     setSelectedPhone(phone)
     if (!convos[phone]) loadConversation(phone)
+    // Mark as read
+    apiFetch(`/sms/contacts/${encodeURIComponent(phone)}/read`, { method: 'POST' }, daemonKey).catch(() => {})
+    setContacts(prev => prev.map(c => c.phone === phone ? { ...c, unread_count: 0 } : c))
   }
 
   const filtered = contacts.filter(c => {
@@ -1613,7 +1644,7 @@ function SmsPanel({ daemonKey }) {
               onBlur={e => e.target.style.borderColor = 'var(--border)'}
             />
             <span
-              onClick={loadContacts}
+              onClick={() => { loadContacts(); if (selectedPhone) loadConversation(selectedPhone) }}
               style={{ color: 'var(--text-dim)', cursor: 'pointer', fontSize: 12, padding: '4px', lineHeight: 1 }}
               onMouseEnter={e => e.target.style.color = 'var(--accent)'}
               onMouseLeave={e => e.target.style.color = 'var(--text-dim)'}
@@ -1672,11 +1703,13 @@ function SmsPanel({ daemonKey }) {
           <SmsConversation
             contact={selectedContact}
             convo={convo}
+            daemonKey={daemonKey}
             onSend={text => sendMessage(selectedPhone, text)}
             onLoadMore={() => {
               const msgs = convo?.messages || []
               if (msgs.length > 0 && convo?.hasMore) loadConversation(selectedPhone, msgs[0].id)
             }}
+            onUpdateNotes={notes => updateContactNotes(selectedPhone, notes)}
           />
         ) : (
           <div style={{
@@ -1843,22 +1876,44 @@ function SmsContactRow({ contact, active, onSelect, onToggleAutoReply, onRename 
         )}
       </div>
 
-      {/* Time ago */}
-      {contact.last_message_at && (
-        <span style={{ fontSize: 9, color: 'var(--text-dim)', flexShrink: 0, fontFamily: 'var(--mono)' }}>
-          {timeAgo(contact.last_message_at)}
-        </span>
-      )}
+      {/* Unread badge + time ago */}
+      <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 3, flexShrink: 0 }}>
+        {contact.unread_count > 0 && (
+          <span style={{
+            minWidth: 16, height: 16, borderRadius: 8,
+            background: 'var(--accent)', color: 'var(--bg)',
+            fontSize: 9, fontWeight: 700, fontFamily: 'var(--mono)',
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            padding: '0 4px',
+          }}>{contact.unread_count}</span>
+        )}
+        {contact.last_message_at && (
+          <span style={{ fontSize: 9, color: 'var(--text-dim)', fontFamily: 'var(--mono)' }}>
+            {timeAgo(contact.last_message_at)}
+          </span>
+        )}
+      </div>
     </div>
   )
 }
 
-function SmsConversation({ contact, convo, onSend, onLoadMore }) {
+const QUICK_REPLIES = ["On my way", "In a meeting", "Call you back", "Got it", "Running late"]
+
+function SmsConversation({ contact, convo, daemonKey, onSend, onLoadMore, onUpdateNotes }) {
   const [input, setInput] = useState('')
+  const [showQuickReplies, setShowQuickReplies] = useState(false)
+  const [editingNotes, setEditingNotes] = useState(false)
+  const [notesValue, setNotesValue] = useState(contact.notes || '')
+  const [summary, setSummary] = useState(null)
+  const [summaryLoading, setSummaryLoading] = useState(false)
   const scrollRef = useRef(null)
   const textareaRef = useRef(null)
+  const notesRef = useRef(null)
   const prevHeightRef = useRef(0)
   const isInitialLoad = useRef(true)
+
+  // Reset notes when contact changes
+  useEffect(() => { setNotesValue(contact.notes || ''); setEditingNotes(false); setSummary(null) }, [contact.phone])
 
   // Auto-scroll to bottom on initial load or new message
   useEffect(() => {
@@ -1909,6 +1964,21 @@ function SmsConversation({ contact, convo, onSend, onLoadMore }) {
     el.style.height = Math.min(el.scrollHeight, 120) + 'px'
   }
 
+  async function loadSummary() {
+    setSummaryLoading(true)
+    try {
+      const data = await apiFetch(`/sms/contacts/${encodeURIComponent(contact.phone)}/summary`, {}, daemonKey)
+      setSummary(data.summary || 'No summary available.')
+    } catch { setSummary('Failed to load summary.') }
+    setSummaryLoading(false)
+  }
+
+  function commitNotes() {
+    const trimmed = notesValue.trim()
+    if (trimmed !== (contact.notes || '').trim()) onUpdateNotes(trimmed)
+    setEditingNotes(false)
+  }
+
   const messages = convo?.messages || []
   const displayName = contact.display_name || contact.phone
 
@@ -1921,20 +1991,85 @@ function SmsConversation({ contact, convo, onSend, onLoadMore }) {
       <div style={{
         flexShrink: 0, padding: '10px 16px',
         borderBottom: '1px solid var(--border)', background: 'var(--surface)',
-        display: 'flex', alignItems: 'center', gap: 10,
       }}>
-        <div style={{ flex: 1, minWidth: 0 }}>
-          <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-bright)' }}>{displayName}</div>
-          <div style={{ fontSize: 10, color: 'var(--text-dim)', fontFamily: 'var(--mono)' }}>{contact.phone}</div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-bright)' }}>{displayName}</div>
+            <div style={{ fontSize: 10, color: 'var(--text-dim)', fontFamily: 'var(--mono)' }}>{contact.phone}</div>
+          </div>
+          <span
+            onClick={loadSummary}
+            style={{
+              fontSize: 9, fontWeight: 600, letterSpacing: '0.04em',
+              padding: '3px 8px', borderRadius: 'var(--radius-sm)',
+              background: 'rgba(255,255,255,0.04)', color: 'var(--text-dim)',
+              cursor: 'pointer', transition: 'all var(--transition)',
+            }}
+            onMouseEnter={e => { e.target.style.color = 'var(--accent)'; e.target.style.background = 'rgba(45,212,191,0.12)' }}
+            onMouseLeave={e => { e.target.style.color = 'var(--text-dim)'; e.target.style.background = 'rgba(255,255,255,0.04)' }}
+          >{summaryLoading ? '...' : 'SUMMARY'}</span>
+          <div style={{
+            fontSize: 9, fontWeight: 600, letterSpacing: '0.04em',
+            padding: '3px 8px', borderRadius: 'var(--radius-sm)',
+            background: contact.auto_reply ? 'rgba(45,212,191,0.12)' : 'rgba(255,255,255,0.04)',
+            color: contact.auto_reply ? 'var(--accent)' : 'var(--text-dim)',
+          }}>
+            {contact.auto_reply ? 'AUTO-REPLY ON' : 'AUTO-REPLY OFF'}
+          </div>
         </div>
-        <div style={{
-          fontSize: 9, fontWeight: 600, letterSpacing: '0.04em',
-          padding: '3px 8px', borderRadius: 'var(--radius-sm)',
-          background: contact.auto_reply ? 'rgba(45,212,191,0.12)' : 'rgba(255,255,255,0.04)',
-          color: contact.auto_reply ? 'var(--accent)' : 'var(--text-dim)',
-        }}>
-          {contact.auto_reply ? 'AUTO-REPLY ON' : 'AUTO-REPLY OFF'}
+
+        {/* Contact notes */}
+        <div style={{ marginTop: 6 }}>
+          {editingNotes ? (
+            <div style={{ display: 'flex', gap: 6, alignItems: 'flex-start' }}>
+              <textarea
+                ref={notesRef}
+                autoFocus
+                value={notesValue}
+                onChange={e => setNotesValue(e.target.value)}
+                onBlur={commitNotes}
+                onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); commitNotes() }; if (e.key === 'Escape') { setNotesValue(contact.notes || ''); setEditingNotes(false) } }}
+                placeholder="Add notes about this contact..."
+                rows={2}
+                style={{
+                  flex: 1, fontSize: 10, fontFamily: 'var(--mono)',
+                  background: 'var(--bg)', color: 'var(--text)',
+                  border: '1px solid var(--accent)', borderRadius: 'var(--radius-sm)',
+                  padding: '4px 8px', outline: 'none', resize: 'none',
+                  lineHeight: 1.5,
+                }}
+              />
+            </div>
+          ) : (
+            <div
+              onClick={() => setEditingNotes(true)}
+              style={{
+                fontSize: 10, color: contact.notes ? 'var(--text-dim)' : 'var(--text-muted)',
+                fontFamily: 'var(--mono)', cursor: 'pointer',
+                padding: '2px 0', fontStyle: contact.notes ? 'normal' : 'italic',
+              }}
+            >{contact.notes || 'click to add notes...'}</div>
+          )}
         </div>
+
+        {/* Summary overlay */}
+        {summary && (
+          <div style={{
+            marginTop: 8, padding: '8px 10px',
+            background: 'var(--bg)', border: '1px solid var(--border)',
+            borderRadius: 'var(--radius-sm)', fontSize: 11, color: 'var(--text)',
+            lineHeight: 1.5, fontFamily: 'var(--mono)', position: 'relative',
+          }}>
+            <span
+              onClick={() => setSummary(null)}
+              style={{
+                position: 'absolute', top: 4, right: 8, cursor: 'pointer',
+                color: 'var(--text-dim)', fontSize: 12,
+              }}
+            >{'\u00D7'}</span>
+            {summary}
+          </div>
+        )}
       </div>
 
       {/* Messages */}
@@ -2022,6 +2157,36 @@ function SmsConversation({ contact, convo, onSend, onLoadMore }) {
             </div>
           )
         })}
+      </div>
+
+      {/* Quick replies */}
+      <div style={{ flexShrink: 0, background: 'var(--surface)', borderTop: '1px solid var(--border)' }}>
+        <div
+          onClick={() => setShowQuickReplies(!showQuickReplies)}
+          style={{
+            padding: '4px 16px', cursor: 'pointer', fontSize: 9, fontWeight: 600,
+            color: showQuickReplies ? 'var(--accent)' : 'var(--text-dim)',
+            letterSpacing: '0.04em', userSelect: 'none',
+          }}
+        >{showQuickReplies ? '\u25BC QUICK' : '\u25B6 QUICK'}</div>
+        {showQuickReplies && (
+          <div style={{ padding: '0 16px 8px', display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+            {QUICK_REPLIES.map(qr => (
+              <button
+                key={qr}
+                onClick={() => onSend(qr)}
+                style={{
+                  fontSize: 10, fontFamily: 'var(--mono)', padding: '4px 10px',
+                  background: 'var(--bg)', color: 'var(--text)',
+                  border: '1px solid var(--border)', borderRadius: 12,
+                  cursor: 'pointer', transition: 'all var(--transition)',
+                }}
+                onMouseEnter={e => { e.target.style.borderColor = 'var(--accent)'; e.target.style.color = 'var(--accent)' }}
+                onMouseLeave={e => { e.target.style.borderColor = 'var(--border)'; e.target.style.color = 'var(--text)' }}
+              >{qr}</button>
+            ))}
+          </div>
+        )}
       </div>
 
       {/* Input bar */}

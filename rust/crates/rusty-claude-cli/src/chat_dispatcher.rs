@@ -96,6 +96,16 @@ pub async fn dispatch(
         system.push_str(&sender_block);
     }
 
+    // Inject per-contact notes (e.g., "this is my math teacher").
+    if let (Some(phone), Some(p)) = (sender_phone, pool) {
+        if let Some(notes) = crate::db::get_contact_notes(p, phone).await {
+            if !notes.is_empty() {
+                system.push_str("\n\n## Notes about this contact\n");
+                system.push_str(&notes);
+            }
+        }
+    }
+
     // Schedule context: inject Isaac's current schedule so GHOST can tell people
     // where he is and when he'll be available.
     let schedule_context = if let Some(p) = pool {

@@ -24,6 +24,7 @@
 //!     for cloud/Railway deployment where the platform handles TLS routing).
 //!   - CORS uses an explicit allow-list (default <http://localhost:5173> for
 //!     the dashboard dev server). Override with `GHOST_DAEMON_CORS_ORIGIN`.
+use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -379,7 +380,6 @@ async fn write_response(
         body.len()
     );
     if let Some(origin) = allowed_origin {
-        use std::fmt::Write as _;
         let _ = write!(headers, "Access-Control-Allow-Origin: {origin}\r\n");
         headers.push_str("Vary: Origin\r\n");
         headers.push_str("Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS\r\n");
@@ -637,6 +637,21 @@ async fn dispatch(
             let mid = &p["/sms/contacts/".len()..p.len() - "/name".len()];
             let phone = url_decode(mid);
             sms_contact_name_handler(cfg, raw, &phone).await
+        }
+        ("POST", p) if p.starts_with("/sms/contacts/") && p.ends_with("/read") => {
+            let mid = &p["/sms/contacts/".len()..p.len() - "/read".len()];
+            let phone = url_decode(mid);
+            sms_mark_read_handler(cfg, raw, &phone).await
+        }
+        ("PUT", p) if p.starts_with("/sms/contacts/") && p.ends_with("/notes") => {
+            let mid = &p["/sms/contacts/".len()..p.len() - "/notes".len()];
+            let phone = url_decode(mid);
+            sms_contact_notes_handler(cfg, raw, &phone).await
+        }
+        ("GET", p) if p.starts_with("/sms/contacts/") && p.ends_with("/summary") => {
+            let mid = &p["/sms/contacts/".len()..p.len() - "/summary".len()];
+            let phone = url_decode(mid);
+            sms_summary_handler(cfg, raw, &phone).await
         }
 
         // --- Schedule endpoints ---
@@ -1515,6 +1530,141 @@ async fn sms_contact_name_handler(
 
     db::set_contact_name(pool, phone, name).await;
     ("200 OK", json!({"status": "ok"}).to_string())
+}
+
+/// `POST /sms/contacts/{phone}/read` -- mark conversation as read.
+async fn sms_mark_read_handler(
+    cfg: &DaemonConfig,
+    raw: &str,
+    phone: &str,
+) -> (&'static str, String) {
+    if !auth_matches(raw) {
+        return ("401 Unauthorized", r#"{"error":"unauthorized"}"#.to_owned());
+    }
+    let Some(pool) = cfg.db.as_deref() else {
+        return (
+            "503 Service Unavailable",
+            r#"{"error":"database not configured"}"#.to_owned(),
+        );
+    };
+    db::mark_contact_read(pool, phone).await;
+    ("200 OK", json!({"status": "ok"}).to_string())
+}
+
+/// `PUT /sms/contacts/{phone}/notes` -- set contact notes.
+async fn sms_contact_notes_handler(
+    cfg: &DaemonConfig,
+    raw: &str,
+    phone: &str,
+) -> (&'static str, String) {
+    if !auth_matches(raw) {
+        return ("401 Unauthorized", r#"{"error":"unauthorized"}"#.to_owned());
+    }
+    let Some(pool) = cfg.db.as_deref() else {
+        return (
+            "503 Service Unavailable",
+            r#"{"error":"database not configured"}"#.to_owned(),
+        );
+    };
+
+    let body_str = raw
+        .split_once("\r\n\r\n")
+        .or_else(|| raw.split_once("\n\n"))
+        .map_or("", |(_, b)| b);
+
+    let Ok(body) = serde_json::from_str::<serde_json::Value>(body_str) else {
+        return (
+            "400 Bad Request",
+            r#"{"error":"body must be JSON"}"#.to_owned(),
+        );
+    };
+
+    let notes = body["notes"].as_str().unwrap_or("");
+    db::set_contact_notes(pool, phone, notes).await;
+    ("200 OK", json!({"status": "ok"}).to_string())
+}
+
+/// `GET /sms/contacts/{phone}/summary` -- AI-generated conversation summary.
+async fn sms_summary_handler(
+    cfg: &DaemonConfig,
+    raw: &str,
+    phone: &str,
+) -> (&'static str, String) {
+    if !auth_matches(raw) {
+        return ("401 Unauthorized", r#"{"error":"unauthorized"}"#.to_owned());
+    }
+    let Some(pool) = cfg.db.as_deref() else {
+        return (
+            "503 Service Unavailable",
+            r#"{"error":"database not configured"}"#.to_owned(),
+        );
+    };
+
+    let history = db::load_sms_history(pool, phone, 20).await;
+    if history.is_empty() {
+        return (
+            "200 OK",
+            json!({"summary": "No messages yet."}).to_string(),
+        );
+    }
+
+    // Format history into a readable block for the summarizer.
+    let mut transcript = String::new();
+    for msg in &history {
+        if let (Some(role), Some(content)) = (msg.get("role").and_then(|v| v.as_str()), msg.get("content").and_then(|v| v.as_str())) {
+            let label = if role == "user" { "Them" } else { "GHOST" };
+            let _ = writeln!(transcript, "{label}: {content}");
+        }
+    }
+
+    let api_key = match std::env::var("ANTHROPIC_API_KEY") {
+        Ok(k) if !k.is_empty() => k,
+        _ => {
+            return (
+                "503 Service Unavailable",
+                r#"{"error":"ANTHROPIC_API_KEY not set"}"#.to_owned(),
+            );
+        }
+    };
+
+    let body = json!({
+        "model": "claude-haiku-4-5-20251001",
+        "max_tokens": 256,
+        "system": "Summarize this SMS conversation in 2-3 sentences. Focus on key topics, decisions, and any outstanding items. Be concise.",
+        "messages": [{"role": "user", "content": transcript}]
+    });
+
+    let client = reqwest::Client::new();
+    match client
+        .post("https://api.anthropic.com/v1/messages")
+        .header("x-api-key", &api_key)
+        .header("anthropic-version", "2023-06-01")
+        .header("content-type", "application/json")
+        .body(body.to_string())
+        .send()
+        .await
+    {
+        Ok(resp) => match resp.text().await {
+            Ok(text) => {
+                let parsed: serde_json::Value =
+                    serde_json::from_str(&text).unwrap_or(json!({}));
+                let summary = parsed["content"]
+                    .as_array()
+                    .and_then(|arr| arr.first())
+                    .and_then(|b| b["text"].as_str())
+                    .unwrap_or("Could not generate summary.");
+                ("200 OK", json!({"summary": summary}).to_string())
+            }
+            Err(e) => (
+                "500 Internal Server Error",
+                json!({"error": format!("failed to read response: {e}")}).to_string(),
+            ),
+        },
+        Err(e) => (
+            "500 Internal Server Error",
+            json!({"error": format!("API call failed: {e}")}).to_string(),
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------------

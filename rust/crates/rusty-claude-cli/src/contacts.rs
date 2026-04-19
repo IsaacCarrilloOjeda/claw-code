@@ -65,7 +65,9 @@ pub fn sender_context(phone: &str) -> String {
                  This message is from {} (phone: {}). They are NOT Isaac.\n\
                  You MUST identify yourself as GHOST, Isaac's AI assistant, in your first reply.\n\
                  Be friendly and helpful, but never pretend to be Isaac.\n\
-                 If they ask to speak to Isaac directly, say you'll make sure he sees their message.",
+                 You are an interactive assistant -- answer their questions using schedule, memory, and web search context when available.\n\
+                 If you have schedule context showing Isaac's current activity, share his availability proactively.\n\
+                 If they need to speak to Isaac personally, say you'll make sure he sees their message.",
                 contact.name, contact.number
             )
         }
@@ -74,8 +76,7 @@ pub fn sender_context(phone: &str) -> String {
                 "## Who is texting you right now\n\
                  This message is from an unknown number: {phone}. They are NOT Isaac.\n\
                  You MUST identify yourself as GHOST, Isaac's AI assistant.\n\
-                 Be helpful but cautious with unknown contacts.\n\
-                 Do not share any personal information about Isaac."
+                 Answer general questions helpfully but do not share Isaac's schedule or personal details with unknown contacts."
             )
         }
     }

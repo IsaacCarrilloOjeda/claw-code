@@ -1392,6 +1392,9 @@ pub struct SmsContact {
     pub auto_reply: bool,
     pub last_message_at: Option<String>,
     pub message_count: i64,
+    pub unread_count: i64,
+    pub last_message: Option<String>,
+    pub notes: Option<String>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -1414,8 +1417,8 @@ pub struct ScheduleEntry {
 }
 
 /// List all distinct phone numbers from `sms_history`, joined with `sms_contacts`
-/// for `display_name` and `auto_reply` status. Returns contacts sorted by most
-/// recent message.
+/// for `display_name`, `auto_reply` status, unread count, last message preview,
+/// and contact notes. Returns contacts sorted by most recent message.
 pub async fn list_sms_contacts(pool: &PgPool) -> Vec<SmsContact> {
     let rows = sqlx::query(
         "SELECT
@@ -1423,10 +1426,17 @@ pub async fn list_sms_contacts(pool: &PgPool) -> Vec<SmsContact> {
             c.display_name,
             COALESCE(c.auto_reply, FALSE) as auto_reply,
             MAX(h.created_at)::text as last_message_at,
-            COUNT(*) as message_count
+            COUNT(*) as message_count,
+            COUNT(*) FILTER (WHERE h.role = 'user'
+                AND h.created_at > COALESCE(c.last_read_at, '1970-01-01'::timestamptz)
+            ) as unread_count,
+            (SELECT content FROM sms_history
+             WHERE phone = h.phone ORDER BY created_at DESC LIMIT 1
+            ) as last_message,
+            c.notes
          FROM sms_history h
          LEFT JOIN sms_contacts c ON c.phone = h.phone
-         GROUP BY h.phone, c.display_name, c.auto_reply
+         GROUP BY h.phone, c.display_name, c.auto_reply, c.last_read_at, c.notes
          ORDER BY MAX(h.created_at) DESC",
     )
     .fetch_all(pool)
@@ -1440,6 +1450,9 @@ pub async fn list_sms_contacts(pool: &PgPool) -> Vec<SmsContact> {
             auto_reply: row.try_get("auto_reply").unwrap_or(false),
             last_message_at: row.try_get("last_message_at").unwrap_or(None),
             message_count: row.try_get("message_count").unwrap_or(0),
+            unread_count: row.try_get("unread_count").unwrap_or(0),
+            last_message: row.try_get("last_message").unwrap_or(None),
+            notes: row.try_get("notes").unwrap_or(None),
         })
         .collect()
 }
@@ -1463,8 +1476,16 @@ pub async fn get_sms_contact(pool: &PgPool, phone: &str) -> Option<SmsContact> {
             c.phone,
             c.display_name,
             c.auto_reply,
+            c.notes,
             (SELECT MAX(created_at)::text FROM sms_history WHERE phone = c.phone) as last_message_at,
-            (SELECT COUNT(*) FROM sms_history WHERE phone = c.phone) as message_count
+            (SELECT COUNT(*) FROM sms_history WHERE phone = c.phone) as message_count,
+            (SELECT COUNT(*) FROM sms_history
+             WHERE phone = c.phone AND role = 'user'
+               AND created_at > COALESCE(c.last_read_at, '1970-01-01'::timestamptz)
+            ) as unread_count,
+            (SELECT content FROM sms_history
+             WHERE phone = c.phone ORDER BY created_at DESC LIMIT 1
+            ) as last_message
          FROM sms_contacts c
          WHERE c.phone = $1",
     )
@@ -1479,6 +1500,9 @@ pub async fn get_sms_contact(pool: &PgPool, phone: &str) -> Option<SmsContact> {
         auto_reply: row.try_get("auto_reply").unwrap_or(false),
         last_message_at: row.try_get("last_message_at").unwrap_or(None),
         message_count: row.try_get("message_count").unwrap_or(0),
+        unread_count: row.try_get("unread_count").unwrap_or(0),
+        last_message: row.try_get("last_message").unwrap_or(None),
+        notes: row.try_get("notes").unwrap_or(None),
     })
 }
 
@@ -1506,6 +1530,44 @@ pub async fn set_contact_name(pool: &PgPool, phone: &str, name: &str) {
     .bind(name)
     .execute(pool)
     .await;
+}
+
+/// Mark a conversation as read (set `last_read_at` to now).
+/// Upserts if the contact doesn't exist.
+pub async fn mark_contact_read(pool: &PgPool, phone: &str) {
+    let normalized = crate::daemon::normalize_phone(phone);
+    let _ = sqlx::query(
+        "INSERT INTO sms_contacts (phone, last_read_at, updated_at) VALUES ($1, now(), now())
+         ON CONFLICT (phone) DO UPDATE SET last_read_at = now(), updated_at = now()",
+    )
+    .bind(&normalized)
+    .execute(pool)
+    .await;
+}
+
+/// Update `notes` for a contact. Upserts if the contact doesn't exist.
+pub async fn set_contact_notes(pool: &PgPool, phone: &str, notes: &str) {
+    let normalized = crate::daemon::normalize_phone(phone);
+    let _ = sqlx::query(
+        "INSERT INTO sms_contacts (phone, notes, updated_at) VALUES ($1, $2, now())
+         ON CONFLICT (phone) DO UPDATE SET notes = $2, updated_at = now()",
+    )
+    .bind(&normalized)
+    .bind(notes)
+    .execute(pool)
+    .await;
+}
+
+/// Get contact notes for a phone number.
+pub async fn get_contact_notes(pool: &PgPool, phone: &str) -> Option<String> {
+    let normalized = crate::daemon::normalize_phone(phone);
+    sqlx::query("SELECT notes FROM sms_contacts WHERE phone = $1")
+        .bind(&normalized)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|row| row.try_get::<Option<String>, _>("notes").unwrap_or(None))
 }
 
 /// Check if `auto_reply` is enabled for a phone number.
