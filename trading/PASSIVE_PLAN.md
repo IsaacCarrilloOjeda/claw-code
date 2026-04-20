@@ -21,12 +21,15 @@ reallocation.
 
 ## One-time setup
 
-1. **Open a Roth IRA** (if you don't have one — Fidelity or Schwab, free, 15 min online).
-   2026 contribution limit: $7,000/yr. The Roth part matters because SCHD's dividends never get federally taxed inside it.
-2. **Open a taxable brokerage** at the same place for VOO + SGOV.
-3. **Turn on DRIP** (dividend reinvestment) on every position. Auto-compounding.
-4. **Set up automatic contributions** — fixed dollar amount biweekly or monthly. Dollar-cost-averaging beats market timing at the retail level by a mile.
+**Age note:** Since you're 15, accounts need to be custodial (UTMA/UGMA or custodial Roth) — a parent is the custodian until you turn 18 or 21 (state-dependent). This isn't a hoop to jump through; it's paperwork signed once.
+
+1. **Custodial Roth IRA** — Fidelity Youth / Schwab custodial Roth. Requires reported **earned income** (W-2 or self-employment income filed on a tax return — RC Concrete freelance pay or KYNE invoices count if you actually file). Contribution limit 2026: $7,000/yr or your total earned income, whichever is lower. Inside a Roth, dividends and gains never get federally taxed again.
+2. **Custodial taxable brokerage (UTMA/UGMA)** — same brokerage, opened by a parent. Holds VOO + SGOV. Money is legally yours at age of majority.
+3. **Turn on DRIP** (dividend reinvestment) on every position.
+4. **Automatic contributions** — fixed dollar amount biweekly or monthly. Dollar-cost-averaging beats retail market-timing by a mile.
 5. **Don't look at it more than quarterly.** Rebalance once a year if any sleeve has drifted >5pp from target.
+
+**Until you're 18:** Alpaca paper trading is fine (no age gate). Alpaca live requires 18. Plan = paper until 18, then live — by then the Ghost signal is either validated or proven dead, so you're not flipping to live trading on a hunch.
 
 ## Why these funds specifically
 
