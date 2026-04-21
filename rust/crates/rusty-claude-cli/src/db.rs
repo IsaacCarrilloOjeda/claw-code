@@ -1823,3 +1823,717 @@ pub async fn reset_health_flags(pool: &PgPool) {
     .execute(pool)
     .await;
 }
+
+// ---------------------------------------------------------------------------
+// Ghost events model (Phase 3 — self-correction substrate)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct NewGhostEventRow<'a> {
+    pub job_id: Option<uuid::Uuid>,
+    pub agent: &'a str,
+    pub tier: &'a str,
+    pub input: Option<&'a str>,
+    pub output: Option<&'a str>,
+    pub tokens_in: i32,
+    pub tokens_out: i32,
+    pub cost_cents: i32,
+    pub outcome: &'a str,
+}
+
+#[derive(Debug, Clone)]
+pub struct GhostEventRow {
+    pub id: uuid::Uuid,
+    pub job_id: Option<uuid::Uuid>,
+    pub agent: String,
+    pub tier: String,
+    pub input: Option<String>,
+    pub output: Option<String>,
+    pub tokens_in: i32,
+    pub tokens_out: i32,
+    pub cost_cents: i32,
+    pub outcome: String,
+    pub human_correction: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+fn row_to_ghost_event(row: &sqlx::postgres::PgRow) -> GhostEventRow {
+    GhostEventRow {
+        id: row.try_get("id").unwrap_or_else(|_| uuid::Uuid::nil()),
+        job_id: row.try_get("job_id").unwrap_or(None),
+        agent: row.try_get("agent").unwrap_or_default(),
+        tier: row.try_get("tier").unwrap_or_default(),
+        input: row.try_get("input").unwrap_or(None),
+        output: row.try_get("output").unwrap_or(None),
+        tokens_in: row.try_get("tokens_in").unwrap_or(0),
+        tokens_out: row.try_get("tokens_out").unwrap_or(0),
+        cost_cents: row.try_get("cost_cents").unwrap_or(0),
+        outcome: row.try_get("outcome").unwrap_or_default(),
+        human_correction: row.try_get("human_correction").unwrap_or(None),
+        created_at: row
+            .try_get("created_at")
+            .unwrap_or_else(|_| chrono::Utc::now()),
+    }
+}
+
+/// Insert a new ghost event row. Returns the new row's UUID.
+pub async fn insert_ghost_event(
+    pool: &PgPool,
+    ev: &NewGhostEventRow<'_>,
+) -> Result<uuid::Uuid, sqlx::Error> {
+    let id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO ghost_events
+            (id, job_id, agent, tier, input, output,
+             tokens_in, tokens_out, cost_cents, outcome)
+         VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+    )
+    .bind(id)
+    .bind(ev.job_id)
+    .bind(ev.agent)
+    .bind(ev.tier)
+    .bind(ev.input)
+    .bind(ev.output)
+    .bind(ev.tokens_in)
+    .bind(ev.tokens_out)
+    .bind(ev.cost_cents)
+    .bind(ev.outcome)
+    .execute(pool)
+    .await?;
+    Ok(id)
+}
+
+/// Most recent ghost events, newest first.
+pub async fn list_recent_ghost_events(
+    pool: &PgPool,
+    limit: i64,
+) -> Result<Vec<GhostEventRow>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT id, job_id, agent, tier, input, output,
+                tokens_in, tokens_out, cost_cents, outcome,
+                human_correction, created_at
+         FROM ghost_events
+         ORDER BY created_at DESC
+         LIMIT $1",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows.iter().map(row_to_ghost_event).collect())
+}
+
+/// Most recent ghost events for one agent, newest first.
+pub async fn list_ghost_events_by_agent(
+    pool: &PgPool,
+    agent: &str,
+    limit: i64,
+) -> Result<Vec<GhostEventRow>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT id, job_id, agent, tier, input, output,
+                tokens_in, tokens_out, cost_cents, outcome,
+                human_correction, created_at
+         FROM ghost_events
+         WHERE agent = $1
+         ORDER BY created_at DESC
+         LIMIT $2",
+    )
+    .bind(agent)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows.iter().map(row_to_ghost_event).collect())
+}
+
+/// Attach a human correction to an existing ghost event.
+pub async fn update_ghost_event_correction(
+    pool: &PgPool,
+    id: uuid::Uuid,
+    correction: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE ghost_events SET human_correction = $1 WHERE id = $2::uuid")
+        .bind(correction)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Approval (Wave 2) — helpers for jobs in `waiting_confirmation` status.
+// ---------------------------------------------------------------------------
+
+/// Minimum fields the approval module needs from a pending job.
+#[derive(Debug, Clone)]
+pub struct PendingJobRow {
+    pub id: uuid::Uuid,
+    pub input: String,
+    pub agent: String,
+    pub confirmation_token: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+fn row_to_pending_job(row: &sqlx::postgres::PgRow) -> Result<PendingJobRow, sqlx::Error> {
+    Ok(PendingJobRow {
+        id: row.try_get("id")?,
+        input: row.try_get("input")?,
+        agent: row
+            .try_get::<Option<String>, _>("agent")?
+            .unwrap_or_default(),
+        confirmation_token: row.try_get("confirmation_token")?,
+        created_at: row.try_get("created_at")?,
+    })
+}
+
+/// Most recent `waiting_confirmation` job for this phone number, if any.
+pub async fn find_pending_job_by_phone(
+    pool: &PgPool,
+    phone: &str,
+) -> Result<Option<PendingJobRow>, sqlx::Error> {
+    let normalized = crate::daemon::normalize_phone(phone);
+    let row = sqlx::query(
+        "SELECT id, input, agent, confirmation_token, created_at
+         FROM jobs
+         WHERE phone_from = $1
+           AND status = 'waiting_confirmation'
+         ORDER BY created_at DESC
+         LIMIT 1",
+    )
+    .bind(&normalized)
+    .fetch_optional(pool)
+    .await?;
+
+    row.as_ref().map(row_to_pending_job).transpose()
+}
+
+/// `waiting_confirmation` job matching this phone + token. Phone is scoped so
+/// one contact's approval can't resolve another's job.
+pub async fn find_pending_job_by_token(
+    pool: &PgPool,
+    phone: &str,
+    token: &str,
+) -> Result<Option<PendingJobRow>, sqlx::Error> {
+    let normalized = crate::daemon::normalize_phone(phone);
+    let row = sqlx::query(
+        "SELECT id, input, agent, confirmation_token, created_at
+         FROM jobs
+         WHERE phone_from = $1
+           AND confirmation_token = $2
+           AND status = 'waiting_confirmation'
+         ORDER BY created_at DESC
+         LIMIT 1",
+    )
+    .bind(&normalized)
+    .bind(token)
+    .fetch_optional(pool)
+    .await?;
+
+    row.as_ref().map(row_to_pending_job).transpose()
+}
+
+/// Transition a job from `waiting_confirmation` to `done`. Returns the number
+/// of rows updated — 0 means the job was missing or already in a different
+/// status (caller decides how to treat that).
+pub async fn mark_waiting_job_done(pool: &PgPool, job_id: uuid::Uuid) -> Result<u64, sqlx::Error> {
+    let res = sqlx::query(
+        "UPDATE jobs
+         SET status = 'done',
+             completed_at = now(),
+             updated_at = now()
+         WHERE id = $1
+           AND status = 'waiting_confirmation'",
+    )
+    .bind(job_id)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
+}
+
+// ---------------------------------------------------------------------------
+// OAuth token storage (migration 013_oauth_tokens.sql)
+//
+// Shared by Calendar / Docs / Gmail agents. One row per (provider, account).
+// The refresh_token is long-lived; access_token + expires_at are rewritten
+// each time we exchange refresh → access against Google's token endpoint.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct OAuthTokenRow {
+    pub provider: String,
+    pub account_label: String,
+    pub refresh_token: String,
+    pub access_token: Option<String>,
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub scopes: Vec<String>,
+}
+
+fn row_to_oauth_token(row: &sqlx::postgres::PgRow) -> OAuthTokenRow {
+    OAuthTokenRow {
+        provider: row.try_get("provider").unwrap_or_default(),
+        account_label: row.try_get("account_label").unwrap_or_default(),
+        refresh_token: row.try_get("refresh_token").unwrap_or_default(),
+        access_token: row.try_get("access_token").unwrap_or(None),
+        expires_at: row.try_get("expires_at").unwrap_or(None),
+        scopes: row.try_get("scopes").unwrap_or_default(),
+    }
+}
+
+/// Load the stored OAuth row for a (provider, `account_label`). None if absent.
+pub async fn load_oauth_token(
+    pool: &PgPool,
+    provider: &str,
+    account: &str,
+) -> Result<Option<OAuthTokenRow>, sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT provider, account_label, refresh_token, access_token,
+                expires_at, scopes
+         FROM oauth_tokens
+         WHERE provider = $1 AND account_label = $2",
+    )
+    .bind(provider)
+    .bind(account)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.as_ref().map(row_to_oauth_token))
+}
+
+/// Upsert the `refresh_token` + scopes. Clears any stale `access_token` / expiry
+/// so the next call refreshes. Used once after a manual consent flow.
+pub async fn upsert_oauth_token(
+    pool: &PgPool,
+    provider: &str,
+    account: &str,
+    refresh_token: &str,
+    scopes: &[String],
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO oauth_tokens
+            (provider, account_label, refresh_token, access_token,
+             expires_at, scopes, updated_at)
+         VALUES ($1, $2, $3, NULL, NULL, $4, now())
+         ON CONFLICT (provider, account_label) DO UPDATE
+         SET refresh_token = EXCLUDED.refresh_token,
+             access_token  = NULL,
+             expires_at    = NULL,
+             scopes        = EXCLUDED.scopes,
+             updated_at    = now()",
+    )
+    .bind(provider)
+    .bind(account)
+    .bind(refresh_token)
+    .bind(scopes)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Write a freshly-issued `access_token` + expiry back to the row. Leaves
+/// the `refresh_token` untouched.
+pub async fn update_oauth_access_token(
+    pool: &PgPool,
+    provider: &str,
+    account: &str,
+    access_token: &str,
+    expires_at: chrono::DateTime<chrono::Utc>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE oauth_tokens
+         SET access_token = $3,
+             expires_at   = $4,
+             updated_at   = now()
+         WHERE provider = $1 AND account_label = $2",
+    )
+    .bind(provider)
+    .bind(account)
+    .bind(access_token)
+    .bind(expires_at)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Agent spend model (Phase 3 — daily per-agent budget counters)
+// ---------------------------------------------------------------------------
+
+/// Today's (`cost_cents`, calls) for one agent. Missing row → (0, 0).
+pub async fn get_agent_spend_today(pool: &PgPool, agent: &str) -> Result<(i64, i32), sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT cost_cents, calls
+         FROM agent_spend
+         WHERE agent = $1 AND day = CURRENT_DATE",
+    )
+    .bind(agent)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map_or((0, 0), |r| {
+        (
+            r.try_get::<i64, _>("cost_cents").unwrap_or(0),
+            r.try_get::<i32, _>("calls").unwrap_or(0),
+        )
+    }))
+}
+
+/// Upsert today's spend row: increments tokens/cost/calls atomically.
+pub async fn upsert_agent_spend(
+    pool: &PgPool,
+    agent: &str,
+    tokens_in: i64,
+    tokens_out: i64,
+    cost_cents: i64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO agent_spend (agent, day, tokens_in, tokens_out, cost_cents, calls, updated_at)
+         VALUES ($1, CURRENT_DATE, $2, $3, $4, 1, now())
+         ON CONFLICT (agent, day) DO UPDATE SET
+            tokens_in  = agent_spend.tokens_in  + EXCLUDED.tokens_in,
+            tokens_out = agent_spend.tokens_out + EXCLUDED.tokens_out,
+            cost_cents = agent_spend.cost_cents + EXCLUDED.cost_cents,
+            calls      = agent_spend.calls      + 1,
+            updated_at = now()",
+    )
+    .bind(agent)
+    .bind(tokens_in)
+    .bind(tokens_out)
+    .bind(cost_cents)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Today's spend for every agent that has called today. Returns
+/// (agent, `cost_cents`, calls) tuples.
+pub async fn list_agent_spend_today(pool: &PgPool) -> Result<Vec<(String, i64, i32)>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT agent, cost_cents, calls
+         FROM agent_spend
+         WHERE day = CURRENT_DATE
+         ORDER BY cost_cents DESC",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .iter()
+        .map(|r| {
+            (
+                r.try_get::<String, _>("agent").unwrap_or_default(),
+                r.try_get::<i64, _>("cost_cents").unwrap_or(0),
+                r.try_get::<i32, _>("calls").unwrap_or(0),
+            )
+        })
+        .collect())
+}
+
+// ---------------------------------------------------------------------------
+// Scheduled triggers (migration 014_scheduled_triggers.sql)
+//
+// Polled every 30s by `infra::scheduler`. Rows with `next_fire_at <= now()`
+// and `enabled = TRUE` are dispatched; `next_fire_at` is recomputed from
+// `cron_expr` (6-field `sec min hr dom mon dow` per the `cron` crate).
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct ScheduledTrigger {
+    pub id: uuid::Uuid,
+    pub name: String,
+    pub cron_expr: String,
+    pub agent: String,
+    pub payload: String,
+    pub enabled: bool,
+    pub last_fired_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub next_fire_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+fn row_to_scheduled_trigger(row: &sqlx::postgres::PgRow) -> ScheduledTrigger {
+    ScheduledTrigger {
+        id: row.try_get("id").unwrap_or_else(|_| uuid::Uuid::nil()),
+        name: row.try_get("name").unwrap_or_default(),
+        cron_expr: row.try_get("cron_expr").unwrap_or_default(),
+        agent: row.try_get("agent").unwrap_or_default(),
+        payload: row.try_get("payload").unwrap_or_default(),
+        enabled: row.try_get("enabled").unwrap_or(false),
+        last_fired_at: row.try_get("last_fired_at").unwrap_or(None),
+        next_fire_at: row.try_get("next_fire_at").unwrap_or(None),
+    }
+}
+
+/// Up to `limit` enabled triggers whose `next_fire_at` has elapsed, oldest
+/// first. Rows with NULL `next_fire_at` are excluded (scheduler computes one
+/// the first time it fires them — caller seeds `next_fire_at = now()` on insert).
+pub async fn due_triggers(pool: &PgPool, limit: i64) -> Result<Vec<ScheduledTrigger>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT id, name, cron_expr, agent, payload, enabled,
+                last_fired_at, next_fire_at
+         FROM scheduled_triggers
+         WHERE enabled = TRUE AND next_fire_at <= now()
+         ORDER BY next_fire_at ASC
+         LIMIT $1",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows.iter().map(row_to_scheduled_trigger).collect())
+}
+
+/// Stamp a trigger as fired: set `last_fired_at = now()` and rewrite
+/// `next_fire_at` to the passed value. Called BEFORE dispatch so a
+/// slow-running agent cannot cause double-fires on the next tick.
+pub async fn mark_fired(
+    pool: &PgPool,
+    id: uuid::Uuid,
+    next_fire_at: chrono::DateTime<chrono::Utc>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE scheduled_triggers
+         SET last_fired_at = now(),
+             next_fire_at  = $2
+         WHERE id = $1",
+    )
+    .bind(id)
+    .bind(next_fire_at)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Interest nodes (migration 015_interest_nodes.sql)
+//
+// Reflective write surface for the Dreamer agent. Each row is a short
+// "topic + summary" with an embedding; the chat dispatcher can pgvector-query
+// this table to surface what Isaac has been thinking about lately without
+// re-reading raw ghost_events.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct InterestNode {
+    pub id: uuid::Uuid,
+    pub topic: String,
+    pub summary: String,
+    pub weight: f32,
+    pub embedding: Option<Vec<f32>>,
+    pub source_refs: serde_json::Value,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Insert a new interest node. Returns the new row's UUID on success.
+pub async fn insert_interest_node(
+    pool: &PgPool,
+    topic: &str,
+    summary: &str,
+    embedding: Option<&[f32]>,
+    source_refs: &serde_json::Value,
+) -> Result<uuid::Uuid, sqlx::Error> {
+    let id = uuid::Uuid::new_v4();
+    if let Some(emb) = embedding {
+        let embedding_str = vec_to_pgvector(emb);
+        sqlx::query(
+            "INSERT INTO interest_nodes
+                (id, topic, summary, embedding, source_refs)
+             VALUES ($1::uuid, $2, $3, $4::vector, $5)",
+        )
+        .bind(id)
+        .bind(topic)
+        .bind(summary)
+        .bind(&embedding_str)
+        .bind(source_refs)
+        .execute(pool)
+        .await?;
+    } else {
+        sqlx::query(
+            "INSERT INTO interest_nodes
+                (id, topic, summary, source_refs)
+             VALUES ($1::uuid, $2, $3, $4)",
+        )
+        .bind(id)
+        .bind(topic)
+        .bind(summary)
+        .bind(source_refs)
+        .execute(pool)
+        .await?;
+    }
+    Ok(id)
+}
+
+fn row_to_interest_node(row: &sqlx::postgres::PgRow) -> InterestNode {
+    InterestNode {
+        id: row.try_get("id").unwrap_or_else(|_| uuid::Uuid::nil()),
+        topic: row.try_get("topic").unwrap_or_default(),
+        summary: row.try_get("summary").unwrap_or_default(),
+        weight: {
+            #[allow(clippy::cast_possible_truncation)]
+            let w = row.try_get::<f64, _>("weight").unwrap_or(1.0) as f32;
+            w
+        },
+        // Embedding column is VECTOR(1024); sqlx doesn't decode pgvector
+        // natively so we don't surface it here. Consumers that need the
+        // vector should query by cosine similarity in SQL rather than
+        // round-tripping it through Rust.
+        embedding: None,
+        source_refs: row
+            .try_get::<serde_json::Value, _>("source_refs")
+            .unwrap_or_else(|_| serde_json::json!([])),
+        created_at: row
+            .try_get("created_at")
+            .unwrap_or_else(|_| chrono::Utc::now()),
+        updated_at: row
+            .try_get("updated_at")
+            .unwrap_or_else(|_| chrono::Utc::now()),
+    }
+}
+
+/// List the top-weighted interest nodes, highest weight first.
+pub async fn list_interest_nodes(
+    pool: &PgPool,
+    limit: i64,
+) -> Result<Vec<InterestNode>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT id, topic, summary, weight, source_refs, created_at, updated_at
+         FROM interest_nodes
+         ORDER BY weight DESC, created_at DESC
+         LIMIT $1",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows.iter().map(row_to_interest_node).collect())
+}
+
+/// Recent activity window the Dreamer reflects on. Pulls the last
+/// `events_limit` `ghost_events` rows AND the last `notes_limit`
+/// `director_notes`. Returned as plain formatted strings — Dreamer concatenates
+/// them as the user prompt. Caller is responsible for total-byte truncation.
+pub async fn dreamer_window(
+    pool: &PgPool,
+    events_limit: i64,
+    notes_limit: i64,
+) -> Result<Vec<String>, sqlx::Error> {
+    let event_rows = sqlx::query(
+        "SELECT agent, input, output, outcome, created_at
+         FROM ghost_events
+         ORDER BY created_at DESC
+         LIMIT $1",
+    )
+    .bind(events_limit)
+    .fetch_all(pool)
+    .await?;
+
+    let note_rows = sqlx::query(
+        "SELECT category, content, created_at
+         FROM director_notes
+         WHERE expires_at IS NULL
+         ORDER BY created_at DESC
+         LIMIT $1",
+    )
+    .bind(notes_limit)
+    .fetch_all(pool)
+    .await?;
+
+    let mut out: Vec<(chrono::DateTime<chrono::Utc>, String)> =
+        Vec::with_capacity(event_rows.len() + note_rows.len());
+
+    for row in &event_rows {
+        let created_at: chrono::DateTime<chrono::Utc> = row
+            .try_get("created_at")
+            .unwrap_or_else(|_| chrono::Utc::now());
+        let agent: String = row.try_get("agent").unwrap_or_default();
+        let input: Option<String> = row.try_get("input").unwrap_or(None);
+        let outcome: String = row.try_get("outcome").unwrap_or_default();
+        let date = created_at.format("%Y-%m-%d").to_string();
+        let body = input.unwrap_or_else(|| format!("(no input, outcome={outcome})"));
+        out.push((created_at, format!("[event {date} {agent}] {body}")));
+    }
+
+    for row in &note_rows {
+        let created_at: chrono::DateTime<chrono::Utc> = row
+            .try_get("created_at")
+            .unwrap_or_else(|_| chrono::Utc::now());
+        let category: String = row.try_get("category").unwrap_or_default();
+        let content: String = row.try_get("content").unwrap_or_default();
+        let date = created_at.format("%Y-%m-%d").to_string();
+        out.push((created_at, format!("[note {date} {category}] {content}")));
+    }
+
+    // Oldest first so the Dreamer's prompt reads chronologically.
+    out.sort_by_key(|(ts, _)| *ts);
+    Ok(out.into_iter().map(|(_, s)| s).collect())
+}
+
+// ---------------------------------------------------------------------------
+// Scheduled trigger CRUD (Wave 5).
+//
+// `infra/scheduler` reads via `due_triggers` / `mark_fired`. The HTTP CRUD
+// surface (`POST /triggers`, `GET /triggers`, `DELETE /triggers/:id`) lives in
+// `daemon.rs` and goes through these helpers.
+// ---------------------------------------------------------------------------
+
+/// Fields needed to insert a new `scheduled_triggers` row. Caller is
+/// responsible for parsing/validating `cron_expr` and computing
+/// `next_fire_at` from it (see `cron::Schedule::upcoming`).
+pub struct NewScheduledTrigger<'a> {
+    pub name: &'a str,
+    pub cron_expr: &'a str,
+    pub agent: &'a str,
+    pub payload: &'a str,
+    pub enabled: bool,
+    pub next_fire_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Insert a new scheduled trigger and return its UUID.
+pub async fn insert_scheduled_trigger(
+    pool: &PgPool,
+    t: NewScheduledTrigger<'_>,
+) -> Result<uuid::Uuid, sqlx::Error> {
+    let id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO scheduled_triggers
+            (id, name, cron_expr, agent, payload, enabled, next_fire_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+    )
+    .bind(id)
+    .bind(t.name)
+    .bind(t.cron_expr)
+    .bind(t.agent)
+    .bind(t.payload)
+    .bind(t.enabled)
+    .bind(t.next_fire_at)
+    .execute(pool)
+    .await?;
+    Ok(id)
+}
+
+/// Delete a scheduled trigger by id. Returns `true` if a row was deleted,
+/// `false` if no row matched.
+pub async fn delete_scheduled_trigger(pool: &PgPool, id: uuid::Uuid) -> Result<bool, sqlx::Error> {
+    let res = sqlx::query("DELETE FROM scheduled_triggers WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected() > 0)
+}
+
+/// List up to `limit` triggers, newest-first by `created_at`.
+pub async fn list_scheduled_triggers(
+    pool: &PgPool,
+    limit: i64,
+) -> Result<Vec<ScheduledTrigger>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT id, name, cron_expr, agent, payload, enabled,
+                last_fired_at, next_fire_at
+         FROM scheduled_triggers
+         ORDER BY created_at DESC
+         LIMIT $1",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows.iter().map(row_to_scheduled_trigger).collect())
+}

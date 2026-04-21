@@ -192,6 +192,12 @@ async fn daemon_main(cfg: DaemonConfig) -> Result<(), Box<dyn std::error::Error>
         });
     }
 
+    // Spawn scheduler task (polls `scheduled_triggers` every 30s, fires due
+    // rows through the dispatcher). See `infra/scheduler.rs`.
+    if let Some(pool) = cfg.db.clone() {
+        let _scheduler_handle = crate::infra::scheduler::spawn((*pool).clone());
+    }
+
     let start = Instant::now();
     eprintln!("{LOG_PREFIX} listening on http://{addr}");
     eprintln!("{LOG_PREFIX} PID {}", std::process::id());
@@ -613,6 +619,15 @@ async fn dispatch(
             let id = &p["/memories/".len()..];
             memory_delete(cfg.db.as_deref(), raw, id).await
         }
+
+        // --- Observability endpoints (Wave 3) ---
+        ("GET", "/events") => {
+            let qs = path.split_once('?').map_or("", |(_, q)| q);
+            events_list(cfg, raw, qs).await
+        }
+        ("GET", "/agents/budget") => agents_budget(cfg, raw).await,
+        ("GET", "/agents") => agents_list(raw),
+
         ("POST", "/chat") => chat_handler(cfg, raw).await,
         ("POST", "/sms/inbound") => sms_inbound(cfg, raw).await,
         ("POST", "/sms/send") => sms_send_handler(raw, cfg).await,
@@ -660,6 +675,14 @@ async fn dispatch(
         ("DELETE", p) if p.starts_with("/schedule/") => {
             let id = &p["/schedule/".len()..];
             schedule_delete(cfg, raw, id).await
+        }
+
+        // --- Trigger CRUD (Wave 5) ---
+        ("GET", "/triggers") => triggers_list(cfg, raw).await,
+        ("POST", "/triggers") => trigger_create(cfg, raw).await,
+        ("DELETE", p) if p.starts_with("/triggers/") => {
+            let id = &p["/triggers/".len()..];
+            trigger_delete(cfg, raw, id).await
         }
 
         // --- Bible endpoints ---
@@ -1115,10 +1138,18 @@ async fn chat_handler(cfg: &DaemonConfig, raw: &str) -> (&'static str, String) {
         );
     };
 
-    let (agent_name, process_msg) = if let Some(stripped) = message.strip_prefix('!') {
-        ("director", stripped.trim().to_string())
-    } else {
-        ("chat_dispatcher", message.clone())
+    // Routing lives in agents::dispatcher. `agent_name` is only for the jobs
+    // table — classify just to get a label.
+    let (intent_label, _) = crate::agents::intent::classify(&message);
+    let agent_name = match intent_label {
+        crate::agents::intent::Intent::Director => "director",
+        crate::agents::intent::Intent::Research => "research",
+        crate::agents::intent::Intent::Scheduled => "scheduled",
+        crate::agents::intent::Intent::Calendar => "calendar",
+        crate::agents::intent::Intent::ChiefOfStaff => "chief_of_staff",
+        crate::agents::intent::Intent::Docs => "docs",
+        crate::agents::intent::Intent::Ignore => "ignored",
+        crate::agents::intent::Intent::Chat => "chat_dispatcher",
     };
 
     let Some(job_id) = db::create_job(pool_ref, &message, agent_name, "dashboard", None).await
@@ -1129,12 +1160,15 @@ async fn chat_handler(cfg: &DaemonConfig, raw: &str) -> (&'static str, String) {
         );
     };
 
-    let result = if agent_name == "director" {
-        crate::director::handle(&process_msg, &job_id, Some(pool_ref)).await
-    } else {
-        crate::chat_dispatcher::dispatch(&process_msg, &history, &job_id, Some(pool_ref), None)
-            .await
+    let dispatcher = crate::agents::dispatcher::Dispatcher::new();
+    let req = crate::agents::AgentRequest {
+        message: message.clone(),
+        history,
+        source: crate::agents::Source::Dashboard,
+        job_id: job_id.clone(),
+        sender_phone: None,
     };
+    let result = dispatcher.dispatch(req, pool_ref).await.map(|r| r.text);
 
     match result {
         Ok(text) => {
@@ -1147,6 +1181,46 @@ async fn chat_handler(cfg: &DaemonConfig, raw: &str) -> (&'static str, String) {
             let resp = serde_json::json!({"error": e, "job_id": job_id}).to_string();
             ("502 Bad Gateway", resp)
         }
+    }
+}
+
+/// Outcome of an SMS-driven approval lookup. `NoMatch` means the message
+/// looked like an approval but didn't resolve any pending job — caller should
+/// fall through to normal chat dispatch rather than swallow it.
+enum ApprovalOutcome {
+    Resolved { job_id: uuid::Uuid },
+    NoMatch,
+    DbError(String),
+}
+
+/// Resolve an SMS approval message ("y" / "yes" / "y <token>") against the
+/// caller's pending jobs. Composes the public API in `infra::approval` so
+/// `sms_inbound` only has to make one call.
+async fn resolve_approval(
+    pool: &sqlx::PgPool,
+    phone: &str,
+    kind: crate::infra::approval::ApprovalKind,
+) -> ApprovalOutcome {
+    use crate::infra::approval::{
+        find_pending_for_contact, mark_job_approved, resolve_by_token, ApprovalKind,
+    };
+    let pending = match kind {
+        ApprovalKind::Plain => match find_pending_for_contact(pool, phone).await {
+            Ok(p) => p,
+            Err(e) => return ApprovalOutcome::DbError(e.to_string()),
+        },
+        ApprovalKind::Tokened(tok) => match resolve_by_token(pool, phone, &tok).await {
+            Ok(p) => p,
+            Err(e) => return ApprovalOutcome::DbError(e.to_string()),
+        },
+    };
+    let Some(job) = pending else {
+        return ApprovalOutcome::NoMatch;
+    };
+    match mark_job_approved(pool, job.id).await {
+        Ok(()) => ApprovalOutcome::Resolved { job_id: job.id },
+        Err(sqlx::Error::RowNotFound) => ApprovalOutcome::NoMatch,
+        Err(e) => ApprovalOutcome::DbError(e.to_string()),
     }
 }
 
@@ -1232,16 +1306,58 @@ async fn sms_inbound(cfg: &DaemonConfig, raw: &str) -> (&'static str, String) {
         }
     }
 
-    // `.` prefix → reserved/ignored for now.
-    if message.starts_with('.') {
-        return ("200 OK", r#"{"status":"ignored"}"#.to_owned());
+    // --- Approval intercept (Wave 5) -------------------------------------
+    // A plain "y" / "yes" / "y <token>" resolves the sender's most recent
+    // pending job and does NOT go to any agent. Gated on DB being configured
+    // — without a pool we can't look up pending jobs anyway.
+    if let Some(pool) = cfg.db.as_deref() {
+        if !phone_from.is_empty() {
+            if let Some(kind) = crate::infra::approval::is_approval_message(&message) {
+                match resolve_approval(pool, &phone_from, kind).await {
+                    ApprovalOutcome::Resolved { job_id } => {
+                        let reply = format!("[ok] approved -- running job {job_id}");
+                        if let Err(e) =
+                            crate::sms::send_response(&phone_from, &reply, &job_id.to_string())
+                                .await
+                        {
+                            eprintln!("[ghost approval] reply send failed: {e}");
+                        }
+                        db::insert_sms_history(pool, &phone_from, "user", &message).await;
+                        db::insert_sms_history(pool, &phone_from, "assistant", &reply).await;
+                        // TODO(wave 6): actually kick the waiting job forward.
+                        // mark_job_approved is terminal today — no agent
+                        // continuation path exists yet.
+                        return ("200 OK", r#"{"status":"approved"}"#.to_owned());
+                    }
+                    ApprovalOutcome::NoMatch => {
+                        // Token didn't match an awaiting job; fall through to
+                        // the normal dispatcher. Wave 6 may surface a "no
+                        // pending job found" UX hint here.
+                    }
+                    ApprovalOutcome::DbError(e) => {
+                        eprintln!("[ghost approval] lookup failed: {e}");
+                        // Better to treat it as a chat message than to drop
+                        // it on a flaky DB read.
+                    }
+                }
+            }
+        }
     }
 
-    // Determine route and strip prefix if needed.
-    let (agent_name, process_msg) = if let Some(stripped) = message.strip_prefix('!') {
-        ("director", stripped.trim().to_string())
-    } else {
-        ("chat_dispatcher", message.clone())
+    // Routing + prefix stripping now lives in agents::intent / agents::dispatcher.
+    // We still classify here once to label the `jobs.agent` column and to store
+    // a prefix-stripped copy in `sms_history`. The dispatcher re-classifies
+    // internally — it's the single source of truth for the routing decision.
+    let (intent_label, process_msg) = crate::agents::intent::classify(&message);
+    let agent_name = match intent_label {
+        crate::agents::intent::Intent::Director => "director",
+        crate::agents::intent::Intent::Research => "research",
+        crate::agents::intent::Intent::Scheduled => "scheduled",
+        crate::agents::intent::Intent::Calendar => "calendar",
+        crate::agents::intent::Intent::ChiefOfStaff => "chief_of_staff",
+        crate::agents::intent::Intent::Docs => "docs",
+        crate::agents::intent::Intent::Ignore => "ignored",
+        crate::agents::intent::Intent::Chat => "chat_dispatcher",
     };
 
     let Some(pool_ref) = cfg.db.as_deref() else {
@@ -1263,7 +1379,7 @@ async fn sms_inbound(cfg: &DaemonConfig, raw: &str) -> (&'static str, String) {
     // Clone what the background task needs — respond 200 before AI call.
     let pool_arc = Arc::clone(cfg.db.as_ref().unwrap()); // safe: just checked above
     let job_id_bg = job_id.clone();
-    let use_director = agent_name == "director";
+    let message_for_bg = message.clone();
 
     tokio::spawn(async move {
         // Store inbound message in conversation history.
@@ -1281,20 +1397,22 @@ async fn sms_inbound(cfg: &DaemonConfig, raw: &str) -> (&'static str, String) {
         let loadbearing = db::load_loadbearing_history(&pool_arc, &phone_from).await;
         merge_loadbearing(&mut history, loadbearing);
 
-        let result = if use_director {
-            crate::director::handle(&process_msg, &job_id_bg, Some(&pool_arc)).await
-        } else {
-            crate::chat_dispatcher::dispatch(
-                &process_msg,
-                &history,
-                &job_id_bg,
-                Some(&pool_arc),
-                Some(&phone_from),
-            )
-            .await
+        let dispatcher = crate::agents::dispatcher::Dispatcher::new();
+        let req = crate::agents::AgentRequest {
+            message: message_for_bg,
+            history,
+            source: crate::agents::Source::Sms,
+            job_id: job_id_bg.clone(),
+            sender_phone: Some(phone_from.clone()),
         };
+        let result = dispatcher.dispatch(req, &pool_arc).await.map(|r| r.text);
 
         match result {
+            Ok(text) if text.is_empty() => {
+                // Ignore intent (e.g. `.` prefix): do not send an SMS reply.
+                eprintln!("[ghost sms] ignored message for job {job_id_bg}, no reply sent");
+                db::update_job_done(&pool_arc, &job_id_bg, "(ignored)").await;
+            }
             Ok(text) => {
                 // Guard check — review outbound reply before sending.
                 let verdict = crate::guard::check(&process_msg, &text, &phone_from).await;
@@ -1585,11 +1703,7 @@ async fn sms_contact_notes_handler(
 }
 
 /// `GET /sms/contacts/{phone}/summary` -- AI-generated conversation summary.
-async fn sms_summary_handler(
-    cfg: &DaemonConfig,
-    raw: &str,
-    phone: &str,
-) -> (&'static str, String) {
+async fn sms_summary_handler(cfg: &DaemonConfig, raw: &str, phone: &str) -> (&'static str, String) {
     if !auth_matches(raw) {
         return ("401 Unauthorized", r#"{"error":"unauthorized"}"#.to_owned());
     }
@@ -1602,16 +1716,16 @@ async fn sms_summary_handler(
 
     let history = db::load_sms_history(pool, phone, 20).await;
     if history.is_empty() {
-        return (
-            "200 OK",
-            json!({"summary": "No messages yet."}).to_string(),
-        );
+        return ("200 OK", json!({"summary": "No messages yet."}).to_string());
     }
 
     // Format history into a readable block for the summarizer.
     let mut transcript = String::new();
     for msg in &history {
-        if let (Some(role), Some(content)) = (msg.get("role").and_then(|v| v.as_str()), msg.get("content").and_then(|v| v.as_str())) {
+        if let (Some(role), Some(content)) = (
+            msg.get("role").and_then(|v| v.as_str()),
+            msg.get("content").and_then(|v| v.as_str()),
+        ) {
             let label = if role == "user" { "Them" } else { "GHOST" };
             let _ = writeln!(transcript, "{label}: {content}");
         }
@@ -1646,8 +1760,7 @@ async fn sms_summary_handler(
     {
         Ok(resp) => match resp.text().await {
             Ok(text) => {
-                let parsed: serde_json::Value =
-                    serde_json::from_str(&text).unwrap_or(json!({}));
+                let parsed: serde_json::Value = serde_json::from_str(&text).unwrap_or(json!({}));
                 let summary = parsed["content"]
                     .as_array()
                     .and_then(|arr| arr.first())
@@ -1766,6 +1879,230 @@ async fn schedule_delete(cfg: &DaemonConfig, raw: &str, id: &str) -> (&'static s
     }
 }
 
+// ---------------------------------------------------------------------------
+// Trigger CRUD handlers (Wave 5)
+//
+// `infra::scheduler` polls `scheduled_triggers` every 30s; these endpoints are
+// how Isaac (or the dashboard) registers new cron-fired agent jobs. All three
+// require `Authorization: Bearer <GHOST_DAEMON_KEY>` like `POST /sms/send`.
+// ---------------------------------------------------------------------------
+
+/// Allow-list of agent names that can be scheduled. Includes agents that
+/// don't yet exist in the dispatcher (`chief_of_staff`, `dreamer`) so Isaac
+/// can schedule ahead of Wave 5.5 without redeploying.
+const SCHEDULABLE_AGENTS: &[&str] = &[
+    "research",
+    "calendar",
+    "docs",
+    "chat_dispatcher",
+    "director",
+    "chief_of_staff",
+    "dreamer",
+];
+
+/// `GET /triggers` — list all scheduled triggers, newest-first, capped at 100.
+async fn triggers_list(cfg: &DaemonConfig, raw: &str) -> (&'static str, String) {
+    if !auth_matches(raw) {
+        return ("401 Unauthorized", r#"{"error":"unauthorized"}"#.to_owned());
+    }
+    let Some(pool) = cfg.db.as_deref() else {
+        return (
+            "503 Service Unavailable",
+            r#"{"error":"database not configured"}"#.to_owned(),
+        );
+    };
+
+    match db::list_scheduled_triggers(pool, 100).await {
+        Ok(triggers) => {
+            let items: Vec<serde_json::Value> = triggers
+                .iter()
+                .map(|t| {
+                    json!({
+                        "id": t.id.to_string(),
+                        "name": t.name,
+                        "cron_expr": t.cron_expr,
+                        "agent": t.agent,
+                        "payload": t.payload,
+                        "enabled": t.enabled,
+                        "last_fired_at": t.last_fired_at.map(|ts| ts.to_rfc3339()),
+                        "next_fire_at": t.next_fire_at.map(|ts| ts.to_rfc3339()),
+                    })
+                })
+                .collect();
+            ("200 OK", json!({ "triggers": items }).to_string())
+        }
+        Err(e) => {
+            eprintln!("[ghost daemon] triggers_list query failed: {e}");
+            (
+                "500 Internal Server Error",
+                r#"{"error":"failed to list triggers"}"#.to_owned(),
+            )
+        }
+    }
+}
+
+/// `POST /triggers` — register a new cron-fired agent job.
+///
+/// Body: `{"name":"morning_brief","cron_expr":"0 0 9 * * *","agent":"research",
+///         "payload":"?what's new in rust async","enabled":true}`
+///
+/// `cron_expr` uses the `cron` crate's 6-field format
+/// (`<sec> <min> <hr> <dom> <mon> <dow>`). `next_fire_at` is computed from it
+/// at insert time. `enabled` defaults to `true`.
+async fn trigger_create(cfg: &DaemonConfig, raw: &str) -> (&'static str, String) {
+    if !auth_matches(raw) {
+        return ("401 Unauthorized", r#"{"error":"unauthorized"}"#.to_owned());
+    }
+    let Some(pool) = cfg.db.as_deref() else {
+        return (
+            "503 Service Unavailable",
+            r#"{"error":"database not configured"}"#.to_owned(),
+        );
+    };
+
+    let body_str = raw
+        .split_once("\r\n\r\n")
+        .or_else(|| raw.split_once("\n\n"))
+        .map_or("", |(_, b)| b);
+
+    let Ok(body) = serde_json::from_str::<serde_json::Value>(body_str) else {
+        return (
+            "400 Bad Request",
+            r#"{"error":"body must be JSON"}"#.to_owned(),
+        );
+    };
+
+    let Some(name) = body["name"].as_str() else {
+        return (
+            "400 Bad Request",
+            r#"{"error":"missing field: name"}"#.to_owned(),
+        );
+    };
+    if name.is_empty() || name.len() > 128 {
+        return (
+            "400 Bad Request",
+            r#"{"error":"name must be non-empty and <=128 chars"}"#.to_owned(),
+        );
+    }
+
+    let Some(cron_expr) = body["cron_expr"].as_str() else {
+        return (
+            "400 Bad Request",
+            r#"{"error":"missing field: cron_expr"}"#.to_owned(),
+        );
+    };
+
+    let Some(agent) = body["agent"].as_str() else {
+        return (
+            "400 Bad Request",
+            r#"{"error":"missing field: agent"}"#.to_owned(),
+        );
+    };
+    if !SCHEDULABLE_AGENTS.contains(&agent) {
+        return (
+            "400 Bad Request",
+            json!({
+                "error": format!("unknown agent '{agent}'"),
+                "allowed": SCHEDULABLE_AGENTS,
+            })
+            .to_string(),
+        );
+    }
+
+    let Some(payload) = body["payload"].as_str() else {
+        return (
+            "400 Bad Request",
+            r#"{"error":"missing field: payload"}"#.to_owned(),
+        );
+    };
+    if payload.is_empty() || payload.len() > 4096 {
+        return (
+            "400 Bad Request",
+            r#"{"error":"payload must be non-empty and <=4096 chars"}"#.to_owned(),
+        );
+    }
+
+    let enabled = body["enabled"].as_bool().unwrap_or(true);
+
+    let next_fire_at = match next_fire_from_cron(cron_expr) {
+        Ok(ts) => ts,
+        Err(e) => {
+            return ("400 Bad Request", json!({ "error": e }).to_string());
+        }
+    };
+
+    let new_trigger = db::NewScheduledTrigger {
+        name,
+        cron_expr,
+        agent,
+        payload,
+        enabled,
+        next_fire_at,
+    };
+
+    match db::insert_scheduled_trigger(pool, new_trigger).await {
+        Ok(id) => (
+            "200 OK",
+            json!({
+                "id": id.to_string(),
+                "next_fire_at": next_fire_at.to_rfc3339(),
+            })
+            .to_string(),
+        ),
+        Err(e) => {
+            eprintln!("[ghost daemon] insert_scheduled_trigger failed: {e}");
+            (
+                "500 Internal Server Error",
+                r#"{"error":"failed to insert trigger"}"#.to_owned(),
+            )
+        }
+    }
+}
+
+/// `DELETE /triggers/{id}` — delete a scheduled trigger by UUID.
+async fn trigger_delete(cfg: &DaemonConfig, raw: &str, id: &str) -> (&'static str, String) {
+    if !auth_matches(raw) {
+        return ("401 Unauthorized", r#"{"error":"unauthorized"}"#.to_owned());
+    }
+    let Some(pool) = cfg.db.as_deref() else {
+        return (
+            "503 Service Unavailable",
+            r#"{"error":"database not configured"}"#.to_owned(),
+        );
+    };
+    let Ok(parsed) = uuid::Uuid::parse_str(id) else {
+        return ("400 Bad Request", r#"{"error":"invalid uuid"}"#.to_owned());
+    };
+    match db::delete_scheduled_trigger(pool, parsed).await {
+        Ok(true) => ("200 OK", r#"{"deleted":true}"#.to_owned()),
+        Ok(false) => ("404 Not Found", r#"{"error":"not found"}"#.to_owned()),
+        Err(e) => {
+            eprintln!("[ghost daemon] delete_scheduled_trigger failed: {e}");
+            (
+                "500 Internal Server Error",
+                r#"{"error":"failed to delete trigger"}"#.to_owned(),
+            )
+        }
+    }
+}
+
+/// Parse a 6-field cron expression and return the next fire time in UTC.
+/// Mirrors `infra::scheduler::next_fire` so trigger registration computes
+/// `next_fire_at` the same way the scheduler will recompute it post-fire.
+fn next_fire_from_cron(cron_expr: &str) -> Result<chrono::DateTime<chrono::Utc>, String> {
+    use std::str::FromStr;
+    let schedule = cron::Schedule::from_str(cron_expr).map_err(|e| {
+        format!(
+            "invalid cron expression: {e} \
+             (expected 6-field format: '<sec> <min> <hr> <dom> <mon> <dow>')"
+        )
+    })?;
+    schedule
+        .upcoming(chrono::Utc)
+        .next()
+        .ok_or_else(|| "cron produced no upcoming fire time".to_string())
+}
+
 fn options_preflight() -> (&'static str, String) {
     ("204 No Content", String::new())
 }
@@ -1799,6 +2136,128 @@ async fn memory_delete(db: Option<&PgPool>, raw: &str, id: &str) -> (&'static st
     } else {
         ("404 Not Found", r#"{"error":"not found"}"#.to_owned())
     }
+}
+
+// ---------------------------------------------------------------------------
+// Observability endpoints (Wave 3): /events, /agents/budget, /agents
+// ---------------------------------------------------------------------------
+
+/// `GET /events?limit=50&agent=<name>` — recent `ghost_events` rows, newest first.
+async fn events_list(cfg: &DaemonConfig, raw: &str, query_string: &str) -> (&'static str, String) {
+    if !auth_matches(raw) {
+        return ("401 Unauthorized", r#"{"error":"unauthorized"}"#.to_owned());
+    }
+    let Some(pool) = cfg.db.as_deref() else {
+        return (
+            "503 Service Unavailable",
+            r#"{"error":"database not configured"}"#.to_owned(),
+        );
+    };
+
+    let params = parse_urlencoded(query_string);
+    let limit: i64 = params
+        .get("limit")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(50)
+        .clamp(1, 500);
+    let agent = params.get("agent").map(String::as_str);
+
+    let events_result = match agent {
+        Some(a) if !a.is_empty() => crate::infra::events::for_agent(pool, a, limit).await,
+        _ => crate::infra::events::recent(pool, limit).await,
+    };
+
+    let events = match events_result {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                "500 Internal Server Error",
+                json!({ "error": format!("failed to load events: {e}") }).to_string(),
+            );
+        }
+    };
+
+    let events_json: Vec<serde_json::Value> = events
+        .iter()
+        .map(|e| {
+            json!({
+                "id": e.id.to_string(),
+                "job_id": e.job_id.map(|j| j.to_string()),
+                "agent": e.agent,
+                "tier": e.tier,
+                "input": e.input,
+                "output": e.output,
+                "tokens_in": e.tokens_in,
+                "tokens_out": e.tokens_out,
+                "cost_cents": e.cost_cents,
+                "outcome": e.outcome.as_str(),
+                "human_correction": e.human_correction,
+                "created_at": e.created_at.to_rfc3339(),
+            })
+        })
+        .collect();
+
+    ("200 OK", json!({ "events": events_json }).to_string())
+}
+
+/// `GET /agents/budget` — today's spend per agent (cents + call count + cap).
+async fn agents_budget(cfg: &DaemonConfig, raw: &str) -> (&'static str, String) {
+    if !auth_matches(raw) {
+        return ("401 Unauthorized", r#"{"error":"unauthorized"}"#.to_owned());
+    }
+    let Some(pool) = cfg.db.as_deref() else {
+        return (
+            "503 Service Unavailable",
+            r#"{"error":"database not configured"}"#.to_owned(),
+        );
+    };
+
+    let statuses = match crate::infra::budget::today(pool).await {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                "500 Internal Server Error",
+                json!({ "error": format!("failed to load budget: {e}") }).to_string(),
+            );
+        }
+    };
+
+    let today_json: Vec<serde_json::Value> = statuses
+        .iter()
+        .map(|s| {
+            json!({
+                "agent": s.agent,
+                "spent_cents": s.spent_cents,
+                "cap_cents": s.cap_cents,
+                "calls_today": s.calls_today,
+                "remaining_cents": s.remaining_cents(),
+                "is_blown": s.is_blown(),
+            })
+        })
+        .collect();
+
+    let date = chrono::Utc::now().date_naive().to_string();
+    (
+        "200 OK",
+        json!({ "today": today_json, "date": date }).to_string(),
+    )
+}
+
+/// `GET /agents` — static agent catalogue (name, tier, trigger, implemented).
+/// Wave 4+: replace with dispatcher registry query.
+fn agents_list(raw: &str) -> (&'static str, String) {
+    if !auth_matches(raw) {
+        return ("401 Unauthorized", r#"{"error":"unauthorized"}"#.to_owned());
+    }
+    let body = json!({
+        "agents": [
+            {"name": "chat_dispatcher", "tier": "fast", "implemented": true,  "trigger": "no prefix"},
+            {"name": "director",        "tier": "mid",  "implemented": true,  "trigger": "! prefix"},
+            {"name": "research",        "tier": "fast", "implemented": false, "trigger": "? prefix"},
+            {"name": "calendar",        "tier": "fast", "implemented": false, "trigger": "natural language"},
+        ]
+    });
+    ("200 OK", body.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -2330,5 +2789,37 @@ mod tests {
         assert!(output.contains("***redacted***"));
         assert!(!output.contains("supersecretkey123"));
         std::env::remove_var("GHOST_DAEMON_KEY");
+    }
+
+    #[test]
+    fn next_fire_from_cron_accepts_six_field() {
+        // Every day at 09:00:00 UTC.
+        let next = next_fire_from_cron("0 0 9 * * *").expect("valid cron must parse");
+        assert!(next > chrono::Utc::now(), "next fire must be in the future");
+    }
+
+    #[test]
+    fn next_fire_from_cron_rejects_invalid() {
+        let err = next_fire_from_cron("not a cron").expect_err("invalid cron must error");
+        assert!(err.contains("invalid cron expression"));
+    }
+
+    #[test]
+    fn next_fire_from_cron_rejects_five_field() {
+        // Classic 5-field cron is not supported by the `cron` crate — the
+        // leading seconds field is mandatory. Pin that contract here so the
+        // /triggers endpoint stays consistent with `infra::scheduler`.
+        let err = next_fire_from_cron("0 9 * * *").expect_err("5-field cron must error");
+        assert!(err.contains("invalid cron expression"));
+    }
+
+    #[test]
+    fn schedulable_agents_includes_future_wave_55() {
+        // Isaac may schedule chief_of_staff / dreamer triggers before those
+        // agents are dispatcher-wired. Rejecting them would force a redeploy
+        // post-Wave-5.5, so they must stay in the allow-list.
+        assert!(SCHEDULABLE_AGENTS.contains(&"chief_of_staff"));
+        assert!(SCHEDULABLE_AGENTS.contains(&"dreamer"));
+        assert!(SCHEDULABLE_AGENTS.contains(&"chat_dispatcher"));
     }
 }

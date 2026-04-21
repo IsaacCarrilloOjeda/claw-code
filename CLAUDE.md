@@ -18,10 +18,32 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - `scripts/` — PowerShell helpers (Task Scheduler setup, etc.).
 - `src/` and `tests/` — stay consistent with generated guidance and tests.
 
+## Maps (read before writing new files)
+- **`ARCHITECTURE.md`** — file-tree map of every module that exists or will exist, with status
+  markers (`[LIVE]` / `[STUB]` / `[IDLE]` / `[NEW]`) and dependency arrows. Before creating a
+  new file or splitting an existing one, check this map so the change lands in the right layer.
+  If a file exists on disk but isn't in the map, add it in the same PR.
+- `VISION.md` — product/phase plan. `ROADMAP.md`, `PIPELINE.md`, `PHILOSOPHY.md` — design docs.
+
 ## Working agreement
 - Prefer small, reviewable changes and keep generated bootstrap files aligned with actual repo workflows.
 - Keep shared defaults in `.claude.json`; reserve `.claude/settings.local.json` for machine-local overrides.
 - Do not overwrite existing `CLAUDE.md` content automatically; update it intentionally when repo workflows change.
+
+## Design rules (locked 2026-04-20)
+These are the structural decisions for the Ghost expansion. See `ARCHITECTURE.md` for the full map.
+- **Agents live inline** at `rust/crates/rusty-claude-cli/src/agents/`. Not a sibling crate.
+- **`director.rs` is a thin facade** over `agents/dispatcher.rs`. The `!` prefix contract stays;
+  the real routing lives in the dispatcher.
+- **Prompt caching ships before any agent work.** Add `cache_control` markers on the stable
+  prefix (core context + personality + Gerald overview) in `chat_dispatcher.rs` and `director.rs`.
+- **Prefix parsing consolidates into `agents/intent.rs`** on the first agent PR — not scattered
+  across `daemon.rs` and `chat_dispatcher.rs` like today.
+- **Budget caps are per-agent per-day.** Hard cap, not soft. Blown budget → fall back or refuse.
+- **Dreamer runs on cron** (MVP). No always-on loops anywhere in the system.
+- **`ghost_events` writes to Postgres every turn, mirrors weekly-condensed to Gerald.**
+- **Transports: SMS + dashboard only.** Telegram, if ever added, is alongside SMS, not a
+  replacement — SMS-specific state (contacts, auto-reply, loadbearing) stays on the SMS path.
 
 ---
 
