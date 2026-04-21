@@ -6,6 +6,7 @@
     clippy::unnecessary_wraps,
     clippy::unused_self
 )]
+mod agents;
 mod bible;
 mod bible_ingest;
 mod chat_dispatcher;
@@ -18,6 +19,7 @@ mod director;
 mod gerald;
 mod guard;
 mod http_client;
+mod infra;
 mod init;
 mod input;
 mod macros;

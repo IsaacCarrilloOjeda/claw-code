@@ -7,6 +7,7 @@
 
 use std::time::Duration;
 
+use crate::agents::Usage;
 use crate::constants::{ANTHROPIC_MESSAGES_URL, HAIKU_MODEL, OPUS_MODEL, SONNET_MODEL};
 
 const AI_TIMEOUT_SECS: u64 = 60;
@@ -34,7 +35,7 @@ pub async fn dispatch(
     _job_id: &str,
     pool: Option<&sqlx::PgPool>,
     sender_phone: Option<&str>,
-) -> Result<String, String> {
+) -> Result<(String, Usage), String> {
     let api_key =
         std::env::var("ANTHROPIC_API_KEY").map_err(|_| "ANTHROPIC_API_KEY not set".to_string())?;
 
@@ -87,21 +88,27 @@ pub async fn dispatch(
         crate::bible::load_bible_context(&polished, query_embedding.as_deref(), pool).await
     };
 
-    let mut system = core_context;
+    // Stable prefix (cached) = core context file. Same text every turn within
+    // a session, so marking it cache_control=ephemeral lets Anthropic reuse
+    // prior input tokens at ~10% cost. Everything per-turn goes in `dynamic`.
+    let stable = core_context;
+    let mut dynamic = String::new();
 
     // Inject sender identity so GHOST knows who it's talking to.
     if let Some(phone) = sender_phone {
         let sender_block = crate::contacts::sender_context(phone);
-        system.push_str("\n\n");
-        system.push_str(&sender_block);
+        dynamic.push_str(&sender_block);
     }
 
     // Inject per-contact notes (e.g., "this is my math teacher").
     if let (Some(phone), Some(p)) = (sender_phone, pool) {
         if let Some(notes) = crate::db::get_contact_notes(p, phone).await {
             if !notes.is_empty() {
-                system.push_str("\n\n## Notes about this contact\n");
-                system.push_str(&notes);
+                if !dynamic.is_empty() {
+                    dynamic.push_str("\n\n");
+                }
+                dynamic.push_str("## Notes about this contact\n");
+                dynamic.push_str(&notes);
             }
         }
     }
@@ -114,12 +121,18 @@ pub async fn dispatch(
         String::new()
     };
     if !schedule_context.is_empty() {
-        system.push_str("\n\n");
-        system.push_str(&schedule_context);
+        if !dynamic.is_empty() {
+            dynamic.push_str("\n\n");
+        }
+        dynamic.push_str(&schedule_context);
     }
 
     if bible_forced && !bible_context.is_empty() {
-        system.push_str("\n\n## Bible study mode\n\
+        if !dynamic.is_empty() {
+            dynamic.push_str("\n\n");
+        }
+        dynamic.push_str(
+            "## Bible study mode\n\
             You are GHOST's Bible study assistant. You have access to the original Hebrew, \
             Aramaic, and Greek texts alongside KJV and WEB English translations.\n\
             When answering Bible questions:\n\
@@ -130,27 +143,35 @@ pub async fn dispatch(
             5. Use cross-references to show how themes connect across scripture\n\
             6. Distinguish between what the text says (factual) and what it means (interpretive)\n\
             7. For interpretive claims, note major scholarly positions rather than picking one\n\
-            8. The lexicon data is from public-domain sources (BDB, Thayer's) — treat as reference, not infallible");
+            8. The lexicon data is from public-domain sources (BDB, Thayer's) — treat as reference, not infallible",
+        );
     }
 
     if !memory_context.is_empty() {
-        system.push_str("\n\n## What you remember about Isaac\n<memory_notes>\n");
+        if !dynamic.is_empty() {
+            dynamic.push_str("\n\n");
+        }
+        dynamic.push_str("## What you remember about Isaac\n<memory_notes>\n");
         // Cap the memory block to prevent a poisoned store from bloating the prompt
         let capped = if memory_context.len() > 4096 {
             &memory_context[..4096]
         } else {
             &memory_context
         };
-        system.push_str(capped);
-        system.push_str("\n</memory_notes>");
+        dynamic.push_str(capped);
+        dynamic.push_str("\n</memory_notes>");
     }
     if !scholar_context.is_empty() {
-        system.push_str("\n\n");
-        system.push_str(&scholar_context);
+        if !dynamic.is_empty() {
+            dynamic.push_str("\n\n");
+        }
+        dynamic.push_str(&scholar_context);
     }
     if !cache_context.is_empty() {
-        system.push_str("\n\n");
-        system.push_str(&cache_context);
+        if !dynamic.is_empty() {
+            dynamic.push_str("\n\n");
+        }
+        dynamic.push_str(&cache_context);
     }
     if web_context.is_empty() {
         eprintln!("[ghost chat] web_context is empty — nothing to inject");
@@ -159,40 +180,52 @@ pub async fn dispatch(
             "[ghost chat] injecting {} bytes of web context",
             web_context.len()
         );
-        system.push_str(
-            "\n\n## Current web search results\nUse these results to answer the user's question:\n",
+        if !dynamic.is_empty() {
+            dynamic.push_str("\n\n");
+        }
+        dynamic.push_str(
+            "## Current web search results\nUse these results to answer the user's question:\n",
         );
-        system.push_str(&web_context);
+        dynamic.push_str(&web_context);
     }
     if !bible_context.is_empty() {
         eprintln!(
             "[ghost chat] injecting {} bytes of Bible context",
             bible_context.len()
         );
-        system.push_str("\n\n");
-        system.push_str(&bible_context);
+        if !dynamic.is_empty() {
+            dynamic.push_str("\n\n");
+        }
+        dynamic.push_str(&bible_context);
     }
+
+    let system = crate::infra::cache::build_cached_system(&stable, &dynamic);
 
     // If !bible prefix was used, send the stripped message to the model
     let user_message = if bible_forced { &bible_msg } else { &polished };
     let mut messages: Vec<serde_json::Value> = history.to_vec();
     messages.push(serde_json::json!({"role": "user", "content": user_message}));
 
-    // Cascade: Haiku → Sonnet → Opus (escalate on low-confidence responses)
+    // Cascade: Haiku → Sonnet → Opus (escalate on low-confidence responses).
+    // Usage accumulates across tiers so the final debit reflects total spend.
     let body = build_request_body(HAIKU_MODEL, &system, &messages);
-    let mut response = call_anthropic(&api_key, &body).await?;
+    let (mut response, mut usage) = call_anthropic(&api_key, &body).await?;
     let mut tier = "haiku";
 
     if crate::compress::is_low_confidence(&response) {
         eprintln!("[ghost chat] haiku low-confidence, escalating to sonnet");
         let body = build_request_body(SONNET_MODEL, &system, &messages);
-        response = call_anthropic(&api_key, &body).await?;
+        let (text, extra) = call_anthropic(&api_key, &body).await?;
+        response = text;
+        usage = add_usage(usage, extra);
         tier = "sonnet";
 
         if crate::compress::is_low_confidence(&response) {
             eprintln!("[ghost chat] sonnet low-confidence, escalating to opus");
             let body = build_request_body(OPUS_MODEL, &system, &messages);
-            response = call_anthropic(&api_key, &body).await?;
+            let (text, extra) = call_anthropic(&api_key, &body).await?;
+            response = text;
+            usage = add_usage(usage, extra);
             tier = "opus";
         }
     }
@@ -233,7 +266,16 @@ pub async fn dispatch(
         });
     }
 
-    Ok(response)
+    Ok((response, usage))
+}
+
+/// Sum two usage blocks (saturating on overflow). Used when the cascade
+/// escalates across tiers and we want the total input/output for the turn.
+fn add_usage(a: Usage, b: Usage) -> Usage {
+    Usage {
+        tokens_in: a.tokens_in.saturating_add(b.tokens_in),
+        tokens_out: a.tokens_out.saturating_add(b.tokens_out),
+    }
 }
 
 /// Embed the incoming message and pull the top-N most relevant memory notes.
@@ -500,7 +542,7 @@ pub(crate) fn load_core_context() -> String {
 
 fn build_request_body(
     model: &str,
-    system: &str,
+    system: &serde_json::Value,
     messages: &[serde_json::Value],
 ) -> serde_json::Value {
     serde_json::json!({
@@ -511,7 +553,10 @@ fn build_request_body(
     })
 }
 
-async fn call_anthropic(api_key: &str, body: &serde_json::Value) -> Result<String, String> {
+async fn call_anthropic(
+    api_key: &str,
+    body: &serde_json::Value,
+) -> Result<(String, Usage), String> {
     let client = crate::http_client::shared_client();
 
     let resp = client
@@ -540,5 +585,14 @@ async fn call_anthropic(api_key: &str, body: &serde_json::Value) -> Result<Strin
         .unwrap_or("(empty response)")
         .to_string();
 
-    Ok(text)
+    let usage_json = &json["usage"];
+    let input = usage_json["input_tokens"].as_u64().unwrap_or(0);
+    let cache_read = usage_json["cache_read_input_tokens"].as_u64().unwrap_or(0);
+    let output = usage_json["output_tokens"].as_u64().unwrap_or(0);
+    let usage = Usage {
+        tokens_in: u32::try_from(input.saturating_add(cache_read)).unwrap_or(u32::MAX),
+        tokens_out: u32::try_from(output).unwrap_or(u32::MAX),
+    };
+
+    Ok((text, usage))
 }
