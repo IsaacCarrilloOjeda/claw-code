@@ -677,6 +677,10 @@ async fn dispatch(
             schedule_delete(cfg, raw, id).await
         }
 
+        // --- Facts box (SMS-shareable singleton blob) ---
+        ("GET", "/facts") => facts_get(cfg, raw).await,
+        ("PUT", "/facts") => facts_put(cfg, raw).await,
+
         // --- Trigger CRUD (Wave 5) ---
         ("GET", "/triggers") => triggers_list(cfg, raw).await,
         ("POST", "/triggers") => trigger_create(cfg, raw).await,
@@ -1427,7 +1431,11 @@ async fn sms_inbound(cfg: &DaemonConfig, raw: &str) -> (&'static str, String) {
             }
             Ok(text) => {
                 // Guard check — review outbound reply before sending.
-                let verdict = crate::guard::check(&process_msg, &text, &phone_from).await;
+                // Pass shareable context so the guard approves info Isaac has
+                // marked public (facts box + schedule) rather than blocking it.
+                let shareable = db::load_shareable_context(&pool_arc).await;
+                let verdict =
+                    crate::guard::check(&process_msg, &text, &phone_from, &shareable).await;
                 let (send_text, was_blocked) = match verdict {
                     crate::guard::GuardVerdict::Allow => (text.clone(), false),
                     crate::guard::GuardVerdict::Block(reason) => {
@@ -1888,6 +1896,73 @@ async fn schedule_delete(cfg: &DaemonConfig, raw: &str, id: &str) -> (&'static s
         ("200 OK", r#"{"status":"deleted"}"#.to_owned())
     } else {
         ("404 Not Found", r#"{"error":"not found"}"#.to_owned())
+    }
+}
+
+/// `GET /facts` -- return the shareable-facts blob.
+async fn facts_get(cfg: &DaemonConfig, raw: &str) -> (&'static str, String) {
+    if !auth_matches(raw) {
+        return ("401 Unauthorized", r#"{"error":"unauthorized"}"#.to_owned());
+    }
+    let Some(pool) = cfg.db.as_deref() else {
+        return (
+            "503 Service Unavailable",
+            r#"{"error":"database not configured"}"#.to_owned(),
+        );
+    };
+    let content = db::get_facts(pool).await;
+    ("200 OK", json!({ "content": content }).to_string())
+}
+
+/// `PUT /facts` -- overwrite the shareable-facts blob.
+async fn facts_put(cfg: &DaemonConfig, raw: &str) -> (&'static str, String) {
+    if !auth_matches(raw) {
+        return ("401 Unauthorized", r#"{"error":"unauthorized"}"#.to_owned());
+    }
+    let Some(pool) = cfg.db.as_deref() else {
+        return (
+            "503 Service Unavailable",
+            r#"{"error":"database not configured"}"#.to_owned(),
+        );
+    };
+
+    let body_str = raw
+        .split_once("\r\n\r\n")
+        .or_else(|| raw.split_once("\n\n"))
+        .map_or("", |(_, b)| b);
+
+    let Ok(body) = serde_json::from_str::<serde_json::Value>(body_str) else {
+        return (
+            "400 Bad Request",
+            r#"{"error":"body must be JSON"}"#.to_owned(),
+        );
+    };
+
+    let Some(content) = body["content"].as_str() else {
+        return (
+            "400 Bad Request",
+            r#"{"error":"missing field: content"}"#.to_owned(),
+        );
+    };
+
+    // Cap at 16 KiB so a runaway paste can't bloat the system prompt on
+    // every SMS turn.
+    if content.len() > 16 * 1024 {
+        return (
+            "413 Payload Too Large",
+            r#"{"error":"facts content exceeds 16 KiB"}"#.to_owned(),
+        );
+    }
+
+    match db::set_facts(pool, content).await {
+        Ok(()) => ("200 OK", r#"{"status":"saved"}"#.to_owned()),
+        Err(e) => {
+            eprintln!("[ghost facts] set_facts failed: {e}");
+            (
+                "500 Internal Server Error",
+                r#"{"error":"failed to save facts"}"#.to_owned(),
+            )
+        }
     }
 }
 

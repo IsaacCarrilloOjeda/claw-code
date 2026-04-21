@@ -127,6 +127,22 @@ pub async fn dispatch(
         dynamic.push_str(&schedule_context);
     }
 
+    // Facts box: Isaac-curated shareable facts. These are approved to share
+    // with anyone (the guard sees the same block), so GHOST can answer
+    // questions naturally instead of deflecting.
+    let facts = if let Some(p) = pool {
+        crate::db::get_facts(p).await
+    } else {
+        String::new()
+    };
+    if !facts.trim().is_empty() {
+        if !dynamic.is_empty() {
+            dynamic.push_str("\n\n");
+        }
+        dynamic.push_str("## Facts about Isaac (shareable)\n");
+        dynamic.push_str(&facts);
+    }
+
     if bible_forced && !bible_context.is_empty() {
         if !dynamic.is_empty() {
             dynamic.push_str("\n\n");

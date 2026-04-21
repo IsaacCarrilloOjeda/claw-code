@@ -681,12 +681,119 @@ function SmsSchedulePanel({ daemonKey, entries, setEntries, onClose }) {
   )
 }
 
+function SmsFactsPanel({ daemonKey, onClose }) {
+  const [content, setContent] = useState('')
+  const [loading, setLoading] = useState(true)
+  const [saving, setSaving] = useState(false)
+  const [saved, setSaved] = useState(false)
+  const [dirty, setDirty] = useState(false)
+
+  useEffect(() => {
+    let cancelled = false
+    ;(async () => {
+      try {
+        const data = await apiFetch('/facts', {}, daemonKey)
+        if (!cancelled) setContent(data?.content || '')
+      } catch { /* ignore */ }
+      if (!cancelled) setLoading(false)
+    })()
+    return () => { cancelled = true }
+  }, [daemonKey])
+
+  async function save() {
+    setSaving(true)
+    setSaved(false)
+    try {
+      await apiFetch('/facts', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content }),
+      }, daemonKey)
+      setSaved(true)
+      setDirty(false)
+      setTimeout(() => setSaved(false), 1500)
+    } catch { /* ignore */ }
+    setSaving(false)
+  }
+
+  return (
+    <>
+      <div
+        onClick={onClose}
+        style={{ position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.4)', zIndex: 10 }}
+      />
+      <div style={{
+        position: 'absolute', top: 0, right: 0, bottom: 0,
+        width: 360, background: 'var(--surface)',
+        borderLeft: '1px solid var(--border)',
+        zIndex: 11, display: 'flex', flexDirection: 'column',
+        overflow: 'hidden',
+      }}>
+        <div style={{
+          flexShrink: 0, padding: '14px 16px',
+          borderBottom: '1px solid var(--border)',
+          display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+        }}>
+          <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-bright)' }}>Facts</span>
+          <span
+            onClick={onClose}
+            style={{ color: 'var(--text-dim)', cursor: 'pointer', fontSize: 14, lineHeight: 1 }}
+            onMouseEnter={e => e.target.style.color = 'var(--text)'}
+            onMouseLeave={e => e.target.style.color = 'var(--text-dim)'}
+          >x</span>
+        </div>
+
+        <div style={{ flex: 1, display: 'flex', flexDirection: 'column', padding: '16px', gap: 10, overflow: 'hidden' }}>
+          <div style={{ fontSize: 11, color: 'var(--text-dim)', lineHeight: 1.5 }}>
+            Shareable facts about you. GHOST uses these to answer questions on your behalf,
+            and the outbound guard treats anything here as approved to share.
+            <br /><br />
+            Do NOT put passwords, addresses, or financial info — those are blocked regardless.
+          </div>
+          <textarea
+            value={content}
+            onChange={e => { setContent(e.target.value); setDirty(true) }}
+            disabled={loading}
+            placeholder={loading ? 'loading...' : 'Example:\n- In school until 3:30 on weekdays\n- Usually free after 4pm\n- Works on RC Concrete job sites Saturdays\n- Prefers text over call'}
+            style={{
+              flex: 1, minHeight: 0, resize: 'none',
+              fontFamily: 'var(--sans)', fontSize: 12, lineHeight: 1.5,
+              background: 'var(--bg)', color: 'var(--text)',
+              border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)',
+              padding: '10px 12px', outline: 'none',
+            }}
+          />
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <button
+              onClick={save}
+              disabled={saving || loading || !dirty}
+              style={{
+                padding: '6px 14px', fontSize: 11, fontWeight: 600,
+                background: (dirty && !saving) ? 'var(--accent)' : 'var(--border)',
+                color: (dirty && !saving) ? 'var(--bg)' : 'var(--text-dim)',
+                border: 'none', borderRadius: 'var(--radius-sm)',
+                cursor: (dirty && !saving) ? 'pointer' : 'default',
+              }}
+            >{saving ? 'saving...' : 'SAVE'}</button>
+            {saved && <span style={{ fontSize: 10, color: 'var(--accent)' }}>saved</span>}
+            {dirty && !saved && !saving && <span style={{ fontSize: 10, color: 'var(--text-dim)' }}>unsaved</span>}
+            <span style={{ marginLeft: 'auto', fontSize: 10, color: 'var(--text-dim)' }}>
+              {content.length}/16384
+            </span>
+          </div>
+        </div>
+      </div>
+    </>
+  )
+}
+
 export default function SmsPanel({ daemonKey }) {
   const [contacts, setContacts] = useState([])
   const [loading, setLoading] = useState(true)
   const [selectedPhone, setSelectedPhone] = useState(null)
   const [search, setSearch] = useState('')
   const [showSchedule, setShowSchedule] = useState(false)
+  const [showFacts, setShowFacts] = useState(false)
   const [showAddForm, setShowAddForm] = useState(false)
   const [convos, setConvos] = useState({}) // { [phone]: { messages: [], hasMore: bool, loading: bool } }
   const [scheduleEntries, setScheduleEntries] = useState([])
@@ -900,6 +1007,19 @@ export default function SmsPanel({ daemonKey }) {
               onMouseEnter={e => { if (!showSchedule) e.target.style.color = 'var(--accent)' }}
               onMouseLeave={e => { if (!showSchedule) e.target.style.color = showSchedule ? 'var(--accent)' : 'var(--text-dim)' }}
             >SCHED</span>
+            <span
+              onClick={() => setShowFacts(!showFacts)}
+              style={{
+                fontSize: 10, fontWeight: 600, padding: '4px 8px',
+                color: showFacts ? 'var(--accent)' : 'var(--text-dim)',
+                cursor: 'pointer', letterSpacing: '0.04em',
+                background: showFacts ? 'var(--accent-dim)' : 'transparent',
+                borderRadius: 'var(--radius-sm)',
+                transition: 'all var(--transition)',
+              }}
+              onMouseEnter={e => { if (!showFacts) e.target.style.color = 'var(--accent)' }}
+              onMouseLeave={e => { if (!showFacts) e.target.style.color = showFacts ? 'var(--accent)' : 'var(--text-dim)' }}
+            >FACTS</span>
           </div>
           {showAddForm && <SmsAddForm onAdd={addContact} onCancel={() => setShowAddForm(false)} />}
         </div>
@@ -959,6 +1079,14 @@ export default function SmsPanel({ daemonKey }) {
           entries={scheduleEntries}
           setEntries={setScheduleEntries}
           onClose={() => setShowSchedule(false)}
+        />
+      )}
+
+      {/* Facts overlay */}
+      {showFacts && (
+        <SmsFactsPanel
+          daemonKey={daemonKey}
+          onClose={() => setShowFacts(false)}
         />
       )}
     </div>

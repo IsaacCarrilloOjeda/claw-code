@@ -1689,6 +1689,43 @@ pub async fn load_schedule_context(pool: &PgPool) -> String {
     out
 }
 
+/// Fetch the singleton facts blob. Empty string if nothing set yet.
+pub async fn get_facts(pool: &PgPool) -> String {
+    sqlx::query_scalar::<_, String>("SELECT content FROM sms_facts WHERE id = 1")
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default()
+}
+
+/// Upsert the singleton facts blob.
+pub async fn set_facts(pool: &PgPool, content: &str) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO sms_facts (id, content, updated_at)
+         VALUES (1, $1, now())
+         ON CONFLICT (id) DO UPDATE
+         SET content = EXCLUDED.content, updated_at = now()",
+    )
+    .bind(content)
+    .execute(pool)
+    .await
+    .map(|_| ())
+}
+
+/// Combined shareable context for the outbound guard: facts block first,
+/// then today's schedule. Both blocks are optional — either may be empty.
+pub async fn load_shareable_context(pool: &PgPool) -> String {
+    let facts = get_facts(pool).await;
+    let schedule = load_schedule_context(pool).await;
+    match (facts.trim().is_empty(), schedule.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => format!("## Facts about Isaac\n{facts}"),
+        (true, false) => schedule,
+        (false, false) => format!("## Facts about Isaac\n{facts}\n\n{schedule}"),
+    }
+}
+
 /// List all schedule entries (for dashboard display).
 /// Returns persistent entries first, then daily entries sorted by date desc.
 pub async fn list_schedule_entries(pool: &PgPool) -> Vec<ScheduleEntry> {
