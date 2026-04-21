@@ -48,7 +48,14 @@ Schema:\n\
 }\n\
 \n\
 Keep legs minimal — 1 to 3 max. If the ask needs only one agent, still\n\
-emit a single-leg plan. If none of the above agents fit, emit { \"goal\": \"...\", \"legs\": [] }.";
+emit a single-leg plan. If none of the above agents fit, emit { \"goal\": \"...\", \"legs\": [] }.\n\
+\n\
+CRITICAL — schema keys must be exact:\n\
+- Each leg has exactly two fields: \"agent\" and \"prompt\". The payload field\n\
+  is ALWAYS named \"prompt\" — never \"create\", \"action\", \"task\", \"command\",\n\
+  or any action-verb key. The verb goes in the value, not the key.\n\
+- Emit exactly one JSON object. Do not correct yourself, do not emit a second\n\
+  block, do not narrate between blocks. One response, one object, done.";
 
 const COMPOSE_SYSTEM_PROMPT: &str =
     "You are the Chief of Staff. You just orchestrated sub-agents to answer\n\
@@ -154,8 +161,8 @@ pub(crate) fn format_leg_message(leg: &PlanLeg) -> String {
 }
 
 /// Strip a leading Markdown code fence (```json or bare ```) and any trailing
-/// ``` fence that wraps the body. Sonnet sometimes wraps JSON in a fenced
-/// block despite the system prompt asking for raw JSON.
+/// ``` fence that wraps the body. Used as the no-fence-found fallback in
+/// `parse_plan`; the multi-fence case is handled by `extract_fenced_blocks`.
 pub(crate) fn strip_code_fence(raw: &str) -> String {
     let trimmed = raw.trim();
     let after_open: &str = if let Some(rest) = trimmed.strip_prefix("```json") {
@@ -170,10 +177,57 @@ pub(crate) fn strip_code_fence(raw: &str) -> String {
     body.trim().to_string()
 }
 
+/// Return every ```...``` fenced block body from `raw`, in document order.
+/// Accepts both ```json and bare ``` fences. Returns an empty Vec if no
+/// complete fenced blocks are present.
+pub(crate) fn extract_fenced_blocks(raw: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cursor = raw;
+    while let Some(open) = cursor.find("```") {
+        let after = &cursor[open + 3..];
+        // Skip an optional language tag ("json", "") until the first newline.
+        let body_start = after.find('\n').map_or(after.len(), |i| i + 1);
+        let body = &after[body_start..];
+        let Some(close) = body.find("```") else {
+            break;
+        };
+        let block = body[..close].trim();
+        if !block.is_empty() {
+            out.push(block.to_string());
+        }
+        cursor = &body[close + 3..];
+    }
+    out
+}
+
 pub(crate) fn parse_plan(raw: &str) -> Result<Plan, String> {
-    let cleaned = strip_code_fence(raw);
-    serde_json::from_str::<Plan>(&cleaned)
-        .map_err(|e| format!("could not parse Chief of Staff plan: {e}: raw = {raw}"))
+    // Sonnet occasionally emits a malformed block, narrates a self-correction,
+    // then emits a corrected block. Try every fenced candidate in order —
+    // last valid parse wins. Falls back to fence-stripping the whole response
+    // for the no-fence case.
+    let mut candidates = extract_fenced_blocks(raw);
+    if candidates.is_empty() {
+        candidates.push(strip_code_fence(raw));
+    }
+
+    let mut last_err: Option<serde_json::Error> = None;
+    let mut last_ok: Option<Plan> = None;
+    for c in &candidates {
+        match serde_json::from_str::<Plan>(c) {
+            Ok(p) => last_ok = Some(p),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    if let Some(plan) = last_ok {
+        return Ok(plan);
+    }
+    let detail = last_err.map_or_else(
+        || "no JSON candidates found".to_string(),
+        |e| e.to_string(),
+    );
+    Err(format!(
+        "could not parse Chief of Staff plan: {detail}: raw = {raw}"
+    ))
 }
 
 async fn build_plan(api_key: &str, user_msg: &str) -> Result<(Plan, Usage), String> {
@@ -345,6 +399,56 @@ mod tests {
         let raw = "not json at all";
         let err = parse_plan(raw).expect_err("should fail");
         assert!(err.contains("raw = not json at all"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_plan_prefers_last_valid_fenced_block() {
+        // Exact failure mode observed in prod: Sonnet emitted a first block
+        // with the wrong schema key (`create` instead of `prompt`), narrated
+        // "Wait, let me correct the schema:", then emitted a valid block.
+        // The parser must rescue the second block.
+        let raw = "```json\n\
+{\n\
+  \"goal\": \"Plan a 3-hour study block\",\n\
+  \"legs\": [\n\
+    { \"agent\": \"calendar\", \"create\": \"bad key\" }\n\
+  ]\n\
+}\n\
+```\n\
+\n\
+Wait, let me correct the schema:\n\
+\n\
+```json\n\
+{\n\
+  \"goal\": \"Plan a 3-hour study block\",\n\
+  \"legs\": [\n\
+    { \"agent\": \"calendar\", \"prompt\": \"create \\\"Study Block\\\" at 2025-01-27T09:00:00 for 3h\" }\n\
+  ]\n\
+}\n\
+```";
+        let plan = parse_plan(raw).expect("should rescue the corrected second block");
+        assert_eq!(plan.legs.len(), 1);
+        assert_eq!(plan.legs[0].agent, "calendar");
+        assert!(
+            plan.legs[0].prompt.starts_with("create \"Study Block\""),
+            "expected prompt from the corrected block, got: {}",
+            plan.legs[0].prompt
+        );
+    }
+
+    #[test]
+    fn extract_fenced_blocks_returns_bodies_in_order() {
+        let raw = "```json\n{\"a\":1}\n```\n\nsome prose\n\n```\n{\"b\":2}\n```";
+        let blocks = extract_fenced_blocks(raw);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0], "{\"a\":1}");
+        assert_eq!(blocks[1], "{\"b\":2}");
+    }
+
+    #[test]
+    fn extract_fenced_blocks_empty_on_no_fences() {
+        assert!(extract_fenced_blocks("just prose, no fences").is_empty());
+        assert!(extract_fenced_blocks("").is_empty());
     }
 
     #[test]
