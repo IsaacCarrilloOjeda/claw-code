@@ -9,7 +9,7 @@ export default function AboutPanel() {
 
       <div style={{ display: 'flex', flexDirection: 'column', gap: 12, fontSize: 12, color: 'var(--text)' }}>
         <p style={{ lineHeight: 1.6 }}>
-          GHOST is a personal AI operating system. Routes requests through a Director AI to specialist agents for code, email, calendar, research, and more.
+          GHOST is a personal AI operating system. Routes requests through prefix-based intent classification to specialist agents for chat, research, calendar, planning, and more.
         </p>
 
         <div style={{
@@ -24,15 +24,17 @@ export default function AboutPanel() {
           <div style={{ display: 'flex', flexDirection: 'column', gap: 4, fontFamily: 'var(--mono)', fontSize: 11 }}>
             {AGENTS.map(a => (
               <div key={a.id} style={{ display: 'flex', gap: 8 }}>
-                <span style={{ color: a.color, width: 70 }}>{a.label}</span>
+                <span style={{ color: a.color, width: 110 }}>{a.label}</span>
+                <span style={{ color: 'var(--text-dim)', width: 70 }}>{a.trigger}</span>
                 <span style={{ color: 'var(--text-muted)' }}>
-                  {a.id === 'echo' && 'General chat, default agent'}
-                  {a.id === 'research' && 'Brave Search, web synthesis'}
-                  {a.id === 'email' && 'Gmail read, draft, send'}
+                  {a.id === 'chat' && 'Default Haiku chat with memory'}
+                  {a.id === 'director' && 'Sonnet routing + self-correction'}
+                  {a.id === 'research' && 'Web search + synthesis'}
                   {a.id === 'calendar' && 'Google Calendar CRUD'}
-                  {a.id === 'code' && 'DeepSeek + E2B sandbox'}
-                  {a.id === 'itguide' && 'Step-by-step navigation'}
-                  {a.id === 'law' && 'US legal research + citations'}
+                  {a.id === 'chief_of_staff' && 'Planning, multi-step tasks'}
+                  {a.id === 'docs' && 'Google Drive / Docs ops'}
+                  {a.id === 'dreamer' && 'Scheduled reflection / memory consolidation'}
+                  {a.id === 'scheduled' && 'Cron-triggered tasks'}
                 </span>
               </div>
             ))}

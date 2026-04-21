@@ -53,9 +53,9 @@ export default function SettingsPanel() {
       <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
         <SettingRow label="Job status banner" description="Show in-flight job status below the top bar" defaultOn={true} />
         <SettingRow label="Auto-switch tabs" description="Switch to agent preview tab on response" defaultOn={false} />
-        <SettingRow label="Agent thinking (Echo)" description="Stream narrated reasoning for Echo agent" defaultOn={false} />
+        <SettingRow label="Agent thinking (Chat)" description="Stream narrated reasoning for Chat agent" defaultOn={false} />
         <SettingRow label="Agent thinking (Research)" description="Stream narrated reasoning for Research agent" defaultOn={true} />
-        <SettingRow label="Agent thinking (Code)" description="Stream narrated reasoning for Code agent" defaultOn={true} />
+        <SettingRow label="Agent thinking (Director)" description="Stream narrated reasoning for Director routing" defaultOn={true} />
       </div>
     </div>
   )

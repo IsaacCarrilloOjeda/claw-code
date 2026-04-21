@@ -972,7 +972,7 @@ export default function SmsPanel({ daemonKey }) {
               value={search}
               onChange={e => setSearch(e.target.value)}
               style={{
-                flex: 1, fontFamily: 'var(--mono)', fontSize: 11,
+                flex: 1, minWidth: 0, fontFamily: 'var(--mono)', fontSize: 11,
                 background: 'var(--surface)', color: 'var(--text)',
                 border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)',
                 padding: '6px 8px', outline: 'none',
@@ -982,44 +982,50 @@ export default function SmsPanel({ daemonKey }) {
             />
             <span
               onClick={() => { loadContacts(); if (selectedPhone) loadConversation(selectedPhone) }}
-              style={{ color: 'var(--text-dim)', cursor: 'pointer', fontSize: 12, padding: '4px', lineHeight: 1 }}
+              style={{ color: 'var(--text-dim)', cursor: 'pointer', fontSize: 12, padding: '4px', lineHeight: 1, flexShrink: 0 }}
               onMouseEnter={e => e.target.style.color = 'var(--accent)'}
               onMouseLeave={e => e.target.style.color = 'var(--text-dim)'}
               title="Refresh"
             >{'\u21BB'}</span>
             <span
               onClick={() => setShowAddForm(!showAddForm)}
-              style={{ color: 'var(--text-dim)', cursor: 'pointer', fontSize: 16, fontWeight: 600, padding: '2px 4px', lineHeight: 1 }}
+              style={{ color: 'var(--text-dim)', cursor: 'pointer', fontSize: 16, fontWeight: 600, padding: '2px 4px', lineHeight: 1, flexShrink: 0 }}
               onMouseEnter={e => e.target.style.color = 'var(--accent)'}
               onMouseLeave={e => e.target.style.color = 'var(--text-dim)'}
               title="Add contact"
             >+</span>
-            <span
+          </div>
+          <div style={{ display: 'flex', gap: 6 }}>
+            <button
               onClick={() => { setShowSchedule(!showSchedule); if (!showSchedule) loadSchedule() }}
               style={{
-                fontSize: 10, fontWeight: 600, padding: '4px 8px',
+                flex: 1, fontSize: 10, fontWeight: 600, padding: '5px 0',
                 color: showSchedule ? 'var(--accent)' : 'var(--text-dim)',
                 cursor: 'pointer', letterSpacing: '0.04em',
                 background: showSchedule ? 'var(--accent-dim)' : 'transparent',
+                border: '1px solid var(--border)',
                 borderRadius: 'var(--radius-sm)',
                 transition: 'all var(--transition)',
+                fontFamily: 'var(--sans)',
               }}
-              onMouseEnter={e => { if (!showSchedule) e.target.style.color = 'var(--accent)' }}
-              onMouseLeave={e => { if (!showSchedule) e.target.style.color = showSchedule ? 'var(--accent)' : 'var(--text-dim)' }}
-            >SCHED</span>
-            <span
+              onMouseEnter={e => { if (!showSchedule) e.currentTarget.style.color = 'var(--accent)' }}
+              onMouseLeave={e => { if (!showSchedule) e.currentTarget.style.color = 'var(--text-dim)' }}
+            >SCHEDULE</button>
+            <button
               onClick={() => setShowFacts(!showFacts)}
               style={{
-                fontSize: 10, fontWeight: 600, padding: '4px 8px',
+                flex: 1, fontSize: 10, fontWeight: 600, padding: '5px 0',
                 color: showFacts ? 'var(--accent)' : 'var(--text-dim)',
                 cursor: 'pointer', letterSpacing: '0.04em',
                 background: showFacts ? 'var(--accent-dim)' : 'transparent',
+                border: '1px solid var(--border)',
                 borderRadius: 'var(--radius-sm)',
                 transition: 'all var(--transition)',
+                fontFamily: 'var(--sans)',
               }}
-              onMouseEnter={e => { if (!showFacts) e.target.style.color = 'var(--accent)' }}
-              onMouseLeave={e => { if (!showFacts) e.target.style.color = showFacts ? 'var(--accent)' : 'var(--text-dim)' }}
-            >FACTS</span>
+              onMouseEnter={e => { if (!showFacts) e.currentTarget.style.color = 'var(--accent)' }}
+              onMouseLeave={e => { if (!showFacts) e.currentTarget.style.color = 'var(--text-dim)' }}
+            >FACTS</button>
           </div>
           {showAddForm && <SmsAddForm onAdd={addContact} onCancel={() => setShowAddForm(false)} />}
         </div>

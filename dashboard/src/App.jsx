@@ -36,7 +36,7 @@ export default function App() {
   const [activeNav, setActiveNav] = useState(null) // 'sms' | 'events' | 'budget' | 'agents' | 'settings' | 'statistics' | 'about' | null
 
   // Chat state
-  const [selectedAgents, setSelectedAgents] = useState(['echo'])
+  const [selectedAgents, setSelectedAgents] = useState(['chat'])
   const [agentsCollapsed, setAgentsCollapsed] = useState(false)
   const [running, setRunning] = useState(false)
 
@@ -129,10 +129,10 @@ export default function App() {
     })))
 
     setRunning(true)
-    const agentLabel = selectedAgents[0] || 'echo'
+    const agentLabel = selectedAgents[0] || 'chat'
 
     const startTime = Date.now()
-    setActiveJob({ agent: AGENTS.find(a => a.id === agentLabel)?.label ?? 'Echo', status: 'running', elapsed: 0 })
+    setActiveJob({ agent: AGENTS.find(a => a.id === agentLabel)?.label ?? 'Chat', status: 'running', elapsed: 0 })
     const jobInterval = setInterval(() => {
       setActiveJob(prev => prev ? { ...prev, elapsed: Math.floor((Date.now() - startTime) / 1000) } : null)
     }, 1000)

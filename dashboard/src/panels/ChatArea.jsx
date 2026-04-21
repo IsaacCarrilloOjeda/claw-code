@@ -34,7 +34,7 @@ function ChatThread({ messages, running, alive, selectedAgents, onSend }) {
   }
 
   const activeAgentLabel = useMemo(() => {
-    if (selectedAgents.length === 0) return 'Echo'
+    if (selectedAgents.length === 0) return 'Chat'
     return selectedAgents.map(id => AGENTS.find(a => a.id === id)?.label ?? id).join(' + ')
   }, [selectedAgents])
 
@@ -100,7 +100,9 @@ function ChatThread({ messages, running, alive, selectedAgents, onSend }) {
                   }}>
                     {msg.role === 'error'
                       ? 'error'
-                      : (!msg.agent || msg.agent === 'echo' ? 'Echo' : `Echo | ${msg.agent}`)}
+                      : (!msg.agent || msg.agent === 'chat'
+                          ? 'Chat'
+                          : (AGENTS.find(a => a.id === msg.agent)?.label ?? msg.agent))}
                   </span>
                   {msg.job_id && (
                     <span style={{ color: 'var(--text-dim)', fontFamily: 'var(--mono)', fontSize: 9 }}>
@@ -269,108 +271,43 @@ function AgentToggles({ selected, onToggle, collapsed, onCollapseToggle }) {
   )
 }
 
+const PREVIEW_HEADINGS = {
+  chat:           'CHAT',
+  director:       'DIRECTOR',
+  research:       'RESEARCH RESULTS',
+  calendar:       'CALENDAR',
+  chief_of_staff: 'PLAN',
+  docs:           'DOCS',
+  dreamer:        'REFLECTIONS',
+  scheduled:      'SCHEDULED TASKS',
+}
+
+const PREVIEW_EMPTY = {
+  chat:           'no preview',
+  director:       'no routing decision yet',
+  research:       'no results yet',
+  calendar:       'no events loaded',
+  chief_of_staff: 'no plan yet',
+  docs:           'no documents loaded',
+  dreamer:        'no reflections yet',
+  scheduled:      'no scheduled tasks',
+}
+
 function PreviewTab({ selectedAgents }) {
-  const primary = selectedAgents[0] || 'echo'
+  const primary = selectedAgents[0] || 'chat'
   const agent = AGENTS.find(a => a.id === primary)
-  const label = agent?.label ?? 'Echo'
   const color = agent?.color ?? 'var(--accent)'
+  const heading = PREVIEW_HEADINGS[primary] ?? (agent?.label.toUpperCase() ?? 'PREVIEW')
+  const empty = PREVIEW_EMPTY[primary] ?? 'no preview'
 
-  if (primary === 'code') {
-    return (
-      <div style={{
-        flex: 1, display: 'flex', flexDirection: 'column',
-        background: '#0a0a0a',
-        fontFamily: 'var(--mono)',
-        fontSize: 12,
-        color: 'var(--text-dim)',
-        padding: 20,
-      }}>
-        <div style={{ color, fontSize: 10, fontWeight: 600, letterSpacing: '0.06em', marginBottom: 12 }}>
-          CODE TERMINAL
-        </div>
-        <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-          no output yet
-        </div>
-      </div>
-    )
-  }
-
-  if (primary === 'email') {
-    return (
-      <div style={{ flex: 1, padding: 20 }}>
-        <div style={{ color, fontSize: 10, fontWeight: 600, letterSpacing: '0.06em', marginBottom: 16 }}>
-          EMAIL DRAFTS
-        </div>
-        <div style={{
-          background: 'var(--surface-2)',
-          border: '1px solid var(--border)',
-          borderRadius: 'var(--radius)',
-          padding: 16,
-          color: 'var(--text-dim)',
-          fontSize: 12,
-        }}>
-          no drafts yet
-        </div>
-      </div>
-    )
-  }
-
-  if (primary === 'research') {
-    return (
-      <div style={{ flex: 1, padding: 20 }}>
-        <div style={{ color, fontSize: 10, fontWeight: 600, letterSpacing: '0.06em', marginBottom: 16 }}>
-          RESEARCH RESULTS
-        </div>
-        <div style={{ color: 'var(--text-dim)', fontSize: 12 }}>
-          no results yet
-        </div>
-      </div>
-    )
-  }
-
-  if (primary === 'calendar') {
-    return (
-      <div style={{ flex: 1, padding: 20 }}>
-        <div style={{ color, fontSize: 10, fontWeight: 600, letterSpacing: '0.06em', marginBottom: 16 }}>
-          CALENDAR
-        </div>
-        <div style={{ color: 'var(--text-dim)', fontSize: 12 }}>
-          no events loaded
-        </div>
-      </div>
-    )
-  }
-
-  if (primary === 'itguide') {
-    return (
-      <div style={{ flex: 1, padding: 20 }}>
-        <div style={{ color, fontSize: 10, fontWeight: 600, letterSpacing: '0.06em', marginBottom: 16 }}>
-          STEP MAP
-        </div>
-        <div style={{ color: 'var(--text-dim)', fontSize: 12 }}>
-          no steps yet
-        </div>
-      </div>
-    )
-  }
-
-  if (primary === 'law') {
-    return (
-      <div style={{ flex: 1, padding: 20 }}>
-        <div style={{ color, fontSize: 10, fontWeight: 600, letterSpacing: '0.06em', marginBottom: 16 }}>
-          LEGAL CITATIONS
-        </div>
-        <div style={{ color: 'var(--text-dim)', fontSize: 12 }}>
-          no citations yet
-        </div>
-      </div>
-    )
-  }
-
-  // echo / default
   return (
-    <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--text-dim)', fontSize: 12 }}>
-      {label} preview
+    <div style={{ flex: 1, padding: 20 }}>
+      <div style={{ color, fontSize: 10, fontWeight: 600, letterSpacing: '0.06em', marginBottom: 16 }}>
+        {heading}
+      </div>
+      <div style={{ color: 'var(--text-dim)', fontSize: 12 }}>
+        {empty}
+      </div>
     </div>
   )
 }
@@ -379,18 +316,21 @@ function ContextTab({ selectedAgents }) {
   const [coreExpanded, setCoreExpanded] = useState(false)
   const [memExpanded, setMemExpanded] = useState(false)
 
+  // Planned tools per agent. `chat` lines up with `chat_dispatcher` in the
+  // Rust backend; the rest correspond to `Intent::*` variants in `agents/intent.rs`.
   const toolsByAgent = {
-    echo: ['chat_dispatcher', 'memory_search'],
-    research: ['brave_search', 'page_reader', 'summarize'],
-    email: ['gmail_read', 'gmail_draft', 'gmail_send'],
-    calendar: ['gcal_read', 'gcal_create', 'gcal_edit', 'gcal_delete'],
-    code: ['e2b_execute', 'file_write', 'github_push'],
-    itguide: ['brave_search', 'screenshot_read', 'step_map'],
-    law: ['cornell_search', 'case_lookup', 'citation_format'],
+    chat:           ['chat_dispatcher', 'memory_search'],
+    director:       ['sonnet_reply', 'route_correct'],
+    research:       ['brave_search', 'page_reader', 'summarize'],
+    calendar:       ['gcal_read', 'gcal_create', 'gcal_edit', 'gcal_delete'],
+    chief_of_staff: ['plan_build', 'plan_execute', 'memory_search'],
+    docs:           ['drive_read', 'docs_edit', 'docs_create'],
+    dreamer:        ['memory_consolidate', 'ghost_events_read'],
+    scheduled:      ['cron_trigger', 'job_dispatch'],
   }
 
-  const primary = selectedAgents[0] || 'echo'
-  const tools = toolsByAgent[primary] || toolsByAgent.echo
+  const primary = selectedAgents[0] || 'chat'
+  const tools = toolsByAgent[primary] || toolsByAgent.chat
 
   return (
     <div style={{ flex: 1, padding: 20, overflowY: 'auto' }}>
@@ -514,25 +454,23 @@ export default function ChatArea({
 
   function handleAgentToggle(agentId) {
     setSelectedAgents(prev => {
-      if (agentId === 'echo') {
-        // Toggling Echo: if it's the only one, keep it. If others are on, toggle echo off/on.
-        if (prev.includes('echo')) {
-          const without = prev.filter(id => id !== 'echo')
-          return without.length === 0 ? ['echo'] : without
+      if (agentId === 'chat') {
+        if (prev.includes('chat')) {
+          const without = prev.filter(id => id !== 'chat')
+          return without.length === 0 ? ['chat'] : without
         }
-        return [...prev, 'echo']
+        return [...prev, 'chat']
       }
       // Specialist toggle
       if (prev.includes(agentId)) {
         const without = prev.filter(id => id !== agentId)
-        return without.length === 0 ? ['echo'] : without
+        return without.length === 0 ? ['chat'] : without
       }
-      // Max: echo + one specialist
-      const specialists = prev.filter(id => id !== 'echo')
+      // Max: chat + one specialist
+      const specialists = prev.filter(id => id !== 'chat')
       if (specialists.length >= 1) {
-        // Replace the specialist
-        const hasEcho = prev.includes('echo')
-        return hasEcho ? ['echo', agentId] : [agentId]
+        const hasChat = prev.includes('chat')
+        return hasChat ? ['chat', agentId] : [agentId]
       }
       return [...prev, agentId]
     })

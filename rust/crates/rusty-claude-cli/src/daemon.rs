@@ -2336,12 +2336,18 @@ fn agents_list(raw: &str) -> (&'static str, String) {
     if !auth_matches(raw) {
         return ("401 Unauthorized", r#"{"error":"unauthorized"}"#.to_owned());
     }
+    // Keep in sync with `crate::agents::intent::Intent` variants and
+    // `crate::agents::dispatcher::Dispatcher::dispatch` tier assignments.
     let body = json!({
         "agents": [
-            {"name": "chat_dispatcher", "tier": "fast", "implemented": true,  "trigger": "no prefix"},
-            {"name": "director",        "tier": "mid",  "implemented": true,  "trigger": "! prefix"},
-            {"name": "research",        "tier": "fast", "implemented": false, "trigger": "? prefix"},
-            {"name": "calendar",        "tier": "fast", "implemented": false, "trigger": "natural language"},
+            {"name": "chat",           "tier": "fast", "implemented": true,  "trigger": "no prefix"},
+            {"name": "director",       "tier": "mid",  "implemented": true,  "trigger": "! prefix"},
+            {"name": "research",       "tier": "fast", "implemented": true,  "trigger": "? prefix"},
+            {"name": "calendar",       "tier": "fast", "implemented": true,  "trigger": "@ prefix"},
+            {"name": "chief_of_staff", "tier": "mid",  "implemented": true,  "trigger": "# prefix"},
+            {"name": "docs",           "tier": "fast", "implemented": true,  "trigger": "& prefix"},
+            {"name": "dreamer",        "tier": "mid",  "implemented": true,  "trigger": "~ prefix"},
+            {"name": "scheduled",      "tier": "fast", "implemented": false, "trigger": "> prefix"},
         ]
     });
     ("200 OK", body.to_string())

@@ -4,14 +4,17 @@ export const API = import.meta.env.VITE_DAEMON_URL || 'http://127.0.0.1:7878'
 export const STORAGE_KEY = 'ghost-daemon-key'
 export const PROJECTS_KEY = 'ghost-projects'
 
+// IDs match backend `Intent` variants in `rust/crates/rusty-claude-cli/src/agents/intent.rs`.
+// Triggers match the prefix parser in the same file.
 export const AGENTS = [
-  { id: 'echo',     label: 'Echo',     color: '#2dd4bf' },
-  { id: 'research', label: 'Research', color: '#3b82f6' },
-  { id: 'email',    label: 'Email',    color: '#a78bfa' },
-  { id: 'calendar', label: 'Calendar', color: '#f59e0b' },
-  { id: 'code',     label: 'Code',     color: '#34d399' },
-  { id: 'itguide',  label: 'IT Guide', color: '#22d3ee' },
-  { id: 'law',      label: 'Law',      color: '#f43f5e' },
+  { id: 'chat',           label: 'Chat',           trigger: '(no prefix)', color: '#2dd4bf' },
+  { id: 'director',       label: 'Director',       trigger: '!',           color: '#a78bfa' },
+  { id: 'research',       label: 'Research',       trigger: '?',           color: '#3b82f6' },
+  { id: 'calendar',       label: 'Calendar',       trigger: '@',           color: '#f59e0b' },
+  { id: 'chief_of_staff', label: 'Chief of Staff', trigger: '#',           color: '#34d399' },
+  { id: 'docs',           label: 'Docs',           trigger: '&',           color: '#22d3ee' },
+  { id: 'dreamer',        label: 'Dreamer',        trigger: '~',           color: '#f43f5e' },
+  { id: 'scheduled',      label: 'Scheduled',      trigger: '>',           color: '#fb923c' },
 ]
 
 export const QUICK_REPLIES = ["On my way", "In a meeting", "Call you back", "Got it", "Running late"]
