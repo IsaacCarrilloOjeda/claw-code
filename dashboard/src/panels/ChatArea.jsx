@@ -98,7 +98,9 @@ function ChatThread({ messages, running, alive, selectedAgents, onSend }) {
                     fontWeight: 600,
                     color: msg.role === 'error' ? 'var(--red)' : (AGENTS.find(a => a.id === msg.agent)?.color ?? 'var(--accent)'),
                   }}>
-                    {msg.role === 'error' ? 'error' : (msg.agent ? AGENTS.find(a => a.id === msg.agent)?.label ?? msg.agent : 'Echo')}
+                    {msg.role === 'error'
+                      ? 'error'
+                      : (!msg.agent || msg.agent === 'echo' ? 'Echo' : `Echo | ${msg.agent}`)}
                   </span>
                   {msg.job_id && (
                     <span style={{ color: 'var(--text-dim)', fontFamily: 'var(--mono)', fontSize: 9 }}>

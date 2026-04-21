@@ -7,6 +7,7 @@ pub enum Intent {
     Calendar,
     ChiefOfStaff,
     Docs,
+    Dreamer,
     Ignore,
 }
 
@@ -34,6 +35,9 @@ pub fn classify(raw: &str) -> (Intent, String) {
     }
     if let Some(rest) = trimmed.strip_prefix('&') {
         return (Intent::Docs, rest.trim().to_string());
+    }
+    if let Some(rest) = trimmed.strip_prefix('~') {
+        return (Intent::Dreamer, rest.trim().to_string());
     }
     if let Some(rest) = trimmed.strip_prefix('.') {
         return (Intent::Ignore, rest.trim().to_string());
@@ -92,6 +96,13 @@ mod tests {
         let (intent, body) = classify("&create \"Team Notes\"");
         assert_eq!(intent, Intent::Docs);
         assert_eq!(body, "create \"Team Notes\"");
+    }
+
+    #[test]
+    fn classifies_tilde_prefix_as_dreamer() {
+        let (intent, body) = classify("~reflect on the last week");
+        assert_eq!(intent, Intent::Dreamer);
+        assert_eq!(body, "reflect on the last week");
     }
 
     #[test]

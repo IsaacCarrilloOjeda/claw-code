@@ -1148,6 +1148,7 @@ async fn chat_handler(cfg: &DaemonConfig, raw: &str) -> (&'static str, String) {
         crate::agents::intent::Intent::Calendar => "calendar",
         crate::agents::intent::Intent::ChiefOfStaff => "chief_of_staff",
         crate::agents::intent::Intent::Docs => "docs",
+        crate::agents::intent::Intent::Dreamer => "dreamer",
         crate::agents::intent::Intent::Ignore => "ignored",
         crate::agents::intent::Intent::Chat => "chat_dispatcher",
     };
@@ -1173,12 +1174,22 @@ async fn chat_handler(cfg: &DaemonConfig, raw: &str) -> (&'static str, String) {
     match result {
         Ok(text) => {
             db::update_job_done(pool_ref, &job_id, &text).await;
-            let resp = serde_json::json!({"response": text, "job_id": job_id}).to_string();
+            let resp = serde_json::json!({
+                "response": text,
+                "job_id": job_id,
+                "agent": agent_name,
+            })
+            .to_string();
             ("200 OK", resp)
         }
         Err(e) => {
             db::update_job_failed(pool_ref, &job_id, &e).await;
-            let resp = serde_json::json!({"error": e, "job_id": job_id}).to_string();
+            let resp = serde_json::json!({
+                "error": e,
+                "job_id": job_id,
+                "agent": agent_name,
+            })
+            .to_string();
             ("502 Bad Gateway", resp)
         }
     }
@@ -1356,6 +1367,7 @@ async fn sms_inbound(cfg: &DaemonConfig, raw: &str) -> (&'static str, String) {
         crate::agents::intent::Intent::Calendar => "calendar",
         crate::agents::intent::Intent::ChiefOfStaff => "chief_of_staff",
         crate::agents::intent::Intent::Docs => "docs",
+        crate::agents::intent::Intent::Dreamer => "dreamer",
         crate::agents::intent::Intent::Ignore => "ignored",
         crate::agents::intent::Intent::Chat => "chat_dispatcher",
     };

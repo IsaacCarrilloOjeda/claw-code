@@ -164,7 +164,7 @@ export default function App() {
               role: 'assistant',
               content: data.response,
               job_id: data.job_id,
-              agent: agentLabel,
+              agent: data.agent ?? agentLabel,
             }],
           }
         }),

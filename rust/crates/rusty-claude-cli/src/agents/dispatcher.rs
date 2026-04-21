@@ -1,6 +1,7 @@
 use super::calendar::Calendar;
 use super::chief_of_staff::ChiefOfStaff;
 use super::docs::Docs;
+use super::dreamer::Dreamer;
 use super::intent::{self, Intent};
 use super::research::Research;
 use super::{Agent, AgentRequest, AgentResponse, ModelTier};
@@ -50,6 +51,7 @@ impl Dispatcher {
             Intent::Calendar => ("calendar", ModelTier::Fast),
             Intent::ChiefOfStaff => ("chief_of_staff", ModelTier::Mid),
             Intent::Docs => ("docs", ModelTier::Fast),
+            Intent::Dreamer => ("dreamer", ModelTier::Mid),
             Intent::Ignore => unreachable!("ignore handled above"),
         };
 
@@ -110,6 +112,10 @@ impl Dispatcher {
                 .await
                 .map(|resp| (resp.text, resp.usage)),
             Intent::Docs => Docs::new()
+                .handle(req.clone(), pool)
+                .await
+                .map(|resp| (resp.text, resp.usage)),
+            Intent::Dreamer => Dreamer::new()
                 .handle(req.clone(), pool)
                 .await
                 .map(|resp| (resp.text, resp.usage)),
