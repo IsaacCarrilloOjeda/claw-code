@@ -315,7 +315,7 @@ export default function App() {
           {activeNav === 'events' && <EventsPanel daemonKey={daemonKey} />}
           {activeNav === 'budget' && <BudgetPanel daemonKey={daemonKey} />}
           {activeNav === 'agents' && <AgentsPanel daemonKey={daemonKey} />}
-          {activeNav === 'settings' && <SettingsPanel />}
+          {activeNav === 'settings' && <SettingsPanel daemonKey={daemonKey} />}
           {activeNav === 'statistics' && <StatisticsPanel />}
           {activeNav === 'about' && <AboutPanel />}
           {!activeNav && activeChat && (

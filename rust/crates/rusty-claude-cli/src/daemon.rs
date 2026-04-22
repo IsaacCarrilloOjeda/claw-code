@@ -3503,10 +3503,18 @@ async fn list_pending_diff_ids_for_chat(pool: &sqlx::PgPool, chat_id: uuid::Uuid
 /// configured key in constant time. Only called from `stream_tokens_handler`
 /// so this path doesn't leak to other routes.
 fn stream_tokens_query_key_matches(raw: &str) -> bool {
-    let Some(required) = configured_key() else { return false };
-    let Some(first) = raw.lines().next() else { return false };
-    let Some(path) = first.split_whitespace().nth(1) else { return false };
-    let Some((_, qs)) = path.split_once('?') else { return false };
+    let Some(required) = configured_key() else {
+        return false;
+    };
+    let Some(first) = raw.lines().next() else {
+        return false;
+    };
+    let Some(path) = first.split_whitespace().nth(1) else {
+        return false;
+    };
+    let Some((_, qs)) = path.split_once('?') else {
+        return false;
+    };
     for pair in qs.split('&') {
         if let Some(v) = pair.strip_prefix("key=") {
             let decoded = url_decode(v);
@@ -3649,6 +3657,7 @@ const WRITABLE_SETTINGS: &[&str] = &[
     "coder.auto_apply",
     "coder.summarize_as_you_go",
     "coder.kill_switch",
+    "coder.index_watcher_enabled",
 ];
 
 async fn settings_list(cfg: &DaemonConfig, raw: &str) -> (&'static str, String) {

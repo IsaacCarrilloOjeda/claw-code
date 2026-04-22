@@ -69,6 +69,15 @@ function KindGroup({ title, color, chats, activeChatId, onOpen, onDelete, open, 
             margin: '0 4px',
           }}
         >
+          <span
+            aria-label={`${title} chat`}
+            style={{
+              width: 6, height: 6,
+              borderRadius: '50%',
+              background: color,
+              flexShrink: 0,
+            }}
+          />
           <span style={{
             flex: 1,
             overflow: 'hidden',
