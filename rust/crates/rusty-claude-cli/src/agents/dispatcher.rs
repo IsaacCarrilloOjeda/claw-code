@@ -148,6 +148,18 @@ impl Dispatcher {
                 )
                 .await;
 
+                if let Some(jid) = job_uuid {
+                    crate::infra::token_stream::publish(crate::infra::token_stream::TokenEvent {
+                        job_id: jid,
+                        agent: agent_name.to_string(),
+                        tier: tier.as_str().to_string(),
+                        input: usage.tokens_in,
+                        output: usage.tokens_out,
+                        cache_read: 0,
+                        cost_cents: clamp_i32(cost),
+                    });
+                }
+
                 Ok(AgentResponse { text, usage, tier })
             }
             Err(e) => {

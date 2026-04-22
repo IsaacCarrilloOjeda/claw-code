@@ -7,6 +7,7 @@
 //! All queries use runtime-checked `sqlx::query` / `sqlx::query_as` (not the
 //! compile-time macros) so the Docker build does not require a live database.
 
+use serde::de::DeserializeOwned;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
 
@@ -2573,4 +2574,504 @@ pub async fn list_scheduled_triggers(
     .await?;
 
     Ok(rows.iter().map(row_to_scheduled_trigger).collect())
+}
+
+// ---------------------------------------------------------------------------
+// Availability schedules (slots A/B/C) + sleep mode — migration 017
+// ---------------------------------------------------------------------------
+
+const SCHEDULE_TZ: &str = "America/Denver";
+
+#[derive(Debug, serde::Serialize)]
+pub struct ScheduleSlot {
+    pub slot: String,
+    pub name: String,
+    pub windows: Vec<ScheduleWindow>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ScheduleWindow {
+    pub id: String,
+    pub slot: String,
+    pub kind: String,
+    pub weekday_mask: Option<i32>,
+    pub day_date: Option<String>,
+    pub start_time: String,
+    pub end_time: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct SleepState {
+    pub active: bool,
+    pub asleep_at: Option<String>,
+    pub awake_by: Option<String>,
+}
+
+pub async fn list_schedule_slots(pool: &PgPool) -> Vec<ScheduleSlot> {
+    let slot_rows = sqlx::query("SELECT slot, name FROM sms_schedules ORDER BY slot")
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+
+    let window_rows = sqlx::query(
+        "SELECT id::text, slot, kind, weekday_mask, day_date::text,
+                to_char(start_time, 'HH24:MI') as start_time,
+                to_char(end_time, 'HH24:MI') as end_time
+         FROM sms_schedule_windows
+         ORDER BY slot, kind, weekday_mask, day_date, start_time",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    let windows: Vec<ScheduleWindow> = window_rows
+        .iter()
+        .map(|row| ScheduleWindow {
+            id: row.try_get("id").unwrap_or_default(),
+            slot: row.try_get("slot").unwrap_or_default(),
+            kind: row.try_get("kind").unwrap_or_default(),
+            weekday_mask: row.try_get("weekday_mask").unwrap_or(None),
+            day_date: row.try_get("day_date").unwrap_or(None),
+            start_time: row.try_get("start_time").unwrap_or_default(),
+            end_time: row.try_get("end_time").unwrap_or_default(),
+        })
+        .collect();
+
+    slot_rows
+        .iter()
+        .map(|row| {
+            let slot: String = row.try_get("slot").unwrap_or_default();
+            let name: String = row.try_get("name").unwrap_or_default();
+            let slot_windows = windows.iter().filter(|w| w.slot == slot).cloned().collect();
+            ScheduleSlot {
+                slot,
+                name,
+                windows: slot_windows,
+            }
+        })
+        .collect()
+}
+
+pub async fn rename_schedule_slot(pool: &PgPool, slot: &str, name: &str) -> bool {
+    if !matches!(slot, "A" | "B" | "C") {
+        return false;
+    }
+    sqlx::query("UPDATE sms_schedules SET name = $2, updated_at = now() WHERE slot = $1")
+        .bind(slot)
+        .bind(name)
+        .execute(pool)
+        .await
+        .map(|r| r.rows_affected() > 0)
+        .unwrap_or(false)
+}
+
+pub async fn insert_weekly_window(
+    pool: &PgPool,
+    slot: &str,
+    weekday_mask: i32,
+    start_time: &str,
+    end_time: &str,
+) -> Option<String> {
+    if !matches!(slot, "A" | "B" | "C") {
+        return None;
+    }
+    let row = sqlx::query(
+        "INSERT INTO sms_schedule_windows (slot, kind, weekday_mask, start_time, end_time)
+         VALUES ($1, 'weekly', $2, $3::time, $4::time)
+         RETURNING id::text",
+    )
+    .bind(slot)
+    .bind(weekday_mask)
+    .bind(start_time)
+    .bind(end_time)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()?;
+    row.try_get("id").ok()
+}
+
+pub async fn insert_oneoff_window(
+    pool: &PgPool,
+    slot: &str,
+    day_date: &str,
+    start_time: &str,
+    end_time: &str,
+) -> Option<String> {
+    if !matches!(slot, "A" | "B" | "C") {
+        return None;
+    }
+    let row = sqlx::query(
+        "INSERT INTO sms_schedule_windows (slot, kind, day_date, start_time, end_time)
+         VALUES ($1, 'oneoff', $2::date, $3::time, $4::time)
+         RETURNING id::text",
+    )
+    .bind(slot)
+    .bind(day_date)
+    .bind(start_time)
+    .bind(end_time)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()?;
+    row.try_get("id").ok()
+}
+
+pub async fn delete_schedule_window(pool: &PgPool, id: &str) -> bool {
+    if uuid::Uuid::parse_str(id).is_err() {
+        return false;
+    }
+    sqlx::query("DELETE FROM sms_schedule_windows WHERE id = $1::uuid")
+        .bind(id)
+        .execute(pool)
+        .await
+        .map(|r| r.rows_affected() > 0)
+        .unwrap_or(false)
+}
+
+pub async fn set_contact_schedule_slot(pool: &PgPool, phone: &str, slot: Option<&str>) -> bool {
+    let normalized = crate::daemon::normalize_phone(phone);
+    if let Some(s) = slot {
+        if !matches!(s, "A" | "B" | "C") {
+            return false;
+        }
+    }
+    sqlx::query(
+        "INSERT INTO sms_contacts (phone, schedule_slot, updated_at)
+         VALUES ($1, $2, now())
+         ON CONFLICT (phone) DO UPDATE
+         SET schedule_slot = $2, updated_at = now()",
+    )
+    .bind(&normalized)
+    .bind(slot)
+    .execute(pool)
+    .await
+    .is_ok()
+}
+
+pub async fn get_sleep_state(pool: &PgPool) -> SleepState {
+    let row = sqlx::query(
+        "SELECT active, asleep_at::text, awake_by::text
+         FROM sms_sleep_mode WHERE id = 1",
+    )
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+
+    match row {
+        Some(r) => SleepState {
+            active: r.try_get("active").unwrap_or(false),
+            asleep_at: r.try_get("asleep_at").unwrap_or(None),
+            awake_by: r.try_get("awake_by").unwrap_or(None),
+        },
+        None => SleepState {
+            active: false,
+            asleep_at: None,
+            awake_by: None,
+        },
+    }
+}
+
+/// Activate sleep mode immediately. `awake_by_local` is "HH:MM" in America/Denver;
+/// we compute the next occurrence (today if still in the future, else tomorrow).
+pub async fn start_sleep(pool: &PgPool, awake_by_local: &str) -> Result<SleepState, sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO sms_sleep_mode (id, active, asleep_at, awake_by, updated_at)
+         VALUES (
+             1, TRUE, now(),
+             CASE
+                 WHEN (now() AT TIME ZONE $1)::time < $2::time THEN
+                     (date_trunc('day', (now() AT TIME ZONE $1)::timestamp) + $2::time)
+                         AT TIME ZONE $1
+                 ELSE
+                     (date_trunc('day', (now() AT TIME ZONE $1)::timestamp) + interval '1 day' + $2::time)
+                         AT TIME ZONE $1
+             END,
+             now()
+         )
+         ON CONFLICT (id) DO UPDATE
+         SET active = TRUE,
+             asleep_at = EXCLUDED.asleep_at,
+             awake_by = EXCLUDED.awake_by,
+             updated_at = now()",
+    )
+    .bind(SCHEDULE_TZ)
+    .bind(awake_by_local)
+    .execute(pool)
+    .await?;
+
+    Ok(get_sleep_state(pool).await)
+}
+
+pub async fn end_sleep(pool: &PgPool) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE sms_sleep_mode
+         SET active = FALSE, asleep_at = NULL, awake_by = NULL, updated_at = now()
+         WHERE id = 1",
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn list_sleep_contacts(pool: &PgPool) -> Vec<String> {
+    sqlx::query_scalar::<_, String>("SELECT phone FROM sms_sleep_contacts ORDER BY phone")
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default()
+}
+
+pub async fn add_sleep_contact(pool: &PgPool, phone: &str) -> bool {
+    let normalized = crate::daemon::normalize_phone(phone);
+    sqlx::query(
+        "INSERT INTO sms_sleep_contacts (phone) VALUES ($1)
+         ON CONFLICT (phone) DO NOTHING",
+    )
+    .bind(&normalized)
+    .execute(pool)
+    .await
+    .is_ok()
+}
+
+pub async fn remove_sleep_contact(pool: &PgPool, phone: &str) -> bool {
+    let normalized = crate::daemon::normalize_phone(phone);
+    sqlx::query("DELETE FROM sms_sleep_contacts WHERE phone = $1")
+        .bind(&normalized)
+        .execute(pool)
+        .await
+        .map(|r| r.rows_affected() > 0)
+        .unwrap_or(false)
+}
+
+/// One polling tick. Evaluates every contact touched by the scheduler and
+/// writes the authoritative `auto_reply` flag.
+///
+/// Precedence per contact:
+///   1. Sleep list + sleep active  → TRUE.
+///   2. Has `schedule_slot`        → TRUE iff inside any window of that slot.
+///   3. In sleep list, sleep off   → FALSE.
+///   4. Neither                    → untouched (manual-override territory).
+///
+/// Also auto-clears sleep mode when `awake_by` has passed.
+pub async fn tick_schedule(pool: &PgPool) {
+    let _ = sqlx::query(
+        "UPDATE sms_sleep_mode
+         SET active = FALSE, asleep_at = NULL, awake_by = NULL, updated_at = now()
+         WHERE id = 1 AND active = TRUE AND awake_by IS NOT NULL AND now() >= awake_by",
+    )
+    .execute(pool)
+    .await;
+
+    let _ = sqlx::query(
+        r"
+        WITH sleep AS (
+            SELECT COALESCE((SELECT active FROM sms_sleep_mode WHERE id = 1), FALSE) AS active
+        )
+        UPDATE sms_contacts c
+        SET auto_reply = CASE
+            WHEN EXISTS (SELECT 1 FROM sms_sleep_contacts s WHERE s.phone = c.phone)
+                 AND (SELECT active FROM sleep) THEN TRUE
+            WHEN c.schedule_slot IS NOT NULL THEN EXISTS (
+                SELECT 1 FROM sms_schedule_windows w
+                WHERE w.slot = c.schedule_slot
+                  AND (
+                      (w.kind = 'weekly'
+                       AND (w.weekday_mask & (1 << EXTRACT(DOW FROM now() AT TIME ZONE $1)::int)) <> 0
+                       AND (now() AT TIME ZONE $1)::time >= w.start_time
+                       AND (now() AT TIME ZONE $1)::time <  w.end_time)
+                      OR
+                      (w.kind = 'oneoff'
+                       AND w.day_date = (now() AT TIME ZONE $1)::date
+                       AND (now() AT TIME ZONE $1)::time >= w.start_time
+                       AND (now() AT TIME ZONE $1)::time <  w.end_time)
+                  )
+            )
+            ELSE FALSE
+        END,
+        updated_at = now()
+        WHERE c.schedule_slot IS NOT NULL
+           OR c.phone IN (SELECT phone FROM sms_sleep_contacts)
+        ",
+    )
+    .bind(SCHEDULE_TZ)
+    .execute(pool)
+    .await;
+}
+
+// ---------------------------------------------------------------------------
+// Settings KV (migration 018)
+//
+// Small JSONB key-value store for runtime-mutable flags: provider routing,
+// coder budget caps, kill switch. Read via `get_setting::<T>`; write via
+// `set_setting`. The provider router caches these in memory and refreshes
+// every 60s — writes are eventually consistent.
+// ---------------------------------------------------------------------------
+
+pub async fn get_setting<T: DeserializeOwned>(pool: &PgPool, key: &str) -> Option<T> {
+    let row = sqlx::query("SELECT value FROM settings_kv WHERE key = $1")
+        .bind(key)
+        .fetch_optional(pool)
+        .await
+        .ok()??;
+    let value: serde_json::Value = row.try_get("value").ok()?;
+    serde_json::from_value(value).ok()
+}
+
+pub async fn set_setting(
+    pool: &PgPool,
+    key: &str,
+    value: &serde_json::Value,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO settings_kv (key, value, updated_at)
+         VALUES ($1, $2, now())
+         ON CONFLICT (key) DO UPDATE SET
+             value = EXCLUDED.value,
+             updated_at = now()",
+    )
+    .bind(key)
+    .bind(value)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Fetch every (key, value) row. Used by `GET /settings`.
+pub async fn list_settings(pool: &PgPool) -> Result<Vec<(String, serde_json::Value)>, sqlx::Error> {
+    let rows = sqlx::query("SELECT key, value FROM settings_kv ORDER BY key")
+        .fetch_all(pool)
+        .await?;
+    Ok(rows
+        .iter()
+        .map(|r| {
+            (
+                r.try_get::<String, _>("key").unwrap_or_default(),
+                r.try_get::<serde_json::Value, _>("value")
+                    .unwrap_or(serde_json::Value::Null),
+            )
+        })
+        .collect())
+}
+
+// ---------------------------------------------------------------------------
+// Coder spend ledger (migration 019)
+//
+// Per-call audit trail for the coder path. One row per upstream model call,
+// with model name, provider, and the job_id that triggered it. The `day`
+// column is Mountain Time so "today's spend" matches Isaac's wall clock.
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::too_many_arguments)]
+pub async fn record_spend(
+    pool: &PgPool,
+    agent: &str,
+    model: &str,
+    provider: &str,
+    tokens_in: u32,
+    tokens_out: u32,
+    cache_read: u32,
+    cost_cents: i32,
+    job_id: Option<uuid::Uuid>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO coder_spend (
+             agent, model, provider,
+             input_tokens, output_tokens, cache_read_tokens,
+             cost_cents, job_id
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+    )
+    .bind(agent)
+    .bind(model)
+    .bind(provider)
+    .bind(i64::from(tokens_in))
+    .bind(i64::from(tokens_out))
+    .bind(i64::from(cache_read))
+    .bind(cost_cents)
+    .bind(job_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Sum today's `cost_cents` for one agent from the audit ledger. Used for
+/// `/code/health` and the budget gate when the setting-override cap is active.
+pub async fn spend_today(pool: &PgPool, agent: &str) -> Result<i32, sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT COALESCE(SUM(cost_cents), 0)::int AS total
+         FROM coder_spend
+         WHERE agent = $1
+           AND day = (now() AT TIME ZONE 'America/Denver')::date",
+    )
+    .bind(agent)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.try_get::<i32, _>("total").unwrap_or(0))
+}
+
+// ---------------------------------------------------------------------------
+// Coder condensate store (migration 020)
+//
+// Summarize-as-you-go: each KEEP-classified turn lands as a 2-sentence
+// summary + 1024-dim embedding, keyed by the coder chat_id. `relevant_condensate`
+// returns the top-K matches for injection into the dynamic system prompt.
+// ---------------------------------------------------------------------------
+
+pub async fn insert_coder_condensate(
+    pool: &PgPool,
+    chat_id: &uuid::Uuid,
+    turn_idx: i32,
+    summary: &str,
+    embedding: Option<&[f32]>,
+) -> Result<(), sqlx::Error> {
+    if let Some(emb) = embedding {
+        let embedding_str = vec_to_pgvector(emb);
+        sqlx::query(
+            "INSERT INTO coder_condensate (chat_id, turn_idx, summary, embedding)
+             VALUES ($1, $2, $3, $4::vector)",
+        )
+        .bind(chat_id)
+        .bind(turn_idx)
+        .bind(summary)
+        .bind(&embedding_str)
+        .execute(pool)
+        .await?;
+    } else {
+        sqlx::query(
+            "INSERT INTO coder_condensate (chat_id, turn_idx, summary)
+             VALUES ($1, $2, $3)",
+        )
+        .bind(chat_id)
+        .bind(turn_idx)
+        .bind(summary)
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
+}
+
+pub async fn search_coder_condensate(
+    pool: &PgPool,
+    chat_id: &uuid::Uuid,
+    embedding: &[f32],
+    limit: i64,
+) -> Vec<String> {
+    let embedding_str = vec_to_pgvector(embedding);
+    let rows = sqlx::query(
+        "SELECT summary
+         FROM coder_condensate
+         WHERE chat_id = $1 AND embedding IS NOT NULL
+         ORDER BY embedding <=> $2::vector
+         LIMIT $3",
+    )
+    .bind(chat_id)
+    .bind(&embedding_str)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    rows.iter()
+        .filter_map(|r| r.try_get::<String, _>("summary").ok())
+        .collect()
 }

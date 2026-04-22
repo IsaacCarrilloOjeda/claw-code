@@ -6,6 +6,7 @@ pub mod dreamer;
 pub mod intent;
 pub mod oauth;
 pub mod research;
+pub mod summarizer;
 
 use async_trait::async_trait;
 use sqlx::PgPool;

@@ -198,6 +198,25 @@ async fn daemon_main(cfg: DaemonConfig) -> Result<(), Box<dyn std::error::Error>
         let _scheduler_handle = crate::infra::scheduler::spawn((*pool).clone());
     }
 
+    // Initialize provider-router config cache + 60s refresh task. No-ops when
+    // DB is absent; the cache defaults to OpenRouter + no overrides.
+    if let Some(pool) = cfg.db.clone() {
+        crate::infra::provider::init(pool);
+    }
+
+    // Spawn availability-scheduler tick: every 60s, evaluates A/B/C windows and
+    // sleep mode in America/Denver, writes `auto_reply` for each assigned
+    // contact. See `db::tick_schedule` for the precedence rules.
+    if let Some(pool) = cfg.db.clone() {
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                db::tick_schedule(&pool).await;
+            }
+        });
+    }
+
     let start = Instant::now();
     eprintln!("{LOG_PREFIX} listening on http://{addr}");
     eprintln!("{LOG_PREFIX} PID {}", std::process::id());
@@ -252,6 +271,19 @@ async fn daemon_main(cfg: DaemonConfig) -> Result<(), Box<dyn std::error::Error>
             };
 
             let peer_ip = peer.ip().to_string();
+
+            // SSE routes hold the socket open for the lifetime of the
+            // subscription, so they bypass the one-shot dispatch/write_response
+            // flow. Parse the request line here and hand off to the streaming
+            // handler; anything else falls through to `dispatch`.
+            if let Some(job_id) = parse_stream_tokens_path(&raw) {
+                let origin = header_value(&raw, "origin");
+                let allowed_origin =
+                    origin.and_then(|o| if is_origin_allowed(&o) { Some(o) } else { None });
+                stream_tokens_handler(&mut stream, &raw, &job_id, allowed_origin.as_deref()).await;
+                return;
+            }
+
             let (status_line, body) = dispatch(&cfg, &raw, uptime, &peer_ip).await;
 
             // Echo Origin only if it's in the allow-list
@@ -681,6 +713,42 @@ async fn dispatch(
         ("GET", "/facts") => facts_get(cfg, raw).await,
         ("PUT", "/facts") => facts_put(cfg, raw).await,
 
+        // --- Settings KV (Phase A) ---
+        ("GET", "/settings") => settings_list(cfg, raw).await,
+        ("PUT", p) if p.starts_with("/settings/") => {
+            let key = &p["/settings/".len()..];
+            settings_put(cfg, raw, key).await
+        }
+
+        // --- Coder health (Phase A) — unauthenticated on purpose ---
+        ("GET", "/code/health") => code_health(cfg).await,
+
+        // --- Availability schedules (slots A/B/C) + sleep mode ---
+        ("GET", "/sms/availability") => availability_list(cfg, raw).await,
+        ("PUT", p) if p.starts_with("/sms/availability/slots/") => {
+            let slot = &p["/sms/availability/slots/".len()..];
+            availability_rename_slot(cfg, raw, slot).await
+        }
+        ("POST", "/sms/availability/windows") => availability_window_create(cfg, raw).await,
+        ("DELETE", p) if p.starts_with("/sms/availability/windows/") => {
+            let id = &p["/sms/availability/windows/".len()..];
+            availability_window_delete(cfg, raw, id).await
+        }
+        ("PUT", p) if p.starts_with("/sms/contacts/") && p.ends_with("/schedule-slot") => {
+            let mid = &p["/sms/contacts/".len()..p.len() - "/schedule-slot".len()];
+            let phone = url_decode(mid);
+            availability_contact_slot(cfg, raw, &phone).await
+        }
+        ("GET", "/sms/sleep") => sleep_get(cfg, raw).await,
+        ("POST", "/sms/sleep/start") => sleep_start(cfg, raw).await,
+        ("POST", "/sms/sleep/end") => sleep_end(cfg, raw).await,
+        ("GET", "/sms/sleep/contacts") => sleep_contacts_list(cfg, raw).await,
+        ("POST", "/sms/sleep/contacts") => sleep_contact_add(cfg, raw).await,
+        ("DELETE", p) if p.starts_with("/sms/sleep/contacts/") => {
+            let phone = url_decode(&p["/sms/sleep/contacts/".len()..]);
+            sleep_contact_remove(cfg, raw, &phone).await
+        }
+
         // --- Trigger CRUD (Wave 5) ---
         ("GET", "/triggers") => triggers_list(cfg, raw).await,
         ("POST", "/triggers") => trigger_create(cfg, raw).await,
@@ -1083,6 +1151,7 @@ fn redact_secrets(s: &str) -> String {
 /// Returns `{"response": "...", "job_id": "..."}` after AI call completes.
 /// Requires bearer auth when `GHOST_DAEMON_KEY` is set.
 /// Same routing logic as SMS: `!` prefix → Director, else → chat dispatcher.
+#[allow(clippy::too_many_lines)]
 async fn chat_handler(cfg: &DaemonConfig, raw: &str) -> (&'static str, String) {
     if configured_key().is_some() && !auth_matches(raw) {
         return ("401 Unauthorized", r#"{"error":"unauthorized"}"#.to_owned());
@@ -1173,18 +1242,29 @@ async fn chat_handler(cfg: &DaemonConfig, raw: &str) -> (&'static str, String) {
         job_id: job_id.clone(),
         sender_phone: None,
     };
-    let result = dispatcher.dispatch(req, pool_ref).await.map(|r| r.text);
+    let result = dispatcher.dispatch(req, pool_ref).await;
 
     match result {
-        Ok(text) => {
-            db::update_job_done(pool_ref, &job_id, &text).await;
-            let resp = serde_json::json!({
-                "response": text,
+        Ok(resp) => {
+            db::update_job_done(pool_ref, &job_id, &resp.text).await;
+            let cost = crate::infra::budget::cost_cents(
+                resp.tier,
+                i64::from(resp.usage.tokens_in),
+                i64::from(resp.usage.tokens_out),
+            );
+            let body = serde_json::json!({
+                "response": resp.text,
                 "job_id": job_id,
                 "agent": agent_name,
+                "tokens": {
+                    "input": resp.usage.tokens_in,
+                    "output": resp.usage.tokens_out,
+                    "cache_read": 0,
+                    "cost_cents": cost,
+                },
             })
             .to_string();
-            ("200 OK", resp)
+            ("200 OK", body)
         }
         Err(e) => {
             db::update_job_failed(pool_ref, &job_id, &e).await;
@@ -1961,6 +2041,264 @@ async fn facts_put(cfg: &DaemonConfig, raw: &str) -> (&'static str, String) {
             (
                 "500 Internal Server Error",
                 r#"{"error":"failed to save facts"}"#.to_owned(),
+            )
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// /code/health — unauthenticated coder status dot (Phase A.6)
+//
+// Returns the kill-switch state (env var or settings flag), the remaining
+// coder budget for today, and a daemon-alive flag. Kept unauthenticated so
+// the dashboard status dot works before Isaac types his key.
+// ---------------------------------------------------------------------------
+
+async fn code_health(cfg: &DaemonConfig) -> (&'static str, String) {
+    let env_kill = std::env::var("GHOST_CODING_AGENT")
+        .ok()
+        .is_some_and(|v| v.trim().eq_ignore_ascii_case("off"));
+
+    let mut setting_kill = false;
+    let mut cap: i32 = 200;
+    let mut spent: i32 = 0;
+
+    if let Some(pool) = cfg.db.as_deref() {
+        if let Some(v) = db::get_setting::<bool>(pool, "coder.kill_switch").await {
+            setting_kill = v;
+        }
+        if let Some(v) = db::get_setting::<i32>(pool, "coder.budget_cents_per_day").await {
+            if v > 0 {
+                cap = v;
+            }
+        }
+        if let Ok(v) = db::spend_today(pool, "coder").await {
+            spent = v;
+        }
+    }
+
+    let remaining = cap.saturating_sub(spent).max(0);
+    let body = json!({
+        "kill_switch": env_kill || setting_kill,
+        "budget_remaining_cents": remaining,
+        "daemon_alive": true,
+    })
+    .to_string();
+    ("200 OK", body)
+}
+
+// ---------------------------------------------------------------------------
+// SSE — token event stream (Phase A.4)
+//
+// `GET /stream/tokens/:job_id` holds the socket open and writes `data: ...
+// \n\n` frames for every TokenEvent matching the job_id. Bearer auth is
+// required; `Host` validation already ran upstream before we land here.
+// Heartbeat every 30s keeps idle connections alive through proxies. Clients
+// disconnect by closing the socket — we detect via write error and exit.
+// ---------------------------------------------------------------------------
+
+/// Inspect the request line for `GET /stream/tokens/:job_id`. Returns the
+/// `job_id` segment if matched. Query string and trailing slash tolerated.
+fn parse_stream_tokens_path(raw: &str) -> Option<String> {
+    let first = raw.lines().next()?;
+    let mut parts = first.split_whitespace();
+    let method = parts.next()?;
+    let path = parts.next()?;
+    if method != "GET" {
+        return None;
+    }
+    let path_clean = path.split('?').next().unwrap_or(path);
+    let rest = path_clean.strip_prefix("/stream/tokens/")?;
+    let job = rest.trim_end_matches('/');
+    if job.is_empty() {
+        return None;
+    }
+    Some(job.to_string())
+}
+
+async fn stream_tokens_handler(
+    stream: &mut TcpStream,
+    raw: &str,
+    job_id_str: &str,
+    allowed_origin: Option<&str>,
+) {
+    if !auth_matches(raw) {
+        write_response(
+            stream,
+            "401 Unauthorized",
+            r#"{"error":"unauthorized"}"#,
+            allowed_origin,
+            "application/json",
+        )
+        .await;
+        return;
+    }
+
+    let Ok(target) = uuid::Uuid::parse_str(job_id_str) else {
+        write_response(
+            stream,
+            "400 Bad Request",
+            r#"{"error":"invalid job_id"}"#,
+            allowed_origin,
+            "application/json",
+        )
+        .await;
+        return;
+    };
+
+    // Write the SSE response head ourselves — `write_response` is for
+    // one-shot bodies with a known Content-Length.
+    let mut head = String::from(
+        "HTTP/1.1 200 OK\r\n\
+         Content-Type: text/event-stream\r\n\
+         Cache-Control: no-store\r\n\
+         X-Content-Type-Options: nosniff\r\n\
+         X-Frame-Options: DENY\r\n\
+         Connection: close\r\n",
+    );
+    if let Some(origin) = allowed_origin {
+        let _ = std::fmt::Write::write_fmt(
+            &mut head,
+            format_args!(
+                "Access-Control-Allow-Origin: {origin}\r\n\
+                 Vary: Origin\r\n\
+                 Access-Control-Allow-Credentials: true\r\n\
+                 Access-Control-Allow-Private-Network: true\r\n"
+            ),
+        );
+    }
+    head.push_str("\r\n");
+
+    if stream.write_all(head.as_bytes()).await.is_err() {
+        return;
+    }
+    // Initial comment frame — proxies buffer otherwise.
+    if stream.write_all(b": ready\n\n").await.is_err() {
+        return;
+    }
+
+    let mut rx = crate::infra::token_stream::subscribe();
+    let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(30));
+    heartbeat.tick().await; // skip immediate tick
+
+    loop {
+        tokio::select! {
+            msg = rx.recv() => {
+                match msg {
+                    Ok(event) => {
+                        if event.job_id != target {
+                            continue;
+                        }
+                        let payload = serde_json::to_string(&event)
+                            .unwrap_or_else(|_| "{}".to_string());
+                        let frame = format!("data: {payload}\n\n");
+                        if stream.write_all(frame.as_bytes()).await.is_err() {
+                            return;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        // Dropped some frames — client will reconnect if it cares.
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                }
+            }
+            _ = heartbeat.tick() => {
+                if stream.write_all(b": heartbeat\n\n").await.is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Settings KV endpoints (Phase A)
+//
+// `GET /settings` returns the full key→value map. `PUT /settings/:key` writes
+// one key. Both require bearer auth. Only keys in `WRITABLE_SETTINGS` can be
+// mutated — anything else returns 400. The provider router caches settings
+// in memory; writes are picked up within 60s.
+// ---------------------------------------------------------------------------
+
+const WRITABLE_SETTINGS: &[&str] = &[
+    "provider.default",
+    "provider.per_agent",
+    "coder.budget_cents_per_day",
+    "coder.auto_apply",
+    "coder.summarize_as_you_go",
+    "coder.kill_switch",
+];
+
+async fn settings_list(cfg: &DaemonConfig, raw: &str) -> (&'static str, String) {
+    if !auth_matches(raw) {
+        return ("401 Unauthorized", r#"{"error":"unauthorized"}"#.to_owned());
+    }
+    let Some(pool) = cfg.db.as_deref() else {
+        return (
+            "503 Service Unavailable",
+            r#"{"error":"database not configured"}"#.to_owned(),
+        );
+    };
+    match db::list_settings(pool).await {
+        Ok(rows) => {
+            let map: serde_json::Map<String, serde_json::Value> = rows.into_iter().collect();
+            ("200 OK", serde_json::Value::Object(map).to_string())
+        }
+        Err(e) => {
+            eprintln!("[ghost settings] list failed: {e}");
+            (
+                "500 Internal Server Error",
+                r#"{"error":"failed to list settings"}"#.to_owned(),
+            )
+        }
+    }
+}
+
+async fn settings_put(cfg: &DaemonConfig, raw: &str, key: &str) -> (&'static str, String) {
+    if !auth_matches(raw) {
+        return ("401 Unauthorized", r#"{"error":"unauthorized"}"#.to_owned());
+    }
+    let Some(pool) = cfg.db.as_deref() else {
+        return (
+            "503 Service Unavailable",
+            r#"{"error":"database not configured"}"#.to_owned(),
+        );
+    };
+
+    if !WRITABLE_SETTINGS.contains(&key) {
+        return (
+            "400 Bad Request",
+            json!({ "error": "unknown settings key", "key": key }).to_string(),
+        );
+    }
+
+    let body_str = raw
+        .split_once("\r\n\r\n")
+        .or_else(|| raw.split_once("\n\n"))
+        .map_or("", |(_, b)| b);
+    let Ok(body) = serde_json::from_str::<serde_json::Value>(body_str) else {
+        return (
+            "400 Bad Request",
+            r#"{"error":"body must be JSON"}"#.to_owned(),
+        );
+    };
+    let Some(value) = body.get("value").cloned() else {
+        return (
+            "400 Bad Request",
+            r#"{"error":"missing field: value"}"#.to_owned(),
+        );
+    };
+
+    match db::set_setting(pool, key, &value).await {
+        Ok(()) => (
+            "200 OK",
+            json!({ "status": "saved", "key": key }).to_string(),
+        ),
+        Err(e) => {
+            eprintln!("[ghost settings] set failed for {key}: {e}");
+            (
+                "500 Internal Server Error",
+                r#"{"error":"failed to save setting"}"#.to_owned(),
             )
         }
     }
