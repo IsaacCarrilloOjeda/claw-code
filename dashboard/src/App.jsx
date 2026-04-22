@@ -13,6 +13,16 @@ import EventsPanel from './panels/EventsPanel.jsx'
 import BudgetPanel from './panels/BudgetPanel.jsx'
 import AgentsPanel from './panels/AgentsPanel.jsx'
 import NoChatSelected from './panels/NoChatSelected.jsx'
+import PinnedChats from './components/PinnedChats.jsx'
+
+const PINNED_KEY = 'ghost-pinned-chats'
+function loadPinned() {
+  try {
+    const raw = localStorage.getItem(PINNED_KEY)
+    if (raw) return JSON.parse(raw)
+  } catch { /* ignore */ }
+  return { main: null, code: null }
+}
 
 export default function App() {
   // Auth
@@ -33,7 +43,11 @@ export default function App() {
   // Sidebar
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   const [bottomRatio, setBottomRatio] = useState(0.25)
-  const [activeNav, setActiveNav] = useState(null) // 'sms' | 'events' | 'budget' | 'agents' | 'settings' | 'statistics' | 'about' | null
+  const [activeNav, setActiveNav] = useState(null) // 'code' | 'sms' | 'events' | 'budget' | 'agents' | 'settings' | 'statistics' | 'about' | null
+
+  // Pinned-chat bar (two slots: one main, one code). Bar only renders when both are filled.
+  const [pinnedChats, setPinnedChats] = useState(loadPinned)
+  const [activePinSlot, setActivePinSlot] = useState(null) // which pinned pill is currently showing
 
   // Chat state
   const [selectedAgents, setSelectedAgents] = useState(['chat'])
@@ -47,6 +61,10 @@ export default function App() {
   const promptAbortRef = useRef(null)
 
   useEffect(() => { saveProjects(projects) }, [projects])
+
+  useEffect(() => {
+    try { localStorage.setItem(PINNED_KEY, JSON.stringify(pinnedChats)) } catch { /* ignore */ }
+  }, [pinnedChats])
 
   useEffect(() => {
     mountedRef.current = true
@@ -95,6 +113,28 @@ export default function App() {
       if (prev.some(t => t.id === chatId)) return prev
       return [...prev, { id: chatId, name: chat.name, projectId }]
     })
+    // Pin this as the current "main" chat. Overwrites whatever was there —
+    // spec: clicking a main-chat entry sets pinnedChats.main = {...}.
+    setPinnedChats(prev => ({ ...prev, main: { id: chatId, kind: 'main', title: chat.name, projectId } }))
+    setActivePinSlot('main')
+  }
+
+  function handleSelectPinned(slot) {
+    const entry = pinnedChats?.[slot]
+    if (!entry) return
+    setActivePinSlot(slot)
+    if (slot === 'main') {
+      setActiveChatId(entry.id)
+      setActiveNav(null)
+    } else if (slot === 'code') {
+      // Code panel owns its own activeChatId; surfacing the panel is enough.
+      setActiveNav('code')
+    }
+  }
+
+  function handleUnpin(slot) {
+    setPinnedChats(prev => ({ ...prev, [slot]: null }))
+    if (activePinSlot === slot) setActivePinSlot(null)
   }
 
   function handleSelectTab(tabId) {
@@ -227,6 +267,13 @@ export default function App() {
       />
 
       {activeJob && <JobBanner job={activeJob} onDismiss={() => setActiveJob(null)} />}
+
+      <PinnedChats
+        pinnedChats={pinnedChats}
+        activeSlot={activePinSlot}
+        onSelect={handleSelectPinned}
+        onUnpin={handleUnpin}
+      />
 
       <div style={{ display: 'flex', flex: 1, overflow: 'hidden', minHeight: 0 }}>
         <Sidebar
