@@ -3499,6 +3499,23 @@ async fn list_pending_diff_ids_for_chat(pool: &sqlx::PgPool, chat_id: uuid::Uuid
 // disconnect by closing the socket — we detect via write error and exit.
 // ---------------------------------------------------------------------------
 
+/// Browser `EventSource` fallback: check `?key=<GHOST_DAEMON_KEY>` against the
+/// configured key in constant time. Only called from `stream_tokens_handler`
+/// so this path doesn't leak to other routes.
+fn stream_tokens_query_key_matches(raw: &str) -> bool {
+    let Some(required) = configured_key() else { return false };
+    let Some(first) = raw.lines().next() else { return false };
+    let Some(path) = first.split_whitespace().nth(1) else { return false };
+    let Some((_, qs)) = path.split_once('?') else { return false };
+    for pair in qs.split('&') {
+        if let Some(v) = pair.strip_prefix("key=") {
+            let decoded = url_decode(v);
+            return ct_eq(&decoded, &required);
+        }
+    }
+    false
+}
+
 /// Inspect the request line for `GET /stream/tokens/:job_id`. Returns the
 /// `job_id` segment if matched. Query string and trailing slash tolerated.
 fn parse_stream_tokens_path(raw: &str) -> Option<String> {
@@ -3524,7 +3541,10 @@ async fn stream_tokens_handler(
     job_id_str: &str,
     allowed_origin: Option<&str>,
 ) {
-    if !auth_matches(raw) {
+    // Browser EventSource can't set Authorization headers, so this endpoint
+    // also accepts `?key=<GHOST_DAEMON_KEY>` as a fallback. Scoped to SSE on
+    // purpose — we don't want arbitrary routes to take secrets via query.
+    if !auth_matches(raw) && !stream_tokens_query_key_matches(raw) {
         write_response(
             stream,
             "401 Unauthorized",

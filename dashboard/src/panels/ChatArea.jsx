@@ -1,8 +1,15 @@
 import { useState, useEffect, useRef, useMemo } from 'react'
 import ReactMarkdown from 'react-markdown'
 import { AGENTS } from '../lib/api.js'
+import TokenMeter from '../components/TokenMeter.jsx'
 
 function ChatThread({ messages, running, alive, selectedAgents, onSend }) {
+  const lastTokens = useMemo(() => {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].role === 'assistant' && messages[i].tokens) return messages[i].tokens
+    }
+    return null
+  }, [messages])
   const [input, setInput] = useState('')
   const scrollRef = useRef(null)
   const textareaRef = useRef(null)
@@ -201,8 +208,18 @@ function ChatThread({ messages, running, alive, selectedAgents, onSend }) {
             {'\u2191'}
           </button>
         </div>
-        <div style={{ marginTop: 4, fontSize: 10, color: 'var(--text-dim)', textAlign: 'center', fontFamily: 'var(--mono)' }}>
-          enter to send / shift+enter for newline
+        <div style={{
+          marginTop: 4,
+          fontSize: 10,
+          color: 'var(--text-dim)',
+          fontFamily: 'var(--mono)',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          gap: 8,
+        }}>
+          <span>enter to send / shift+enter for newline</span>
+          {lastTokens && <TokenMeter mode="summary" tokens={lastTokens} compact />}
         </div>
       </div>
     </div>

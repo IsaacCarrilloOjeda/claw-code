@@ -2,6 +2,7 @@ import { useState, useEffect, useRef, useMemo, useCallback } from 'react'
 import ReactMarkdown from 'react-markdown'
 import { apiFetch, uid } from '../lib/api.js'
 import DiffReview from '../components/DiffReview.jsx'
+import TokenMeter, { BudgetBar } from '../components/TokenMeter.jsx'
 
 // CoderPanel — three chat kinds (brainstorm / coder / orchestrator) live in
 // one sidebar with a file-index search. Send routing picks the endpoint based
@@ -325,7 +326,7 @@ function MessageList({ messages, running, onSendToCoder }) {
   )
 }
 
-function Composer({ disabled, running, onSend }) {
+function Composer({ disabled, running, onSend, tokenNode, budgetNode, overBudget }) {
   const [input, setInput] = useState('')
   const textareaRef = useRef(null)
 
@@ -342,24 +343,37 @@ function Composer({ disabled, running, onSend }) {
     el.style.height = Math.min(el.scrollHeight, 160) + 'px'
   }
 
+  const hardBlock = disabled || running || overBudget
   return (
     <div style={{
       flexShrink: 0,
-      padding: '10px 16px 14px',
       background: 'var(--surface)',
       borderTop: '1px solid var(--border)',
     }}>
-      <div style={{ display: 'flex', gap: 8, alignItems: 'flex-end' }}>
+      {tokenNode && (
+        <div style={{ padding: '4px 16px 0', display: 'flex', justifyContent: 'flex-end' }}>
+          {tokenNode}
+        </div>
+      )}
+      <div style={{
+        padding: '10px 16px 14px',
+        display: 'flex',
+        gap: 8,
+        alignItems: 'flex-end',
+      }}>
         <textarea
           ref={textareaRef}
           rows={1}
-          placeholder={disabled ? 'select or create a thread' : 'message...'}
+          placeholder={
+            overBudget ? 'daily cap reached — adjust in settings' :
+            disabled ? 'select or create a thread' : 'message...'
+          }
           value={input}
           onChange={e => { setInput(e.target.value); autoResize(e) }}
           onKeyDown={e => {
             if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend() }
           }}
-          disabled={disabled || running}
+          disabled={hardBlock}
           style={{
             flex: 1,
             fontFamily: 'var(--mono)',
@@ -378,16 +392,16 @@ function Composer({ disabled, running, onSend }) {
         />
         <button
           onClick={handleSend}
-          disabled={disabled || running || !input.trim()}
+          disabled={hardBlock || !input.trim()}
           style={{
             flexShrink: 0,
             width: 40, height: 40,
             padding: 0,
             fontSize: 16,
             fontFamily: 'var(--mono)',
-            background: (disabled || running || !input.trim()) ? 'var(--border)' : 'var(--accent)',
-            color: (disabled || running || !input.trim()) ? 'var(--text-dim)' : 'var(--bg)',
-            cursor: (disabled || running || !input.trim()) ? 'default' : 'pointer',
+            background: (hardBlock || !input.trim()) ? 'var(--border)' : 'var(--accent)',
+            color: (hardBlock || !input.trim()) ? 'var(--text-dim)' : 'var(--bg)',
+            cursor: (hardBlock || !input.trim()) ? 'default' : 'pointer',
             borderRadius: 'var(--radius)',
             display: 'flex', alignItems: 'center', justifyContent: 'center',
             border: 'none',
@@ -396,9 +410,10 @@ function Composer({ disabled, running, onSend }) {
           {'↑'}
         </button>
       </div>
-      <div style={{ marginTop: 4, fontSize: 10, color: 'var(--text-dim)', textAlign: 'center', fontFamily: 'var(--mono)' }}>
+      <div style={{ padding: '0 16px 8px', fontSize: 10, color: 'var(--text-dim)', textAlign: 'center', fontFamily: 'var(--mono)' }}>
         enter to send / shift+enter for newline
       </div>
+      {budgetNode}
     </div>
   )
 }
@@ -414,6 +429,8 @@ export default function CoderPanel({ daemonKey, alive, pinnedChats, setPinnedCha
   const [autoApply, setAutoApply] = useState(false)
   const [diffBusy, setDiffBusy] = useState(false)
   const [diffCollapsed, setDiffCollapsed] = useState(false)
+  const [activeJobId, setActiveJobId] = useState(null) // for live token SSE during a turn
+  const [overBudget, setOverBudget] = useState(false)
   const firstEntryFired = useRef(false)
 
   useEffect(() => { saveCoderChats(chats) }, [chats])
@@ -616,7 +633,20 @@ export default function CoderPanel({ daemonKey, alive, pinnedChats, setPinnedCha
               {KIND_META[activeChat.agent_kind].label.toUpperCase()} {'·'} {activeChat.name}
             </div>
             <MessageList messages={activeChat.messages} running={running} onSendToCoder={handleSendToCoder} />
-            <Composer disabled={!alive} running={running} onSend={handleSend} />
+            <Composer
+              disabled={!alive}
+              running={running}
+              onSend={handleSend}
+              overBudget={overBudget}
+              tokenNode={
+                running && activeJobId ? (
+                  <TokenMeter mode="streaming" jobId={activeJobId} daemonKey={daemonKey} compact />
+                ) : (
+                  lastTokensFor(activeChat) && <TokenMeter mode="summary" tokens={lastTokensFor(activeChat)} compact />
+                )
+              }
+              budgetNode={<BudgetBar daemonKey={daemonKey} onOverCap={setOverBudget} />}
+            />
           </>
         ) : (
           <div style={{
@@ -640,6 +670,15 @@ export default function CoderPanel({ daemonKey, alive, pinnedChats, setPinnedCha
       />
     </div>
   )
+}
+
+function lastTokensFor(chat) {
+  if (!chat) return null
+  for (let i = chat.messages.length - 1; i >= 0; i--) {
+    const m = chat.messages[i]
+    if (m.role === 'assistant' && m.tokens) return m.tokens
+  }
+  return null
 }
 
 function buildBody(kind, text, chat, options = {}) {

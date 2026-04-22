@@ -207,6 +207,7 @@ export default function App() {
               content: data.response,
               job_id: data.job_id,
               agent: data.agent ?? agentLabel,
+              tokens: data.tokens,
             }],
           }
         }),
