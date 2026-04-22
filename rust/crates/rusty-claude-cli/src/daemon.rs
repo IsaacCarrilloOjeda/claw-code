@@ -764,6 +764,7 @@ async fn dispatch(
         ("POST", "/code/index/rebuild") => code_index_rebuild(cfg, raw).await,
         ("POST", "/code/index/file") => code_index_file(cfg, raw).await,
         ("GET", "/code/index/stats") => code_index_stats(cfg, raw).await,
+        ("GET", p) if p.starts_with("/code/files/search") => code_files_search(cfg, raw, p).await,
         ("GET", "/code/templates") => code_templates_list(raw),
         ("POST", "/code/templates/stamp") => code_templates_stamp(cfg, raw).await,
 
@@ -2670,6 +2671,49 @@ async fn code_index_stats(cfg: &DaemonConfig, raw: &str) -> (&'static str, Strin
         Err(e) => (
             "500 Internal Server Error",
             json!({ "error": "stats failed", "detail": e.to_string() }).to_string(),
+        ),
+    }
+}
+
+/// `GET /code/files/search?q=<query>&k=<n>` — thin wrapper over
+/// `agents::coder::index::search_files` so the dashboard sidebar can surface
+/// top-k file matches. Auth-gated; 503 if no DB.
+async fn code_files_search(cfg: &DaemonConfig, raw: &str, path: &str) -> (&'static str, String) {
+    if !auth_matches(raw) {
+        return ("401 Unauthorized", r#"{"error":"unauthorized"}"#.to_owned());
+    }
+    let Some(pool) = cfg.db.as_deref() else {
+        return (
+            "503 Service Unavailable",
+            r#"{"error":"database not configured"}"#.to_owned(),
+        );
+    };
+
+    let mut q = String::new();
+    let mut k: usize = 5;
+    if let Some((_, qs)) = path.split_once('?') {
+        for pair in qs.split('&') {
+            if let Some(v) = pair.strip_prefix("q=") {
+                q = url_decode(v);
+            } else if let Some(v) = pair.strip_prefix("k=") {
+                if let Ok(n) = v.parse::<usize>() {
+                    k = n.clamp(1, 50);
+                }
+            }
+        }
+    }
+    if q.is_empty() {
+        return (
+            "400 Bad Request",
+            r#"{"error":"missing ?q= parameter"}"#.to_owned(),
+        );
+    }
+
+    match crate::agents::coder::index::search_files(pool, &q, k).await {
+        Ok(hits) => ("200 OK", json!({ "hits": hits }).to_string()),
+        Err(e) => (
+            "500 Internal Server Error",
+            json!({ "error": "search failed", "detail": e.to_string() }).to_string(),
         ),
     }
 }

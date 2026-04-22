@@ -81,7 +81,7 @@ pub struct IndexStats {
     pub duration_ms: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct FileHit {
     pub path: String,
     pub similarity: f32,

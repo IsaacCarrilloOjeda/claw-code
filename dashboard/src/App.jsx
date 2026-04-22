@@ -13,6 +13,7 @@ import EventsPanel from './panels/EventsPanel.jsx'
 import BudgetPanel from './panels/BudgetPanel.jsx'
 import AgentsPanel from './panels/AgentsPanel.jsx'
 import NoChatSelected from './panels/NoChatSelected.jsx'
+import CoderPanel from './panels/CoderPanel.jsx'
 import PinnedChats from './components/PinnedChats.jsx'
 
 const PINNED_KEY = 'ghost-pinned-chats'
@@ -48,6 +49,7 @@ export default function App() {
   // Pinned-chat bar (two slots: one main, one code). Bar only renders when both are filled.
   const [pinnedChats, setPinnedChats] = useState(loadPinned)
   const [activePinSlot, setActivePinSlot] = useState(null) // which pinned pill is currently showing
+  const coderFirstEntrySeen = useRef(false)
 
   // Chat state
   const [selectedAgents, setSelectedAgents] = useState(['chat'])
@@ -293,6 +295,21 @@ export default function App() {
           flex: 1, display: 'flex', flexDirection: 'column',
           overflow: 'hidden', minWidth: 0, background: 'var(--bg)',
         }}>
+          {activeNav === 'code' && (
+            <CoderPanel
+              daemonKey={daemonKey}
+              alive={alive}
+              pinnedChats={pinnedChats}
+              setPinnedChats={setPinnedChats}
+              setActivePinSlot={setActivePinSlot}
+              onFirstEntry={() => {
+                if (!coderFirstEntrySeen.current) {
+                  coderFirstEntrySeen.current = true
+                  setSidebarCollapsed(true)
+                }
+              }}
+            />
+          )}
           {activeNav === 'sms' && <SmsPanel daemonKey={daemonKey} />}
           {activeNav === 'events' && <EventsPanel daemonKey={daemonKey} />}
           {activeNav === 'budget' && <BudgetPanel daemonKey={daemonKey} />}

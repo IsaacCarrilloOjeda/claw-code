@@ -265,7 +265,7 @@ function ProjectTree({ projects, setProjects, onOpenChat, activeChatId }) {
 }
 
 function SidebarNav({ activeNav, onNav }) {
-  const items = ['SMS', 'Events', 'Budget', 'Agents', 'Settings', 'Statistics', 'About']
+  const items = ['Code', 'SMS', 'Events', 'Budget', 'Agents', 'Settings', 'Statistics', 'About']
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 1, padding: '8px 0' }}>
       {items.map(item => {
