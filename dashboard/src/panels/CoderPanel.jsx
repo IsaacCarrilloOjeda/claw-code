@@ -1,11 +1,12 @@
 import { useState, useEffect, useRef, useMemo, useCallback } from 'react'
 import ReactMarkdown from 'react-markdown'
 import { apiFetch, uid } from '../lib/api.js'
+import DiffReview from '../components/DiffReview.jsx'
 
-// CoderPanel — D.2 skeleton. Three chat kinds (brainstorm / coder / orchestrator)
-// live in one sidebar with a file-index search. Send routing picks the endpoint
-// based on the active chat's `agent_kind`. Diff review + live-token meter arrive
-// in later phases.
+// CoderPanel — three chat kinds (brainstorm / coder / orchestrator) live in
+// one sidebar with a file-index search. Send routing picks the endpoint based
+// on the active chat's `agent_kind`. Polls /code/pending_diffs every 5s while
+// mounted. Live token meter + budget bar added in D.4.
 
 const CODER_CHATS_KEY = 'ghost-coder-chats'
 
@@ -409,6 +410,10 @@ export default function CoderPanel({ daemonKey, alive, pinnedChats, setPinnedCha
   const [activeChatId, setActiveChatId] = useState(null)
   const [running, setRunning] = useState(false)
   const [sectionOpen, setSectionOpen] = useState({ brainstorm: true, coder: true, orchestrator: true })
+  const [pendingDiffs, setPendingDiffs] = useState([])
+  const [autoApply, setAutoApply] = useState(false)
+  const [diffBusy, setDiffBusy] = useState(false)
+  const [diffCollapsed, setDiffCollapsed] = useState(false)
   const firstEntryFired = useRef(false)
 
   useEffect(() => { saveCoderChats(chats) }, [chats])
@@ -420,6 +425,55 @@ export default function CoderPanel({ daemonKey, alive, pinnedChats, setPinnedCha
       onFirstEntry?.()
     }
   }, [onFirstEntry])
+
+  // Poll pending diffs while mounted. 5s cadence per spec.
+  useEffect(() => {
+    let cancelled = false
+    async function pull() {
+      try {
+        const data = await apiFetch('/code/pending_diffs', {}, daemonKey)
+        if (!cancelled) setPendingDiffs(Array.isArray(data) ? data : [])
+      } catch { /* daemon offline etc. — leave last known */ }
+    }
+    pull()
+    const id = setInterval(pull, 5_000)
+    return () => { cancelled = true; clearInterval(id) }
+  }, [daemonKey])
+
+  // Read auto-apply setting once at mount + whenever key changes.
+  useEffect(() => {
+    let cancelled = false
+    apiFetch('/settings', {}, daemonKey)
+      .then(s => { if (!cancelled) setAutoApply(!!s?.['coder.auto_apply']) })
+      .catch(() => { /* no daemon / not authed yet */ })
+    return () => { cancelled = true }
+  }, [daemonKey])
+
+  async function handleDiffApply(id) {
+    setDiffBusy(true)
+    try {
+      await apiFetch(`/code/diffs/${id}/apply`, { method: 'POST' }, daemonKey)
+      setPendingDiffs(prev => prev.filter(d => d.id !== id))
+    } catch (e) {
+      // Surface the conflict on the card itself by marking it; simplest path
+      // for v1 is an alert. Iterate later.
+      alert(`apply failed: ${e.message}`)
+    } finally {
+      setDiffBusy(false)
+    }
+  }
+
+  async function handleDiffReject(id) {
+    setDiffBusy(true)
+    try {
+      await apiFetch(`/code/diffs/${id}/reject`, { method: 'POST' }, daemonKey)
+      setPendingDiffs(prev => prev.filter(d => d.id !== id))
+    } catch (e) {
+      alert(`reject failed: ${e.message}`)
+    } finally {
+      setDiffBusy(false)
+    }
+  }
 
   const activeChat = useMemo(() => chats.find(c => c.id === activeChatId) || null, [chats, activeChatId])
 
@@ -546,7 +600,7 @@ export default function CoderPanel({ daemonKey, alive, pinnedChats, setPinnedCha
       </aside>
 
       {/* Main conversation pane */}
-      <main style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0, overflow: 'hidden' }}>
+      <main style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0, overflow: 'hidden', minHeight: 0 }}>
         {activeChat ? (
           <>
             <div style={{
@@ -573,6 +627,17 @@ export default function CoderPanel({ daemonKey, alive, pinnedChats, setPinnedCha
           </div>
         )}
       </main>
+
+      {/* Right-side diff review. Always shows a thin strip; expands to full
+          panel when uncollapsed. Spec: auto-apply still renders cards as a log. */}
+      <DiffReview
+        diffs={pendingDiffs}
+        autoApply={autoApply}
+        onApply={handleDiffApply}
+        onReject={handleDiffReject}
+        collapsed={diffCollapsed}
+        onToggleCollapsed={() => setDiffCollapsed(c => !c)}
+      />
     </div>
   )
 }
