@@ -210,7 +210,35 @@ rusty-claude-cli/src/
 │   ├── email.rs                 [NEW]   Gmail OAuth. Draft + send with approval. (VISION Phase 3.)
 │   ├── code.rs                  [NEW]   DeepSeek + E2B sandbox. (VISION Phase 4.)
 │   ├── it_guide.rs              [NEW]   `->` prefix + screenshot. (VISION Phase 4.)
-│   └── law.rs                   [NEW]   US legal retrieval, always-cites. (VISION Phase 4.)
+│   ├── law.rs                   [NEW]   US legal retrieval, always-cites. (VISION Phase 4.)
+│   │
+│   └── coder/                   [LIVE]  Phase C — semantic file index + template scaffolds for
+│       │                                the coder agent. `agent.rs` (Prompt B) wires in the
+│       │                                DeepSeek / Anthropic fallback chain; everything below
+│       │                                is the retrieval + boilerplate-stamping layer.
+│       │
+│       ├── mod.rs               [LIVE]  `repo_root(pool)` resolver. Cascade:
+│       │                                `GHOST_CODER_REPO_ROOT` env > `coder.repo_root` setting
+│       │                                > `std::env::current_dir()`. One source of truth for the
+│       │                                indexer, watcher, and `/code/index/*` endpoints.
+│       │
+│       ├── index.rs             [LIVE]  Per-file signature embeddings in `coder_file_index`
+│       │                                (migration 023, VECTOR(1024)). `index_file` / `index_repo`
+│       │                                / `search_files` / `remove_path`. Walks via `ignore`
+│       │                                (gitignore-aware), skips target/node_modules/.git/dist/
+│       │                                .ghost, 100 KiB cap, binary-byte sniff. Embed via
+│       │                                `memory::embed`; NULL embedding row stored on failure so
+│       │                                `search_files` still finds it via the ILIKE fallback.
+│       │                                → db (coder_file_index) · memory::embed · ignore crate
+│       │
+│       └── templates/           [LIVE]  Six baked-in scaffolds (`.tmpl` + `.meta.json`) for
+│                                        new_migration / new_daemon_endpoint / new_agent /
+│                                        new_dashboard_panel / new_tool / new_db_helper. Bundled
+│                                        via `include_str!`. `stamp()` renders `{{placeholder}}`
+│                                        markers; special server-side placeholders
+│                                        `{{next_migration_number}}` and `{{today_date}}` are
+│                                        computed only when referenced. Does NOT touch disk —
+│                                        callers feed the output through the normal diff queue.
 │
 │ ── Infra layer (agent-wide concerns) ────────────────────────────
 │

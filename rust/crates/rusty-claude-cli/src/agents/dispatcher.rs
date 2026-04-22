@@ -1,13 +1,26 @@
+use super::brainstorm::BrainstormAgent;
 use super::calendar::Calendar;
 use super::chief_of_staff::ChiefOfStaff;
+use super::coder::CoderAgent;
 use super::docs::Docs;
 use super::dreamer::Dreamer;
 use super::intent::{self, Intent};
+use super::orchestrator::OrchestratorAgent;
 use super::research::Research;
 use super::{Agent, AgentRequest, AgentResponse, ModelTier};
+use crate::db;
 use crate::infra::budget;
 use crate::infra::events::{self, NewEvent, Outcome};
 use sqlx::PgPool;
+
+/// Agents that self-account via `db::record_spend` inside their own
+/// `handle()`. The dispatcher must NOT call `budget::debit` for these or
+/// `agent_spend` double-charges (debit in handler + debit in dispatcher).
+const SELF_ACCOUNTING_AGENTS: &[&str] = &["coder", "brainstorm", "orchestrator"];
+
+/// Coder-group agents that honor `coder.kill_switch` / `GHOST_CODING_AGENT=off`.
+/// Kept in sync with `infra::provider::KILL_SWITCHED_AGENTS`.
+const KILL_SWITCHED_AGENTS: &[&str] = &["coder", "brainstorm", "orchestrator"];
 
 pub struct Dispatcher {
     // Wave 3: registered agents live here.
@@ -52,10 +65,35 @@ impl Dispatcher {
             Intent::ChiefOfStaff => ("chief_of_staff", ModelTier::Mid),
             Intent::Docs => ("docs", ModelTier::Fast),
             Intent::Dreamer => ("dreamer", ModelTier::Mid),
+            Intent::Coder => ("coder", ModelTier::Code),
+            Intent::Brainstorm => ("brainstorm", ModelTier::Code),
+            Intent::Orchestrator => ("orchestrator", ModelTier::Mid),
             Intent::Ignore => unreachable!("ignore handled above"),
         };
 
         let job_uuid = parse_uuid(&req.job_id);
+
+        // Kill switch short-circuit for coder-group agents. Runs BEFORE the
+        // budget check so a killed agent never costs a DB round-trip we
+        // then have to unwind.
+        if KILL_SWITCHED_AGENTS.contains(&agent_name) && is_kill_switched(pool).await {
+            record_event(
+                pool,
+                NewEvent {
+                    job_id: job_uuid,
+                    agent: agent_name,
+                    tier: tier.as_str(),
+                    input: Some(&req.message),
+                    output: Some("kill_switched"),
+                    tokens_in: 0,
+                    tokens_out: 0,
+                    cost_cents: 0,
+                    outcome: Outcome::Refused,
+                },
+            )
+            .await;
+            return Err("kill_switched".into());
+        }
 
         // Budget gate. A blown cap writes a `refused` event and returns 402-ish.
         let status = budget::check(pool, agent_name)
@@ -119,6 +157,25 @@ impl Dispatcher {
                 .handle(req.clone(), pool)
                 .await
                 .map(|resp| (resp.text, resp.usage)),
+            Intent::Coder => {
+                let chat_id = job_uuid.unwrap_or_else(uuid::Uuid::new_v4);
+                let repo_root = super::coder::repo_root(pool).await;
+                CoderAgent::new(repo_root, chat_id)
+                    .handle(req.clone(), pool)
+                    .await
+                    .map(|resp| (resp.text, resp.usage))
+            }
+            Intent::Brainstorm => BrainstormAgent::new()
+                .handle(req.clone(), pool)
+                .await
+                .map(|resp| (resp.text, resp.usage)),
+            Intent::Orchestrator => {
+                let repo_root = super::coder::repo_root(pool).await;
+                OrchestratorAgent::new(repo_root, job_uuid)
+                    .handle(req.clone(), pool)
+                    .await
+                    .map(|resp| (resp.text, resp.usage))
+            }
             Intent::Ignore => unreachable!("handled above"),
         };
 
@@ -128,8 +185,15 @@ impl Dispatcher {
                 let tokens_out = i64::from(usage.tokens_out);
                 let cost = budget::cost_cents(tier, tokens_in, tokens_out);
 
-                if let Err(e) = budget::debit(pool, agent_name, tokens_in, tokens_out, cost).await {
-                    eprintln!("[ghost budget] debit failed for {agent_name}: {e}");
+                // Self-accounting agents already wrote to `coder_spend` (and
+                // therefore `agent_spend` via `debit_with_provider`) inside
+                // their own handle(). Skipping here avoids a double-debit.
+                if !SELF_ACCOUNTING_AGENTS.contains(&agent_name) {
+                    if let Err(e) =
+                        budget::debit(pool, agent_name, tokens_in, tokens_out, cost).await
+                    {
+                        eprintln!("[ghost budget] debit failed for {agent_name}: {e}");
+                    }
                 }
 
                 record_event(
@@ -192,6 +256,20 @@ impl Default for Dispatcher {
 
 fn parse_uuid(s: &str) -> Option<uuid::Uuid> {
     uuid::Uuid::parse_str(s).ok()
+}
+
+/// True when `GHOST_CODING_AGENT=off` or `settings_kv.coder.kill_switch=true`.
+/// Checked before dispatching to any coder-group agent.
+async fn is_kill_switched(pool: &PgPool) -> bool {
+    if std::env::var("GHOST_CODING_AGENT")
+        .ok()
+        .is_some_and(|v| v.trim().eq_ignore_ascii_case("off"))
+    {
+        return true;
+    }
+    db::get_setting::<bool>(pool, "coder.kill_switch")
+        .await
+        .unwrap_or(false)
 }
 
 fn clamp_i32(v: i64) -> i32 {

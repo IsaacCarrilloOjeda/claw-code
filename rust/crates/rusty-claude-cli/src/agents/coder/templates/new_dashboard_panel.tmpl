@@ -1,0 +1,72 @@
+import { useState, useEffect } from 'react'
+import { apiFetch } from '../lib/api.js'
+
+// Register in App.jsx nav:
+//     { key: '{{nav_key}}', label: '{{title}}' }
+// ...and render:
+//     {active === '{{nav_key}}' && <{{Name}}Panel daemonKey={daemonKey} />}
+
+export default function {{Name}}Panel({ daemonKey }) {
+  const [items, setItems] = useState([])
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState(null)
+
+  async function refresh() {
+    setLoading(true)
+    setError(null)
+    try {
+      // TODO: replace with the real endpoint this panel backs.
+      const res = await apiFetch('/health', { daemonKey })
+      setItems(res ? [res] : [])
+    } catch (e) {
+      setError(String(e))
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  useEffect(() => { refresh() }, [daemonKey])
+
+  return (
+    <div style={{
+      display: 'flex', flexDirection: 'column', gap: 8,
+      padding: 12, fontFamily: 'var(--mono)', fontSize: 12,
+      color: 'var(--text)',
+    }}>
+      <div style={{
+        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+      }}>
+        <h2 style={{ margin: 0, fontSize: 13, fontWeight: 600 }}>
+          {{title}}
+        </h2>
+        <button
+          onClick={refresh}
+          disabled={loading}
+          style={{
+            padding: '3px 8px', fontSize: 10,
+            background: 'transparent', color: 'var(--text-dim)',
+            border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)',
+            cursor: loading ? 'default' : 'pointer',
+          }}
+        >{loading ? '...' : 'refresh'}</button>
+      </div>
+
+      {error && (
+        <div style={{ color: 'var(--danger, #c33)', fontSize: 11 }}>{error}</div>
+      )}
+
+      {items.length === 0 && !loading && !error && (
+        <div style={{ color: 'var(--text-dim)', fontSize: 11 }}>empty.</div>
+      )}
+
+      {items.map((it, i) => (
+        <pre key={i} style={{
+          margin: 0, padding: 8,
+          background: 'var(--bg-elevated, rgba(0,0,0,0.03))',
+          border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)',
+          whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+        }}>{JSON.stringify(it, null, 2)}</pre>
+      ))}
+    </div>
+  )
+}

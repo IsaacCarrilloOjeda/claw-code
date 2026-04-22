@@ -1,0 +1,17 @@
+{
+  "name": "new_migration",
+  "description": "SQL migration with numbered filename and header comment.",
+  "output_path_template": "rust/migrations/{{next_migration_number}}_{{name}}.sql",
+  "placeholders": [
+    {
+      "name": "name",
+      "description": "snake_case slug used in the filename and sample table.",
+      "example": "coder_diffs"
+    },
+    {
+      "name": "description",
+      "description": "One-line summary that lands in the header comment.",
+      "example": "Pending diffs the coder agent has queued for review."
+    }
+  ]
+}

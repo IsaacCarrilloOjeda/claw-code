@@ -1,0 +1,29 @@
+//! {{description}}
+//!
+//! Added {{today_date}}. Register in `agents/tools/mod.rs` → `registry()`.
+
+use async_trait::async_trait;
+use serde_json::Value;
+
+use super::{Tool, ToolCtx, ToolError};
+
+pub struct {{name}};
+
+#[async_trait]
+impl Tool for {{name}} {
+    fn name(&self) -> &'static str {
+        "{{name}}"
+    }
+
+    fn schema(&self) -> Value {
+        serde_json::from_str(r#"{{args_schema_json}}"#).unwrap_or(Value::Null)
+    }
+
+    async fn run(&self, args: Value, ctx: &ToolCtx) -> Result<String, ToolError> {
+        // TODO: implement. Call `super::resolve_within_repo(&ctx.repo_root, rel)`
+        // before touching any file path, and return a String payload the model
+        // will see as the tool result.
+        let _ = (args, ctx);
+        Ok(String::new())
+    }
+}

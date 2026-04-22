@@ -1,0 +1,22 @@
+{
+  "name": "new_dashboard_panel",
+  "description": "React panel component with daemonKey prop, apiFetch wiring, and an empty state.",
+  "output_path_template": "dashboard/src/panels/{{Name}}Panel.jsx",
+  "placeholders": [
+    {
+      "name": "Name",
+      "description": "PascalCase component name (file becomes `<Name>Panel.jsx`).",
+      "example": "Scheduler"
+    },
+    {
+      "name": "nav_key",
+      "description": "Lowercase key used in App.jsx's tab nav.",
+      "example": "scheduler"
+    },
+    {
+      "name": "title",
+      "description": "Human-readable heading shown at the top of the panel.",
+      "example": "Scheduler"
+    }
+  ]
+}

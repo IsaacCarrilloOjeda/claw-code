@@ -35,8 +35,11 @@ use tokio::net::{TcpListener, TcpStream};
 
 use crate::db;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Mutex;
+
+use tokio::sync::Mutex as AsyncMutex;
 
 const DEFAULT_DAEMON_PORT: u16 = 7878;
 const PID_FILENAME: &str = "daemon.pid";
@@ -110,6 +113,9 @@ struct DaemonConfig {
     db: Option<Arc<PgPool>>,
     /// In-memory rate limiter for POST endpoints.
     rate_limiter: Arc<RateLimiter>,
+    /// Serializes `POST /code/index/rebuild` — only one full reindex runs at
+    /// a time; contention returns 409 via `try_lock`.
+    coder_rebuild_lock: Arc<AsyncMutex<()>>,
 }
 
 /// Entry point called from `run()` in main.rs.
@@ -130,11 +136,13 @@ pub fn run_daemon(
             allow_unsafe_prompt,
             db,
             rate_limiter: Arc::new(RateLimiter::new()),
+            coder_rebuild_lock: Arc::new(AsyncMutex::new(())),
         };
         daemon_main(cfg).await
     })
 }
 
+#[allow(clippy::too_many_lines)]
 async fn daemon_main(cfg: DaemonConfig) -> Result<(), Box<dyn std::error::Error>> {
     if let Ok(key) = std::env::var("GHOST_DAEMON_KEY") {
         if key.trim().is_empty() {
@@ -213,6 +221,35 @@ async fn daemon_main(cfg: DaemonConfig) -> Result<(), Box<dyn std::error::Error>
             loop {
                 interval.tick().await;
                 db::tick_schedule(&pool).await;
+            }
+        });
+    }
+
+    // Spawn coder file-index filesystem watcher. Opt-in via the
+    // `coder.index_watcher_enabled` setting (default on). Silently skips
+    // when the resolved repo_root doesn't exist on disk (e.g. Railway), so
+    // cloud deploys don't crash on startup.
+    if let Some(pool) = cfg.db.clone() {
+        tokio::spawn(async move {
+            let enabled = db::get_setting::<bool>(&pool, "coder.index_watcher_enabled")
+                .await
+                .unwrap_or(true);
+            if !enabled {
+                eprintln!(
+                    "{LOG_PREFIX} coder index watcher: disabled via coder.index_watcher_enabled"
+                );
+                return;
+            }
+            let root = crate::agents::coder::repo_root(&pool).await;
+            if !root.exists() || !root.is_dir() {
+                eprintln!(
+                    "{LOG_PREFIX} coder index watcher: repo_root {} missing, skipping",
+                    root.display()
+                );
+                return;
+            }
+            if let Err(e) = spawn_coder_watcher(pool, root.clone()) {
+                eprintln!("{LOG_PREFIX} coder index watcher failed to start: {e}");
             }
         });
     }
@@ -723,6 +760,37 @@ async fn dispatch(
         // --- Coder health (Phase A) — unauthenticated on purpose ---
         ("GET", "/code/health") => code_health(cfg).await,
 
+        // --- Coder file index + templates (Phase C) ---
+        ("POST", "/code/index/rebuild") => code_index_rebuild(cfg, raw).await,
+        ("POST", "/code/index/file") => code_index_file(cfg, raw).await,
+        ("GET", "/code/index/stats") => code_index_stats(cfg, raw).await,
+        ("GET", "/code/templates") => code_templates_list(raw),
+        ("POST", "/code/templates/stamp") => code_templates_stamp(cfg, raw).await,
+
+        // --- Coder chat + brainstorm + orchestrate (Phase B.6) ---
+        ("POST", "/code/chat") => code_chat_handler(cfg, raw).await,
+        ("POST", "/code/brainstorm") => code_brainstorm_handler(cfg, raw).await,
+        ("POST", "/code/orchestrate") => code_orchestrate_handler(cfg, raw).await,
+        ("POST", p) if p.starts_with("/code/orchestrate/") && p.ends_with("/run") => {
+            let id = &p["/code/orchestrate/".len()..p.len() - "/run".len()];
+            code_orchestrate_run_handler(cfg, raw, id).await
+        }
+        ("GET", p) if p.starts_with("/code/orchestrate/") => {
+            let id = &p["/code/orchestrate/".len()..];
+            let id = id.split('?').next().unwrap_or(id);
+            code_orchestrate_get_handler(cfg, raw, id).await
+        }
+        ("GET", "/code/pending_diffs") => code_pending_diffs_handler(cfg, raw).await,
+        ("POST", p) if p.starts_with("/code/diffs/") && p.ends_with("/apply") => {
+            let id = &p["/code/diffs/".len()..p.len() - "/apply".len()];
+            code_diff_apply_handler(cfg, raw, id).await
+        }
+        ("POST", p) if p.starts_with("/code/diffs/") && p.ends_with("/reject") => {
+            let id = &p["/code/diffs/".len()..p.len() - "/reject".len()];
+            code_diff_reject_handler(cfg, raw, id).await
+        }
+        ("GET", "/code/spend") => code_spend_handler(cfg, raw).await,
+
         // --- Availability schedules (slots A/B/C) + sleep mode ---
         ("GET", "/sms/availability") => availability_list(cfg, raw).await,
         ("PUT", p) if p.starts_with("/sms/availability/slots/") => {
@@ -1222,6 +1290,9 @@ async fn chat_handler(cfg: &DaemonConfig, raw: &str) -> (&'static str, String) {
         crate::agents::intent::Intent::ChiefOfStaff => "chief_of_staff",
         crate::agents::intent::Intent::Docs => "docs",
         crate::agents::intent::Intent::Dreamer => "dreamer",
+        crate::agents::intent::Intent::Coder => "coder",
+        crate::agents::intent::Intent::Brainstorm => "brainstorm",
+        crate::agents::intent::Intent::Orchestrator => "orchestrator",
         crate::agents::intent::Intent::Ignore => "ignored",
         crate::agents::intent::Intent::Chat => "chat_dispatcher",
     };
@@ -1452,6 +1523,9 @@ async fn sms_inbound(cfg: &DaemonConfig, raw: &str) -> (&'static str, String) {
         crate::agents::intent::Intent::ChiefOfStaff => "chief_of_staff",
         crate::agents::intent::Intent::Docs => "docs",
         crate::agents::intent::Intent::Dreamer => "dreamer",
+        crate::agents::intent::Intent::Coder => "coder",
+        crate::agents::intent::Intent::Brainstorm => "brainstorm",
+        crate::agents::intent::Intent::Orchestrator => "orchestrator",
         crate::agents::intent::Intent::Ignore => "ignored",
         crate::agents::intent::Intent::Chat => "chat_dispatcher",
     };
@@ -1979,6 +2053,419 @@ async fn schedule_delete(cfg: &DaemonConfig, raw: &str, id: &str) -> (&'static s
     }
 }
 
+// ---------------------------------------------------------------------------
+// Availability schedules + sleep mode (migration 017)
+// ---------------------------------------------------------------------------
+
+fn parse_hhmm(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    bytes.len() == 5
+        && bytes[2] == b':'
+        && bytes[0].is_ascii_digit()
+        && bytes[1].is_ascii_digit()
+        && bytes[3].is_ascii_digit()
+        && bytes[4].is_ascii_digit()
+        && s[..2].parse::<u8>().is_ok_and(|h| h < 24)
+        && s[3..].parse::<u8>().is_ok_and(|m| m < 60)
+}
+
+fn parse_iso_date(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    bytes.len() == 10
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && s[..4].parse::<u16>().is_ok()
+        && s[5..7].parse::<u8>().is_ok_and(|m| (1..=12).contains(&m))
+        && s[8..].parse::<u8>().is_ok_and(|d| (1..=31).contains(&d))
+}
+
+async fn availability_list(cfg: &DaemonConfig, raw: &str) -> (&'static str, String) {
+    if !auth_matches(raw) {
+        return ("401 Unauthorized", r#"{"error":"unauthorized"}"#.to_owned());
+    }
+    let Some(pool) = cfg.db.as_deref() else {
+        return (
+            "503 Service Unavailable",
+            r#"{"error":"database not configured"}"#.to_owned(),
+        );
+    };
+    let slots = db::list_schedule_slots(pool).await;
+    let sleep = db::get_sleep_state(pool).await;
+    (
+        "200 OK",
+        json!({ "slots": slots, "sleep": sleep }).to_string(),
+    )
+}
+
+async fn availability_rename_slot(
+    cfg: &DaemonConfig,
+    raw: &str,
+    slot: &str,
+) -> (&'static str, String) {
+    if !auth_matches(raw) {
+        return ("401 Unauthorized", r#"{"error":"unauthorized"}"#.to_owned());
+    }
+    let Some(pool) = cfg.db.as_deref() else {
+        return (
+            "503 Service Unavailable",
+            r#"{"error":"database not configured"}"#.to_owned(),
+        );
+    };
+    let body_str = raw
+        .split_once("\r\n\r\n")
+        .or_else(|| raw.split_once("\n\n"))
+        .map_or("", |(_, b)| b);
+    let Ok(body) = serde_json::from_str::<serde_json::Value>(body_str) else {
+        return (
+            "400 Bad Request",
+            r#"{"error":"body must be JSON"}"#.to_owned(),
+        );
+    };
+    let name = body["name"].as_str().unwrap_or("");
+    if name.len() > 64 {
+        return (
+            "400 Bad Request",
+            r#"{"error":"name must be 64 chars or fewer"}"#.to_owned(),
+        );
+    }
+    if db::rename_schedule_slot(pool, slot, name).await {
+        ("200 OK", r#"{"status":"ok"}"#.to_owned())
+    } else {
+        (
+            "400 Bad Request",
+            r#"{"error":"invalid slot (must be A/B/C)"}"#.to_owned(),
+        )
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+async fn availability_window_create(cfg: &DaemonConfig, raw: &str) -> (&'static str, String) {
+    if !auth_matches(raw) {
+        return ("401 Unauthorized", r#"{"error":"unauthorized"}"#.to_owned());
+    }
+    let Some(pool) = cfg.db.as_deref() else {
+        return (
+            "503 Service Unavailable",
+            r#"{"error":"database not configured"}"#.to_owned(),
+        );
+    };
+    let body_str = raw
+        .split_once("\r\n\r\n")
+        .or_else(|| raw.split_once("\n\n"))
+        .map_or("", |(_, b)| b);
+    let Ok(body) = serde_json::from_str::<serde_json::Value>(body_str) else {
+        return (
+            "400 Bad Request",
+            r#"{"error":"body must be JSON"}"#.to_owned(),
+        );
+    };
+
+    let Some(slot) = body["slot"].as_str() else {
+        return (
+            "400 Bad Request",
+            r#"{"error":"missing field: slot"}"#.to_owned(),
+        );
+    };
+    let Some(kind) = body["kind"].as_str() else {
+        return (
+            "400 Bad Request",
+            r#"{"error":"missing field: kind"}"#.to_owned(),
+        );
+    };
+    let Some(start_time) = body["start_time"].as_str() else {
+        return (
+            "400 Bad Request",
+            r#"{"error":"missing field: start_time (HH:MM)"}"#.to_owned(),
+        );
+    };
+    let Some(end_time) = body["end_time"].as_str() else {
+        return (
+            "400 Bad Request",
+            r#"{"error":"missing field: end_time (HH:MM)"}"#.to_owned(),
+        );
+    };
+    if !parse_hhmm(start_time) || !parse_hhmm(end_time) || start_time >= end_time {
+        return (
+            "400 Bad Request",
+            r#"{"error":"start_time/end_time must be HH:MM and start < end"}"#.to_owned(),
+        );
+    }
+
+    let result = match kind {
+        "weekly" => {
+            let Some(mask) = body["weekday_mask"].as_i64() else {
+                return (
+                    "400 Bad Request",
+                    r#"{"error":"weekly windows require weekday_mask (int, bits 0..6 = Sun..Sat)"}"#
+                        .to_owned(),
+                );
+            };
+            if !(1..=127).contains(&mask) {
+                return (
+                    "400 Bad Request",
+                    r#"{"error":"weekday_mask must be between 1 and 127"}"#.to_owned(),
+                );
+            }
+            let m: i32 = match mask.try_into() {
+                Ok(v) => v,
+                Err(_) => {
+                    return (
+                        "400 Bad Request",
+                        r#"{"error":"weekday_mask out of range"}"#.to_owned(),
+                    );
+                }
+            };
+            db::insert_weekly_window(pool, slot, m, start_time, end_time).await
+        }
+        "oneoff" => {
+            let Some(day_date) = body["day_date"].as_str() else {
+                return (
+                    "400 Bad Request",
+                    r#"{"error":"oneoff windows require day_date (YYYY-MM-DD)"}"#.to_owned(),
+                );
+            };
+            if !parse_iso_date(day_date) {
+                return (
+                    "400 Bad Request",
+                    r#"{"error":"day_date must be YYYY-MM-DD"}"#.to_owned(),
+                );
+            }
+            db::insert_oneoff_window(pool, slot, day_date, start_time, end_time).await
+        }
+        _ => {
+            return (
+                "400 Bad Request",
+                r#"{"error":"kind must be 'weekly' or 'oneoff'"}"#.to_owned(),
+            );
+        }
+    };
+
+    match result {
+        Some(id) => ("200 OK", json!({ "id": id }).to_string()),
+        None => (
+            "500 Internal Server Error",
+            r#"{"error":"failed to insert window"}"#.to_owned(),
+        ),
+    }
+}
+
+async fn availability_window_delete(
+    cfg: &DaemonConfig,
+    raw: &str,
+    id: &str,
+) -> (&'static str, String) {
+    if !auth_matches(raw) {
+        return ("401 Unauthorized", r#"{"error":"unauthorized"}"#.to_owned());
+    }
+    let Some(pool) = cfg.db.as_deref() else {
+        return (
+            "503 Service Unavailable",
+            r#"{"error":"database not configured"}"#.to_owned(),
+        );
+    };
+    if db::delete_schedule_window(pool, id).await {
+        ("200 OK", r#"{"status":"deleted"}"#.to_owned())
+    } else {
+        ("404 Not Found", r#"{"error":"not found"}"#.to_owned())
+    }
+}
+
+async fn availability_contact_slot(
+    cfg: &DaemonConfig,
+    raw: &str,
+    phone: &str,
+) -> (&'static str, String) {
+    if !auth_matches(raw) {
+        return ("401 Unauthorized", r#"{"error":"unauthorized"}"#.to_owned());
+    }
+    let Some(pool) = cfg.db.as_deref() else {
+        return (
+            "503 Service Unavailable",
+            r#"{"error":"database not configured"}"#.to_owned(),
+        );
+    };
+    let body_str = raw
+        .split_once("\r\n\r\n")
+        .or_else(|| raw.split_once("\n\n"))
+        .map_or("", |(_, b)| b);
+    let Ok(body) = serde_json::from_str::<serde_json::Value>(body_str) else {
+        return (
+            "400 Bad Request",
+            r#"{"error":"body must be JSON"}"#.to_owned(),
+        );
+    };
+    let slot = body["slot"].as_str();
+    // null or absent → clear assignment.
+    let slot_opt = if body["slot"].is_null() { None } else { slot };
+    if db::set_contact_schedule_slot(pool, phone, slot_opt).await {
+        // Immediately re-evaluate so the UI sees the correct state without waiting 60s.
+        db::tick_schedule(pool).await;
+        ("200 OK", json!({ "slot": slot_opt }).to_string())
+    } else {
+        (
+            "400 Bad Request",
+            r#"{"error":"invalid slot (must be A/B/C or null)"}"#.to_owned(),
+        )
+    }
+}
+
+async fn sleep_get(cfg: &DaemonConfig, raw: &str) -> (&'static str, String) {
+    if !auth_matches(raw) {
+        return ("401 Unauthorized", r#"{"error":"unauthorized"}"#.to_owned());
+    }
+    let Some(pool) = cfg.db.as_deref() else {
+        return (
+            "503 Service Unavailable",
+            r#"{"error":"database not configured"}"#.to_owned(),
+        );
+    };
+    let state = db::get_sleep_state(pool).await;
+    (
+        "200 OK",
+        serde_json::to_string(&state).unwrap_or_else(|_| "{}".into()),
+    )
+}
+
+async fn sleep_start(cfg: &DaemonConfig, raw: &str) -> (&'static str, String) {
+    if !auth_matches(raw) {
+        return ("401 Unauthorized", r#"{"error":"unauthorized"}"#.to_owned());
+    }
+    let Some(pool) = cfg.db.as_deref() else {
+        return (
+            "503 Service Unavailable",
+            r#"{"error":"database not configured"}"#.to_owned(),
+        );
+    };
+    let body_str = raw
+        .split_once("\r\n\r\n")
+        .or_else(|| raw.split_once("\n\n"))
+        .map_or("", |(_, b)| b);
+    let Ok(body) = serde_json::from_str::<serde_json::Value>(body_str) else {
+        return (
+            "400 Bad Request",
+            r#"{"error":"body must be JSON"}"#.to_owned(),
+        );
+    };
+    let Some(awake_by) = body["awake_by_local"].as_str() else {
+        return (
+            "400 Bad Request",
+            r#"{"error":"missing field: awake_by_local (HH:MM in America/Denver)"}"#.to_owned(),
+        );
+    };
+    if !parse_hhmm(awake_by) {
+        return (
+            "400 Bad Request",
+            r#"{"error":"awake_by_local must be HH:MM"}"#.to_owned(),
+        );
+    }
+    match db::start_sleep(pool, awake_by).await {
+        Ok(state) => {
+            db::tick_schedule(pool).await;
+            (
+                "200 OK",
+                serde_json::to_string(&state).unwrap_or_else(|_| "{}".into()),
+            )
+        }
+        Err(e) => (
+            "500 Internal Server Error",
+            json!({ "error": format!("failed to start sleep: {e}") }).to_string(),
+        ),
+    }
+}
+
+async fn sleep_end(cfg: &DaemonConfig, raw: &str) -> (&'static str, String) {
+    if !auth_matches(raw) {
+        return ("401 Unauthorized", r#"{"error":"unauthorized"}"#.to_owned());
+    }
+    let Some(pool) = cfg.db.as_deref() else {
+        return (
+            "503 Service Unavailable",
+            r#"{"error":"database not configured"}"#.to_owned(),
+        );
+    };
+    match db::end_sleep(pool).await {
+        Ok(()) => {
+            db::tick_schedule(pool).await;
+            ("200 OK", r#"{"status":"ok"}"#.to_owned())
+        }
+        Err(e) => (
+            "500 Internal Server Error",
+            json!({ "error": format!("failed to end sleep: {e}") }).to_string(),
+        ),
+    }
+}
+
+async fn sleep_contacts_list(cfg: &DaemonConfig, raw: &str) -> (&'static str, String) {
+    if !auth_matches(raw) {
+        return ("401 Unauthorized", r#"{"error":"unauthorized"}"#.to_owned());
+    }
+    let Some(pool) = cfg.db.as_deref() else {
+        return (
+            "503 Service Unavailable",
+            r#"{"error":"database not configured"}"#.to_owned(),
+        );
+    };
+    let phones = db::list_sleep_contacts(pool).await;
+    ("200 OK", json!({ "phones": phones }).to_string())
+}
+
+async fn sleep_contact_add(cfg: &DaemonConfig, raw: &str) -> (&'static str, String) {
+    if !auth_matches(raw) {
+        return ("401 Unauthorized", r#"{"error":"unauthorized"}"#.to_owned());
+    }
+    let Some(pool) = cfg.db.as_deref() else {
+        return (
+            "503 Service Unavailable",
+            r#"{"error":"database not configured"}"#.to_owned(),
+        );
+    };
+    let body_str = raw
+        .split_once("\r\n\r\n")
+        .or_else(|| raw.split_once("\n\n"))
+        .map_or("", |(_, b)| b);
+    let Ok(body) = serde_json::from_str::<serde_json::Value>(body_str) else {
+        return (
+            "400 Bad Request",
+            r#"{"error":"body must be JSON"}"#.to_owned(),
+        );
+    };
+    let Some(phone) = body["phone"].as_str() else {
+        return (
+            "400 Bad Request",
+            r#"{"error":"missing field: phone"}"#.to_owned(),
+        );
+    };
+    db::add_sleep_contact(pool, phone).await;
+    db::tick_schedule(pool).await;
+    ("200 OK", r#"{"status":"ok"}"#.to_owned())
+}
+
+async fn sleep_contact_remove(
+    cfg: &DaemonConfig,
+    raw: &str,
+    phone: &str,
+) -> (&'static str, String) {
+    if !auth_matches(raw) {
+        return ("401 Unauthorized", r#"{"error":"unauthorized"}"#.to_owned());
+    }
+    let Some(pool) = cfg.db.as_deref() else {
+        return (
+            "503 Service Unavailable",
+            r#"{"error":"database not configured"}"#.to_owned(),
+        );
+    };
+    let removed = db::remove_sleep_contact(pool, phone).await;
+    db::tick_schedule(pool).await;
+    if removed {
+        ("200 OK", r#"{"status":"removed"}"#.to_owned())
+    } else {
+        (
+            "404 Not Found",
+            r#"{"error":"not in sleep list"}"#.to_owned(),
+        )
+    }
+}
+
 /// `GET /facts` -- return the shareable-facts blob.
 async fn facts_get(cfg: &DaemonConfig, raw: &str) -> (&'static str, String) {
     if !auth_matches(raw) {
@@ -2054,6 +2541,318 @@ async fn facts_put(cfg: &DaemonConfig, raw: &str) -> (&'static str, String) {
 // the dashboard status dot works before Isaac types his key.
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Coder file index + templates (Phase C)
+//
+// `/code/index/*` endpoints operate on the `coder_file_index` table — a
+// pgvector store of per-file signature embeddings the coder agent uses to
+// find relevant files without reading the whole repo. Rebuilds are
+// serialized via `cfg.coder_rebuild_lock` (try_lock → 409 on contention).
+// Single-file indexing and stats are unserialized by design.
+//
+// `/code/templates` serves bundled template metadata; `/code/templates/stamp`
+// renders a named template + placeholders and returns `{path, content}`
+// WITHOUT writing to disk — the caller feeds the content through the normal
+// diff queue if it wants to apply it.
+// ---------------------------------------------------------------------------
+
+async fn code_index_rebuild(cfg: &DaemonConfig, raw: &str) -> (&'static str, String) {
+    if !auth_matches(raw) {
+        return ("401 Unauthorized", r#"{"error":"unauthorized"}"#.to_owned());
+    }
+    let Some(pool) = cfg.db.as_deref() else {
+        return (
+            "503 Service Unavailable",
+            r#"{"error":"database not configured"}"#.to_owned(),
+        );
+    };
+
+    let Ok(_guard) = cfg.coder_rebuild_lock.try_lock() else {
+        return (
+            "409 Conflict",
+            r#"{"error":"rebuild already in progress"}"#.to_owned(),
+        );
+    };
+
+    let root = crate::agents::coder::repo_root(pool).await;
+    if !root.exists() || !root.is_dir() {
+        return (
+            "400 Bad Request",
+            json!({ "error": "repo_root missing", "resolved": root.display().to_string() })
+                .to_string(),
+        );
+    }
+
+    match crate::agents::coder::index::index_repo(pool, &root).await {
+        Ok(stats) => (
+            "200 OK",
+            json!({
+                "files_scanned": stats.files_scanned,
+                "files_embedded": stats.files_embedded,
+                "duration_ms": stats.duration_ms,
+                "repo_root": root.display().to_string(),
+            })
+            .to_string(),
+        ),
+        Err(e) => {
+            eprintln!("{LOG_PREFIX} /code/index/rebuild failed: {e}");
+            (
+                "500 Internal Server Error",
+                json!({ "error": "rebuild failed", "detail": e.to_string() }).to_string(),
+            )
+        }
+    }
+}
+
+async fn code_index_file(cfg: &DaemonConfig, raw: &str) -> (&'static str, String) {
+    if !auth_matches(raw) {
+        return ("401 Unauthorized", r#"{"error":"unauthorized"}"#.to_owned());
+    }
+    let Some(pool) = cfg.db.as_deref() else {
+        return (
+            "503 Service Unavailable",
+            r#"{"error":"database not configured"}"#.to_owned(),
+        );
+    };
+
+    let body_str = raw
+        .split_once("\r\n\r\n")
+        .or_else(|| raw.split_once("\n\n"))
+        .map_or("", |(_, b)| b);
+    let Ok(body) = serde_json::from_str::<serde_json::Value>(body_str) else {
+        return (
+            "400 Bad Request",
+            r#"{"error":"body must be JSON"}"#.to_owned(),
+        );
+    };
+    let Some(path_str) = body.get("path").and_then(|v| v.as_str()) else {
+        return (
+            "400 Bad Request",
+            r#"{"error":"missing field: path"}"#.to_owned(),
+        );
+    };
+
+    let root = crate::agents::coder::repo_root(pool).await;
+    let rel = PathBuf::from(path_str);
+    match crate::agents::coder::index::index_file(pool, &root, &rel).await {
+        Ok(outcome) => (
+            "200 OK",
+            json!({
+                "path": path_str,
+                "skipped_unchanged": outcome.skipped_unchanged,
+                "embedded": outcome.embedded,
+            })
+            .to_string(),
+        ),
+        Err(e) => (
+            "500 Internal Server Error",
+            json!({ "error": "index_file failed", "detail": e.to_string() }).to_string(),
+        ),
+    }
+}
+
+async fn code_index_stats(cfg: &DaemonConfig, raw: &str) -> (&'static str, String) {
+    if !auth_matches(raw) {
+        return ("401 Unauthorized", r#"{"error":"unauthorized"}"#.to_owned());
+    }
+    let Some(pool) = cfg.db.as_deref() else {
+        return (
+            "503 Service Unavailable",
+            r#"{"error":"database not configured"}"#.to_owned(),
+        );
+    };
+
+    match crate::agents::coder::index::stored_stats(pool).await {
+        Ok(s) => (
+            "200 OK",
+            serde_json::to_string(&s).unwrap_or_else(|_| "{}".to_string()),
+        ),
+        Err(e) => (
+            "500 Internal Server Error",
+            json!({ "error": "stats failed", "detail": e.to_string() }).to_string(),
+        ),
+    }
+}
+
+fn code_templates_list(raw: &str) -> (&'static str, String) {
+    if !auth_matches(raw) {
+        return ("401 Unauthorized", r#"{"error":"unauthorized"}"#.to_owned());
+    }
+    let body = serde_json::to_string(crate::agents::coder::templates::all())
+        .unwrap_or_else(|_| "[]".to_string());
+    ("200 OK", body)
+}
+
+async fn code_templates_stamp(cfg: &DaemonConfig, raw: &str) -> (&'static str, String) {
+    if !auth_matches(raw) {
+        return ("401 Unauthorized", r#"{"error":"unauthorized"}"#.to_owned());
+    }
+    let body_str = raw
+        .split_once("\r\n\r\n")
+        .or_else(|| raw.split_once("\n\n"))
+        .map_or("", |(_, b)| b);
+    let Ok(body) = serde_json::from_str::<serde_json::Value>(body_str) else {
+        return (
+            "400 Bad Request",
+            r#"{"error":"body must be JSON"}"#.to_owned(),
+        );
+    };
+
+    let Some(name) = body.get("template_name").and_then(|v| v.as_str()) else {
+        return (
+            "400 Bad Request",
+            r#"{"error":"missing field: template_name"}"#.to_owned(),
+        );
+    };
+    let placeholders = body
+        .get("placeholders")
+        .and_then(|v| v.as_object())
+        .cloned()
+        .unwrap_or_default();
+
+    let Some(tmpl) = crate::agents::coder::templates::by_name(name) else {
+        return (
+            "404 Not Found",
+            json!({ "error": "unknown template", "template_name": name }).to_string(),
+        );
+    };
+
+    // Resolve migrations dir relative to the coder's repo_root so
+    // `{{next_migration_number}}` picks up existing files even when the
+    // daemon's cwd isn't the repo root. DB is guaranteed by the endpoints
+    // that need it, but template stamping itself doesn't require one — we
+    // fall back to cwd when the pool is absent.
+    let migrations_dir = match cfg.db.as_deref() {
+        Some(pool) => {
+            let root = crate::agents::coder::repo_root(pool).await;
+            Some(root.join("rust").join("migrations"))
+        }
+        None => None,
+    };
+
+    match crate::agents::coder::templates::stamp(tmpl, &placeholders, migrations_dir.as_deref()) {
+        Ok(out) => (
+            "200 OK",
+            json!({ "path": out.path, "content": out.content }).to_string(),
+        ),
+        Err(e) => (
+            "400 Bad Request",
+            json!({ "error": "stamp failed", "detail": e.to_string() }).to_string(),
+        ),
+    }
+}
+
+// Filesystem watcher: feeds notify events through a tokio channel, debounces
+// a 3s idle window, then re-indexes changed paths and deletes removed ones.
+fn spawn_coder_watcher(pool: Arc<PgPool>, root: PathBuf) -> Result<(), String> {
+    use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<notify::Event>();
+    let mut watcher = RecommendedWatcher::new(
+        move |res: notify::Result<notify::Event>| {
+            if let Ok(evt) = res {
+                let _ = tx.send(evt);
+            }
+        },
+        notify::Config::default(),
+    )
+    .map_err(|e| format!("watcher init: {e}"))?;
+
+    watcher
+        .watch(&root, RecursiveMode::Recursive)
+        .map_err(|e| format!("watch {}: {e}", root.display()))?;
+
+    eprintln!(
+        "{LOG_PREFIX} coder index watcher: watching {}",
+        root.display()
+    );
+
+    tokio::spawn(async move {
+        // Move the watcher into the task so it stays alive for the duration.
+        let _watcher = watcher;
+
+        let debounce = std::time::Duration::from_secs(3);
+        let mut changed: HashSet<PathBuf> = HashSet::new();
+        let mut removed: HashSet<PathBuf> = HashSet::new();
+        let mut deadline: Option<tokio::time::Instant> = None;
+
+        loop {
+            let sleep_until = deadline.unwrap_or_else(|| {
+                tokio::time::Instant::now() + std::time::Duration::from_secs(3600)
+            });
+            tokio::select! {
+                maybe_evt = rx.recv() => {
+                    let Some(evt) = maybe_evt else { break; };
+                    if !record_event(&evt, &root, &mut changed, &mut removed) {
+                        continue;
+                    }
+                    deadline = Some(tokio::time::Instant::now() + debounce);
+                }
+                () = tokio::time::sleep_until(sleep_until) => {
+                    if deadline.is_none() {
+                        continue;
+                    }
+                    deadline = None;
+                    let to_remove: Vec<PathBuf> = removed.drain().collect();
+                    let to_index: Vec<PathBuf> = changed.drain().collect();
+                    for rel in &to_remove {
+                        if let Err(e) =
+                            crate::agents::coder::index::remove_path(&pool, rel).await
+                        {
+                            eprintln!("{LOG_PREFIX} watcher remove {} failed: {e}", rel.display());
+                        }
+                    }
+                    for rel in &to_index {
+                        if let Err(e) =
+                            crate::agents::coder::index::index_file(&pool, &root, rel).await
+                        {
+                            eprintln!("{LOG_PREFIX} watcher index {} failed: {e}", rel.display());
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    Ok(())
+}
+
+/// Classify a notify event into the debounce sets. Returns `true` when at
+/// least one included path landed in `changed`/`removed`, which gates the
+/// deadline bump.
+fn record_event(
+    evt: &notify::Event,
+    root: &std::path::Path,
+    changed: &mut HashSet<PathBuf>,
+    removed: &mut HashSet<PathBuf>,
+) -> bool {
+    use notify::EventKind;
+    let mut touched = false;
+    for path in &evt.paths {
+        let Ok(rel) = path.strip_prefix(root) else {
+            continue;
+        };
+        if crate::agents::coder::index::is_path_excluded(rel) {
+            continue;
+        }
+        let rel_owned = rel.to_path_buf();
+        match evt.kind {
+            EventKind::Remove(_) => {
+                changed.remove(&rel_owned);
+                removed.insert(rel_owned);
+                touched = true;
+            }
+            EventKind::Create(_) | EventKind::Modify(_) => {
+                removed.remove(&rel_owned);
+                changed.insert(rel_owned);
+                touched = true;
+            }
+            _ => {}
+        }
+    }
+    touched
+}
+
 async fn code_health(cfg: &DaemonConfig) -> (&'static str, String) {
     let env_kill = std::env::var("GHOST_CODING_AGENT")
         .ok()
@@ -2085,6 +2884,565 @@ async fn code_health(cfg: &DaemonConfig) -> (&'static str, String) {
     })
     .to_string();
     ("200 OK", body)
+}
+
+// ---------------------------------------------------------------------------
+// Coder endpoints (Phase B.6)
+//
+// All bearer-authed. The agents self-account via `db::record_spend`; the
+// dispatcher path is bypassed here so endpoints can carry an explicit
+// `chat_id` from the body through to the coder (needed for diff queueing
+// and condensate retrieval).
+// ---------------------------------------------------------------------------
+
+fn body_from_raw(raw: &str) -> Option<serde_json::Value> {
+    let body_str = raw
+        .split_once("\r\n\r\n")
+        .or_else(|| raw.split_once("\n\n"))
+        .map_or("", |(_, b)| b);
+    serde_json::from_str::<serde_json::Value>(body_str).ok()
+}
+
+fn parse_history_from_body(body: &serde_json::Value) -> Vec<serde_json::Value> {
+    body["history"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter(|m| {
+                    let role = m["role"].as_str().unwrap_or("");
+                    let content = m["content"].as_str().unwrap_or("");
+                    (role == "user" || role == "assistant")
+                        && !content.is_empty()
+                        && content.len() <= 8192
+                })
+                .take(10)
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+async fn code_chat_handler(cfg: &DaemonConfig, raw: &str) -> (&'static str, String) {
+    use crate::agents::Agent as _;
+    if !auth_matches(raw) {
+        return ("401 Unauthorized", r#"{"error":"unauthorized"}"#.to_owned());
+    }
+    let Some(body) = body_from_raw(raw) else {
+        return (
+            "400 Bad Request",
+            r#"{"error":"body must be JSON"}"#.to_owned(),
+        );
+    };
+    let message = body["message"].as_str().unwrap_or("").trim().to_string();
+    if message.is_empty() {
+        return (
+            "400 Bad Request",
+            r#"{"error":"missing message"}"#.to_owned(),
+        );
+    }
+    let chat_id = match body["chat_id"]
+        .as_str()
+        .and_then(|s| uuid::Uuid::parse_str(s).ok())
+    {
+        Some(id) => id,
+        None => uuid::Uuid::new_v4(),
+    };
+    let history = parse_history_from_body(&body);
+
+    let Some(pool) = cfg.db.as_deref() else {
+        return (
+            "503 Service Unavailable",
+            r#"{"error":"database not configured"}"#.to_owned(),
+        );
+    };
+
+    let Some(job_id) = db::create_job(pool, &message, "coder", "dashboard", None).await else {
+        return (
+            "500 Internal Server Error",
+            r#"{"error":"failed to create job"}"#.to_owned(),
+        );
+    };
+
+    let repo_root = crate::agents::coder::repo_root(pool).await;
+    let agent = crate::agents::coder::CoderAgent::new(repo_root, chat_id);
+    let req = crate::agents::AgentRequest {
+        message: message.clone(),
+        history,
+        source: crate::agents::Source::Dashboard,
+        job_id: job_id.clone(),
+        sender_phone: None,
+    };
+
+    match agent.handle(req, pool).await {
+        Ok(resp) => {
+            db::update_job_done(pool, &job_id, &resp.text).await;
+            let pending_ids = list_pending_diff_ids_for_chat(pool, chat_id).await;
+            let body = json!({
+                "response": resp.text,
+                "job_id": job_id,
+                "chat_id": chat_id.to_string(),
+                "tokens": {
+                    "input": resp.usage.tokens_in,
+                    "output": resp.usage.tokens_out,
+                },
+                "pending_diff_ids": pending_ids,
+            })
+            .to_string();
+            ("200 OK", body)
+        }
+        Err(e) => {
+            db::update_job_failed(pool, &job_id, &e).await;
+            let body = json!({ "error": e, "job_id": job_id }).to_string();
+            ("502 Bad Gateway", body)
+        }
+    }
+}
+
+async fn code_brainstorm_handler(cfg: &DaemonConfig, raw: &str) -> (&'static str, String) {
+    use crate::agents::Agent as _;
+    if !auth_matches(raw) {
+        return ("401 Unauthorized", r#"{"error":"unauthorized"}"#.to_owned());
+    }
+    let Some(body) = body_from_raw(raw) else {
+        return (
+            "400 Bad Request",
+            r#"{"error":"body must be JSON"}"#.to_owned(),
+        );
+    };
+    let message = body["message"].as_str().unwrap_or("").trim().to_string();
+    if message.is_empty() {
+        return (
+            "400 Bad Request",
+            r#"{"error":"missing message"}"#.to_owned(),
+        );
+    }
+    let history = parse_history_from_body(&body);
+    let Some(pool) = cfg.db.as_deref() else {
+        return (
+            "503 Service Unavailable",
+            r#"{"error":"database not configured"}"#.to_owned(),
+        );
+    };
+
+    let Some(job_id) = db::create_job(pool, &message, "brainstorm", "dashboard", None).await else {
+        return (
+            "500 Internal Server Error",
+            r#"{"error":"failed to create job"}"#.to_owned(),
+        );
+    };
+
+    let req = crate::agents::AgentRequest {
+        message: message.clone(),
+        history,
+        source: crate::agents::Source::Dashboard,
+        job_id: job_id.clone(),
+        sender_phone: None,
+    };
+    let agent = crate::agents::brainstorm::BrainstormAgent::new();
+    match agent.handle(req, pool).await {
+        Ok(resp) => {
+            db::update_job_done(pool, &job_id, &resp.text).await;
+            let body = json!({
+                "response": resp.text,
+                "job_id": job_id,
+                "tokens": {
+                    "input": resp.usage.tokens_in,
+                    "output": resp.usage.tokens_out,
+                },
+            })
+            .to_string();
+            ("200 OK", body)
+        }
+        Err(e) => {
+            db::update_job_failed(pool, &job_id, &e).await;
+            let body = json!({ "error": e, "job_id": job_id }).to_string();
+            ("502 Bad Gateway", body)
+        }
+    }
+}
+
+async fn code_orchestrate_handler(cfg: &DaemonConfig, raw: &str) -> (&'static str, String) {
+    if !auth_matches(raw) {
+        return ("401 Unauthorized", r#"{"error":"unauthorized"}"#.to_owned());
+    }
+    let Some(body) = body_from_raw(raw) else {
+        return (
+            "400 Bad Request",
+            r#"{"error":"body must be JSON"}"#.to_owned(),
+        );
+    };
+    let spec = body["spec"].as_str().unwrap_or("").trim().to_string();
+    if spec.is_empty() {
+        return ("400 Bad Request", r#"{"error":"missing spec"}"#.to_owned());
+    }
+    let chat_id = body["chat_id"]
+        .as_str()
+        .and_then(|s| uuid::Uuid::parse_str(s).ok());
+    let Some(pool) = cfg.db.as_deref() else {
+        return (
+            "503 Service Unavailable",
+            r#"{"error":"database not configured"}"#.to_owned(),
+        );
+    };
+    let repo_root = crate::agents::coder::repo_root(pool).await;
+    let agent = crate::agents::orchestrator::OrchestratorAgent::new(repo_root, chat_id);
+    match agent.plan(&spec, pool).await {
+        Ok(outcome) => {
+            let tasks: Vec<serde_json::Value> = outcome
+                .tasks
+                .iter()
+                .map(|(id, t)| {
+                    json!({
+                        "id": id.to_string(),
+                        "task_prompt": t.prompt,
+                        "verify_command": t.verify_command,
+                    })
+                })
+                .collect();
+            let body = json!({
+                "orchestration_id": outcome.orchestration_id.to_string(),
+                "tasks": tasks,
+            })
+            .to_string();
+            ("200 OK", body)
+        }
+        Err(e) => {
+            let body = json!({ "error": e }).to_string();
+            ("502 Bad Gateway", body)
+        }
+    }
+}
+
+async fn code_orchestrate_run_handler(
+    cfg: &DaemonConfig,
+    raw: &str,
+    id_str: &str,
+) -> (&'static str, String) {
+    if !auth_matches(raw) {
+        return ("401 Unauthorized", r#"{"error":"unauthorized"}"#.to_owned());
+    }
+    let Ok(orch_id) = uuid::Uuid::parse_str(id_str) else {
+        return (
+            "400 Bad Request",
+            r#"{"error":"invalid orchestration id"}"#.to_owned(),
+        );
+    };
+    let Some(pool) = cfg.db.as_deref() else {
+        return (
+            "503 Service Unavailable",
+            r#"{"error":"database not configured"}"#.to_owned(),
+        );
+    };
+    // Verify orchestration exists before kicking off background work.
+    let exists: Option<(String,)> =
+        sqlx::query_as("SELECT status FROM coder_orchestrations WHERE id = $1")
+            .bind(orch_id)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten();
+    if exists.is_none() {
+        return ("404 Not Found", r#"{"error":"not found"}"#.to_owned());
+    }
+
+    let repo_root = crate::agents::coder::repo_root(pool).await;
+    crate::agents::orchestrator::spawn_workers(orch_id, repo_root, pool.clone());
+    let body = json!({
+        "orchestration_id": orch_id.to_string(),
+        "status": "running",
+    })
+    .to_string();
+    ("202 Accepted", body)
+}
+
+async fn code_orchestrate_get_handler(
+    cfg: &DaemonConfig,
+    raw: &str,
+    id_str: &str,
+) -> (&'static str, String) {
+    if !auth_matches(raw) {
+        return ("401 Unauthorized", r#"{"error":"unauthorized"}"#.to_owned());
+    }
+    let Ok(orch_id) = uuid::Uuid::parse_str(id_str) else {
+        return (
+            "400 Bad Request",
+            r#"{"error":"invalid orchestration id"}"#.to_owned(),
+        );
+    };
+    let Some(pool) = cfg.db.as_deref() else {
+        return (
+            "503 Service Unavailable",
+            r#"{"error":"database not configured"}"#.to_owned(),
+        );
+    };
+    let orch: Option<(String, String, chrono::DateTime<chrono::Utc>)> =
+        sqlx::query_as("SELECT status, spec, created_at FROM coder_orchestrations WHERE id = $1")
+            .bind(orch_id)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten();
+    let Some((status, spec, created_at)) = orch else {
+        return ("404 Not Found", r#"{"error":"not found"}"#.to_owned());
+    };
+    let rows = sqlx::query_as::<
+        _,
+        (
+            uuid::Uuid,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<chrono::DateTime<chrono::Utc>>,
+        ),
+    >(
+        "SELECT id, task_prompt, status, verify_command, worker_output, completed_at
+         FROM coder_tasks WHERE orchestration_id = $1 ORDER BY created_at",
+    )
+    .bind(orch_id)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    let tasks: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|(id, prompt, status, verify, output, completed_at)| {
+            json!({
+                "id": id.to_string(),
+                "task_prompt": prompt,
+                "status": status,
+                "verify_command": verify,
+                "worker_output": output,
+                "completed_at": completed_at.map(|t| t.to_rfc3339()),
+            })
+        })
+        .collect();
+    let body = json!({
+        "orchestration_id": orch_id.to_string(),
+        "spec": spec,
+        "status": status,
+        "created_at": created_at.to_rfc3339(),
+        "tasks": tasks,
+    })
+    .to_string();
+    ("200 OK", body)
+}
+
+async fn code_pending_diffs_handler(cfg: &DaemonConfig, raw: &str) -> (&'static str, String) {
+    if !auth_matches(raw) {
+        return ("401 Unauthorized", r#"{"error":"unauthorized"}"#.to_owned());
+    }
+    let Some(pool) = cfg.db.as_deref() else {
+        return (
+            "503 Service Unavailable",
+            r#"{"error":"database not configured"}"#.to_owned(),
+        );
+    };
+    let rows = sqlx::query_as::<
+        _,
+        (
+            uuid::Uuid,
+            uuid::Uuid,
+            String,
+            String,
+            String,
+            chrono::DateTime<chrono::Utc>,
+        ),
+    >(
+        "SELECT id, chat_id, path, search, replace, created_at
+         FROM coder_pending_diffs WHERE status = 'pending' ORDER BY created_at",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    let out: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|(id, chat_id, path, search, replace, created_at)| {
+            json!({
+                "id": id.to_string(),
+                "chat_id": chat_id.to_string(),
+                "path": path,
+                "search": search,
+                "replace": replace,
+                "created_at": created_at.to_rfc3339(),
+            })
+        })
+        .collect();
+    (
+        "200 OK",
+        serde_json::to_string(&out).unwrap_or_else(|_| "[]".into()),
+    )
+}
+
+async fn code_diff_apply_handler(
+    cfg: &DaemonConfig,
+    raw: &str,
+    id_str: &str,
+) -> (&'static str, String) {
+    if !auth_matches(raw) {
+        return ("401 Unauthorized", r#"{"error":"unauthorized"}"#.to_owned());
+    }
+    let Ok(diff_id) = uuid::Uuid::parse_str(id_str) else {
+        return (
+            "400 Bad Request",
+            r#"{"error":"invalid diff id"}"#.to_owned(),
+        );
+    };
+    let Some(pool) = cfg.db.as_deref() else {
+        return (
+            "503 Service Unavailable",
+            r#"{"error":"database not configured"}"#.to_owned(),
+        );
+    };
+    let row: Option<(String, String, String)> = sqlx::query_as(
+        "SELECT path, search, replace FROM coder_pending_diffs
+         WHERE id = $1 AND status = 'pending'",
+    )
+    .bind(diff_id)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+    let Some((path, search, replace)) = row else {
+        return (
+            "404 Not Found",
+            r#"{"error":"diff not found or already resolved"}"#.to_owned(),
+        );
+    };
+
+    let repo_root = crate::agents::coder::repo_root(pool).await;
+    let Ok(abs) = crate::agents::tools::resolve_within_repo(&repo_root, &path) else {
+        return ("400 Bad Request", r#"{"error":"path escape"}"#.to_owned());
+    };
+    let original = match tokio::fs::read_to_string(&abs).await {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                "500 Internal Server Error",
+                json!({ "error": format!("read failed: {e}") }).to_string(),
+            );
+        }
+    };
+    if original.matches(search.as_str()).count() != 1 {
+        return (
+            "409 Conflict",
+            json!({ "error": "search string is no longer unique in the file" }).to_string(),
+        );
+    }
+    let updated = original.replacen(&search, &replace, 1);
+    if let Err(e) = tokio::fs::write(&abs, updated).await {
+        return (
+            "500 Internal Server Error",
+            json!({ "error": format!("write failed: {e}") }).to_string(),
+        );
+    }
+    let _ = sqlx::query(
+        "UPDATE coder_pending_diffs SET status = 'applied', resolved_at = now() WHERE id = $1",
+    )
+    .bind(diff_id)
+    .execute(pool)
+    .await;
+    let body = json!({ "ok": true, "path": path }).to_string();
+    ("200 OK", body)
+}
+
+async fn code_diff_reject_handler(
+    cfg: &DaemonConfig,
+    raw: &str,
+    id_str: &str,
+) -> (&'static str, String) {
+    if !auth_matches(raw) {
+        return ("401 Unauthorized", r#"{"error":"unauthorized"}"#.to_owned());
+    }
+    let Ok(diff_id) = uuid::Uuid::parse_str(id_str) else {
+        return (
+            "400 Bad Request",
+            r#"{"error":"invalid diff id"}"#.to_owned(),
+        );
+    };
+    let Some(pool) = cfg.db.as_deref() else {
+        return (
+            "503 Service Unavailable",
+            r#"{"error":"database not configured"}"#.to_owned(),
+        );
+    };
+    let res = sqlx::query(
+        "UPDATE coder_pending_diffs SET status = 'rejected', resolved_at = now()
+         WHERE id = $1 AND status = 'pending'",
+    )
+    .bind(diff_id)
+    .execute(pool)
+    .await;
+    match res {
+        Ok(r) if r.rows_affected() == 0 => (
+            "404 Not Found",
+            r#"{"error":"diff not found or already resolved"}"#.to_owned(),
+        ),
+        Ok(_) => ("200 OK", r#"{"ok": true}"#.to_owned()),
+        Err(e) => (
+            "500 Internal Server Error",
+            json!({ "error": format!("db error: {e}") }).to_string(),
+        ),
+    }
+}
+
+async fn code_spend_handler(cfg: &DaemonConfig, raw: &str) -> (&'static str, String) {
+    if !auth_matches(raw) {
+        return ("401 Unauthorized", r#"{"error":"unauthorized"}"#.to_owned());
+    }
+    let Some(pool) = cfg.db.as_deref() else {
+        return (
+            "503 Service Unavailable",
+            r#"{"error":"database not configured"}"#.to_owned(),
+        );
+    };
+
+    let today_cents = db::spend_today(pool, "coder").await.unwrap_or(0);
+    let cap_cents = db::get_setting::<i32>(pool, "coder.budget_cents_per_day")
+        .await
+        .unwrap_or(200);
+    let week_cents: i32 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(cost_cents), 0)::int
+         FROM coder_spend
+         WHERE agent = 'coder'
+           AND day >= ((now() AT TIME ZONE 'America/Denver')::date - INTERVAL '7 days')",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap_or(0);
+    let by_model_rows: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT model, COALESCE(SUM(cost_cents), 0)::bigint
+         FROM coder_spend
+         WHERE agent = 'coder'
+           AND day = (now() AT TIME ZONE 'America/Denver')::date
+         GROUP BY model",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    let mut by_model = serde_json::Map::new();
+    for (model, cents) in by_model_rows {
+        by_model.insert(model, json!(cents));
+    }
+    let body = json!({
+        "today_cents": today_cents,
+        "cap_cents": cap_cents,
+        "this_week_cents": week_cents,
+        "by_model": by_model,
+    })
+    .to_string();
+    ("200 OK", body)
+}
+
+async fn list_pending_diff_ids_for_chat(pool: &sqlx::PgPool, chat_id: uuid::Uuid) -> Vec<String> {
+    let rows: Vec<(uuid::Uuid,)> = sqlx::query_as(
+        "SELECT id FROM coder_pending_diffs
+         WHERE chat_id = $1 AND status = 'pending' ORDER BY created_at",
+    )
+    .bind(chat_id)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    rows.into_iter().map(|(id,)| id.to_string()).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -3099,6 +4457,7 @@ mod tests {
             allow_unsafe_prompt: true,
             db: None,
             rate_limiter: Arc::new(RateLimiter::new()),
+            coder_rebuild_lock: Arc::new(AsyncMutex::new(())),
         }
     }
 

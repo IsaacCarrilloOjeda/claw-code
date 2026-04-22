@@ -8,6 +8,9 @@ pub enum Intent {
     ChiefOfStaff,
     Docs,
     Dreamer,
+    Coder,
+    Brainstorm,
+    Orchestrator,
     Ignore,
 }
 
@@ -18,6 +21,17 @@ pub enum Intent {
 /// For now this is a correct-but-minimal implementation so callers can start using it.
 pub fn classify(raw: &str) -> (Intent, String) {
     let trimmed = raw.trim_start();
+    // Coder-group prefixes. Order matters — `$$` and `$?` must be checked
+    // before bare `$` so a two-char prefix isn't eaten by the single-char one.
+    if let Some(rest) = trimmed.strip_prefix("$$") {
+        return (Intent::Orchestrator, rest.trim().to_string());
+    }
+    if let Some(rest) = trimmed.strip_prefix("$?") {
+        return (Intent::Brainstorm, rest.trim().to_string());
+    }
+    if let Some(rest) = trimmed.strip_prefix('$') {
+        return (Intent::Coder, rest.trim().to_string());
+    }
     if let Some(rest) = trimmed.strip_prefix('!') {
         return (Intent::Director, rest.trim().to_string());
     }
@@ -103,6 +117,21 @@ mod tests {
         let (intent, body) = classify("~reflect on the last week");
         assert_eq!(intent, Intent::Dreamer);
         assert_eq!(body, "reflect on the last week");
+    }
+
+    #[test]
+    fn parses_coder_prefixes() {
+        let (intent, body) = classify("$ add a /ping endpoint");
+        assert_eq!(intent, Intent::Coder);
+        assert_eq!(body, "add a /ping endpoint");
+
+        let (intent, body) = classify("$? I want a /ping endpoint");
+        assert_eq!(intent, Intent::Brainstorm);
+        assert_eq!(body, "I want a /ping endpoint");
+
+        let (intent, body) = classify("$$ ship the ping feature");
+        assert_eq!(intent, Intent::Orchestrator);
+        assert_eq!(body, "ship the ping feature");
     }
 
     #[test]

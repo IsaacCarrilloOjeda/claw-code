@@ -1,0 +1,12 @@
+// Added {{today_date}}. Paste into `db.rs` near related helpers, or into a
+// dedicated module that `use`s `sqlx::{PgPool, Row}`.
+
+pub async fn {{fn_name}}({{params_signature}}) -> Result<{{return_type}}, sqlx::Error> {
+    let row = sqlx::query(r#"{{sql}}"#)
+        .fetch_one(pool)
+        .await?;
+
+    // TODO: map `row` to `{{return_type}}` via `row.try_get::<T, _>("col")`.
+    let _ = row;
+    todo!("map row to {{return_type}}")
+}

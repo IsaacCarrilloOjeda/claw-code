@@ -1,0 +1,49 @@
+//! {{description}}
+//!
+//! Added {{today_date}}. Declared tier: `{{tier}}`. See `agents/mod.rs` for
+//! the `Agent` trait and the request/response shapes.
+
+use async_trait::async_trait;
+use sqlx::PgPool;
+
+use super::{Agent, AgentRequest, AgentResponse, ModelTier, Usage};
+
+pub struct {{name}};
+
+impl {{name}} {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for {{name}} {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl Agent for {{name}} {
+    fn name(&self) -> &'static str {
+        "{{name}}"
+    }
+
+    fn declared_tier(&self) -> ModelTier {
+        ModelTier::{{tier}}
+    }
+
+    fn requires_approval(&self, _req: &AgentRequest) -> bool {
+        false
+    }
+
+    async fn handle(&self, req: AgentRequest, _pool: &PgPool) -> Result<AgentResponse, String> {
+        // TODO: route via `crate::infra::provider` (see agents/research.rs for
+        // the Anthropic example, or chief_of_staff.rs for a tiered flow).
+        let _ = req;
+        Ok(AgentResponse {
+            text: String::new(),
+            usage: Usage::default(),
+            tier: ModelTier::{{tier}},
+        })
+    }
+}

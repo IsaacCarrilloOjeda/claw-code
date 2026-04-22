@@ -1,0 +1,22 @@
+{
+  "name": "new_tool",
+  "description": "Coder-agent tool module implementing the `Tool` trait (Prompt B).",
+  "output_path_template": "rust/crates/rusty-claude-cli/src/agents/tools/{{name}}.rs",
+  "placeholders": [
+    {
+      "name": "name",
+      "description": "snake_case tool identifier (also used as the struct name).",
+      "example": "read_file"
+    },
+    {
+      "name": "description",
+      "description": "Short sentence the model reads when deciding whether to call this tool.",
+      "example": "Read a file from the repo and return its contents."
+    },
+    {
+      "name": "args_schema_json",
+      "description": "JSON Schema for the tool's arguments, as a single-line JSON string.",
+      "example": "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"]}"
+    }
+  ]
+}

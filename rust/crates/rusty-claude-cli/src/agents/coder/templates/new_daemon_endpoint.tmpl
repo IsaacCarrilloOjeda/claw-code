@@ -1,0 +1,28 @@
+// Added {{today_date}}. Register below in the big `match (method, path_clean)`
+// block in `dispatch` (daemon.rs):
+//
+//     ("{{method}}", "{{path}}") => {{handler_name}}(cfg, raw).await,
+//
+// Auth gate below is a template — delete if `{{requires_auth}}` is `false`.
+
+async fn {{handler_name}}(cfg: &DaemonConfig, raw: &str) -> (&'static str, String) {
+    if {{requires_auth}} && !auth_matches(raw) {
+        return ("401 Unauthorized", r#"{"error":"unauthorized"}"#.to_owned());
+    }
+    let Some(pool) = cfg.db.as_deref() else {
+        return (
+            "503 Service Unavailable",
+            r#"{"error":"database not configured"}"#.to_owned(),
+        );
+    };
+
+    let _body_str = raw
+        .split_once("\r\n\r\n")
+        .or_else(|| raw.split_once("\n\n"))
+        .map_or("", |(_, b)| b);
+
+    // TODO: parse body, call into db / agents, return JSON.
+    let _ = pool;
+    let body = serde_json::json!({ "status": "ok" }).to_string();
+    ("200 OK", body)
+}

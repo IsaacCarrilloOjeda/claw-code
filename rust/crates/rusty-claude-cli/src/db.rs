@@ -1396,6 +1396,8 @@ pub struct SmsContact {
     pub unread_count: i64,
     pub last_message: Option<String>,
     pub notes: Option<String>,
+    /// A / B / C, or None when unassigned (manual-only territory).
+    pub schedule_slot: Option<String>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -1434,10 +1436,11 @@ pub async fn list_sms_contacts(pool: &PgPool) -> Vec<SmsContact> {
             (SELECT content FROM sms_history
              WHERE phone = h.phone ORDER BY created_at DESC LIMIT 1
             ) as last_message,
-            c.notes
+            c.notes,
+            c.schedule_slot
          FROM sms_history h
          LEFT JOIN sms_contacts c ON c.phone = h.phone
-         GROUP BY h.phone, c.display_name, c.auto_reply, c.last_read_at, c.notes
+         GROUP BY h.phone, c.display_name, c.auto_reply, c.last_read_at, c.notes, c.schedule_slot
          ORDER BY MAX(h.created_at) DESC",
     )
     .fetch_all(pool)
@@ -1454,6 +1457,7 @@ pub async fn list_sms_contacts(pool: &PgPool) -> Vec<SmsContact> {
             unread_count: row.try_get("unread_count").unwrap_or(0),
             last_message: row.try_get("last_message").unwrap_or(None),
             notes: row.try_get("notes").unwrap_or(None),
+            schedule_slot: row.try_get("schedule_slot").unwrap_or(None),
         })
         .collect()
 }
@@ -1478,6 +1482,7 @@ pub async fn get_sms_contact(pool: &PgPool, phone: &str) -> Option<SmsContact> {
             c.display_name,
             c.auto_reply,
             c.notes,
+            c.schedule_slot,
             (SELECT MAX(created_at)::text FROM sms_history WHERE phone = c.phone) as last_message_at,
             (SELECT COUNT(*) FROM sms_history WHERE phone = c.phone) as message_count,
             (SELECT COUNT(*) FROM sms_history
@@ -1504,15 +1509,20 @@ pub async fn get_sms_contact(pool: &PgPool, phone: &str) -> Option<SmsContact> {
         unread_count: row.try_get("unread_count").unwrap_or(0),
         last_message: row.try_get("last_message").unwrap_or(None),
         notes: row.try_get("notes").unwrap_or(None),
+        schedule_slot: row.try_get("schedule_slot").unwrap_or(None),
     })
 }
 
-/// Update `auto_reply` flag for a contact. Upserts if the contact doesn't exist.
+/// Update `auto_reply` flag for a contact. Also clears `schedule_slot` so the
+/// availability scheduler stops touching this contact until the user reassigns
+/// a slot (manual override wins — see migration 017).
 pub async fn set_auto_reply(pool: &PgPool, phone: &str, enabled: bool) {
     let normalized = crate::daemon::normalize_phone(phone);
     let _ = sqlx::query(
-        "INSERT INTO sms_contacts (phone, auto_reply, updated_at) VALUES ($1, $2, now())
-         ON CONFLICT (phone) DO UPDATE SET auto_reply = $2, updated_at = now()",
+        "INSERT INTO sms_contacts (phone, auto_reply, schedule_slot, updated_at)
+         VALUES ($1, $2, NULL, now())
+         ON CONFLICT (phone) DO UPDATE
+         SET auto_reply = $2, schedule_slot = NULL, updated_at = now()",
     )
     .bind(&normalized)
     .bind(enabled)

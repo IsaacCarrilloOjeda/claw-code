@@ -1,0 +1,22 @@
+{
+  "name": "new_agent",
+  "description": "Skeleton agent module implementing the `Agent` trait.",
+  "output_path_template": "rust/crates/rusty-claude-cli/src/agents/{{name}}.rs",
+  "placeholders": [
+    {
+      "name": "name",
+      "description": "CamelCase struct name (also used as the agent's string identifier).",
+      "example": "Scheduler"
+    },
+    {
+      "name": "tier",
+      "description": "`ModelTier` variant: Fast | Code | Mid | Full.",
+      "example": "Mid"
+    },
+    {
+      "name": "description",
+      "description": "One-paragraph summary of what the agent does, for the module docstring.",
+      "example": "Books calendar entries by talking to Google Calendar."
+    }
+  ]
+}

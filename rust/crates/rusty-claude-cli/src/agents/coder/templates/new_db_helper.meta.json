@@ -1,0 +1,27 @@
+{
+  "name": "new_db_helper",
+  "description": "Async sqlx helper function with bound params and error mapping.",
+  "output_path_template": "rust/crates/rusty-claude-cli/src/db_{{fn_name}}.rs",
+  "placeholders": [
+    {
+      "name": "fn_name",
+      "description": "snake_case function name.",
+      "example": "get_contact_by_phone"
+    },
+    {
+      "name": "sql",
+      "description": "SQL statement with `$1`/`$2` placeholders — no bindings, just the raw query.",
+      "example": "SELECT phone, name FROM sms_contacts WHERE phone = $1"
+    },
+    {
+      "name": "return_type",
+      "description": "Rust type returned inside `Result<T, sqlx::Error>`.",
+      "example": "Option<(String, String)>"
+    },
+    {
+      "name": "params_signature",
+      "description": "Full parameter list including the `pool`, comma-separated.",
+      "example": "pool: &sqlx::PgPool, phone: &str"
+    }
+  ]
+}

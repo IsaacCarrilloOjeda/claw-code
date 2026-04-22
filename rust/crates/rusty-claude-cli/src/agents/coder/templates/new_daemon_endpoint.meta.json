@@ -1,0 +1,27 @@
+{
+  "name": "new_daemon_endpoint",
+  "description": "Stub async handler for daemon.rs plus the one-line route registration comment.",
+  "output_path_template": "rust/crates/rusty-claude-cli/src/daemon_{{handler_name}}.rs",
+  "placeholders": [
+    {
+      "name": "method",
+      "description": "HTTP method in uppercase.",
+      "example": "POST"
+    },
+    {
+      "name": "path",
+      "description": "URL path including leading slash.",
+      "example": "/code/index/rebuild"
+    },
+    {
+      "name": "handler_name",
+      "description": "snake_case Rust identifier for the handler.",
+      "example": "code_index_rebuild"
+    },
+    {
+      "name": "requires_auth",
+      "description": "`true` to require bearer auth, `false` for open endpoints.",
+      "example": "true"
+    }
+  ]
+}

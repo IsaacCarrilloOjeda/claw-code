@@ -1,12 +1,16 @@
+pub mod brainstorm;
 pub mod calendar;
 pub mod chief_of_staff;
+pub mod coder;
 pub mod dispatcher;
 pub mod docs;
 pub mod dreamer;
 pub mod intent;
 pub mod oauth;
+pub mod orchestrator;
 pub mod research;
 pub mod summarizer;
+pub mod tools;
 
 use async_trait::async_trait;
 use sqlx::PgPool;
