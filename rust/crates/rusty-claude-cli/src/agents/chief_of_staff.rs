@@ -221,10 +221,7 @@ pub(crate) fn parse_plan(raw: &str) -> Result<Plan, String> {
     if let Some(plan) = last_ok {
         return Ok(plan);
     }
-    let detail = last_err.map_or_else(
-        || "no JSON candidates found".to_string(),
-        |e| e.to_string(),
-    );
+    let detail = last_err.map_or_else(|| "no JSON candidates found".to_string(), |e| e.to_string());
     Err(format!(
         "could not parse Chief of Staff plan: {detail}: raw = {raw}"
     ))

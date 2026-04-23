@@ -58,7 +58,7 @@ function SmsAddForm({ onAdd, onCancel }) {
   )
 }
 
-function SmsContactRow({ contact, active, onSelect, onToggleAutoReply, onRename }) {
+function SmsContactRow({ contact, active, onSelect, onToggleAutoReply, onRename, onCycleSlot }) {
   const [editing, setEditing] = useState(false)
   const [editName, setEditName] = useState(contact.display_name || '')
   const inputRef = useRef(null)
@@ -89,6 +89,24 @@ function SmsContactRow({ contact, active, onSelect, onToggleAutoReply, onRename 
       onMouseEnter={e => { if (!active) e.currentTarget.style.background = 'var(--bg-raised)' }}
       onMouseLeave={e => { e.currentTarget.style.background = active ? 'var(--accent-dim)' : 'transparent' }}
     >
+      {/* Schedule slot indicator: click to cycle None → A → B → C → None. */}
+      <div
+        onClick={e => { e.stopPropagation(); onCycleSlot() }}
+        title={contact.schedule_slot
+          ? `Schedule ${contact.schedule_slot} — click to change`
+          : 'No schedule — click to assign A/B/C'}
+        style={{
+          width: 20, height: 20, flexShrink: 0,
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          fontSize: 10, fontWeight: 700, fontFamily: 'var(--mono)',
+          color: contact.schedule_slot ? 'var(--bg)' : 'var(--text-dim)',
+          background: contact.schedule_slot ? 'var(--accent)' : 'transparent',
+          border: '1px solid ' + (contact.schedule_slot ? 'var(--accent)' : 'var(--border)'),
+          borderRadius: 'var(--radius-sm)', cursor: 'pointer',
+          transition: 'all var(--transition)',
+        }}
+      >{contact.schedule_slot || '—'}</div>
+
       {/* Auto-reply toggle */}
       <div
         onClick={e => { e.stopPropagation(); onToggleAutoReply(!contact.auto_reply) }}
@@ -98,7 +116,7 @@ function SmsContactRow({ contact, active, onSelect, onToggleAutoReply, onRename 
           borderRadius: 8, cursor: 'pointer',
           position: 'relative', transition: 'background var(--transition)',
         }}
-        title={contact.auto_reply ? 'Auto-reply ON' : 'Auto-reply OFF'}
+        title={contact.auto_reply ? 'Auto-reply ON (manual toggle clears slot)' : 'Auto-reply OFF (manual toggle clears slot)'}
       >
         <div style={{
           width: 12, height: 12, borderRadius: '50%', background: '#fff',
@@ -787,6 +805,549 @@ function SmsFactsPanel({ daemonKey, onClose }) {
   )
 }
 
+// ---------------------------------------------------------------------------
+// Availability schedules (slots A/B/C) + sleep mode
+// ---------------------------------------------------------------------------
+
+// Weekday mask bits: Sun=0, Mon=1, ..., Sat=6 (matches PostgreSQL EXTRACT(DOW)).
+const WEEKDAYS = [
+  { label: 'Mon', bit: 1 },
+  { label: 'Tue', bit: 2 },
+  { label: 'Wed', bit: 3 },
+  { label: 'Thu', bit: 4 },
+  { label: 'Fri', bit: 5 },
+  { label: 'Sat', bit: 6 },
+  { label: 'Sun', bit: 0 },
+]
+
+function maskToLabel(mask) {
+  if (mask == null) return ''
+  const weekdayBits = (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5)
+  const weekendBits = (1 << 0) | (1 << 6)
+  if (mask === weekdayBits) return 'Mon–Fri'
+  if (mask === weekendBits) return 'Sat–Sun'
+  if (mask === weekdayBits | weekendBits) return 'Every day'
+  return WEEKDAYS.filter(d => (mask & (1 << d.bit)) !== 0).map(d => d.label).join(' ')
+}
+
+function WindowForm({ slot, kind, onAdd, onCancel }) {
+  const [mask, setMask] = useState((1 << 1) | (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5))
+  const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10))
+  const [start, setStart] = useState('08:00')
+  const [end, setEnd] = useState('15:00')
+  const valid = start < end && (kind === 'oneoff' || mask > 0)
+
+  function toggleBit(bit) {
+    setMask(m => m ^ (1 << bit))
+  }
+
+  return (
+    <div style={{
+      display: 'flex', flexDirection: 'column', gap: 6,
+      padding: 8, marginTop: 6,
+      background: 'var(--bg)', border: '1px solid var(--border)',
+      borderRadius: 'var(--radius-sm)',
+    }}>
+      {kind === 'weekly' ? (
+        <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
+          {WEEKDAYS.map(d => {
+            const on = (mask & (1 << d.bit)) !== 0
+            return (
+              <span
+                key={d.label}
+                onClick={() => toggleBit(d.bit)}
+                style={{
+                  padding: '3px 6px', fontSize: 10, fontWeight: 600,
+                  fontFamily: 'var(--mono)', cursor: 'pointer',
+                  background: on ? 'var(--accent)' : 'transparent',
+                  color: on ? 'var(--bg)' : 'var(--text-dim)',
+                  border: '1px solid ' + (on ? 'var(--accent)' : 'var(--border)'),
+                  borderRadius: 'var(--radius-sm)',
+                }}
+              >{d.label}</span>
+            )
+          })}
+        </div>
+      ) : (
+        <input
+          type="date" value={date} onChange={e => setDate(e.target.value)}
+          style={{
+            fontFamily: 'var(--mono)', fontSize: 11,
+            background: 'var(--surface)', color: 'var(--text)',
+            border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)',
+            padding: '4px 6px', outline: 'none', colorScheme: 'dark',
+          }}
+        />
+      )}
+      <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+        <input
+          type="time" value={start} onChange={e => setStart(e.target.value)}
+          style={{
+            flex: 1, fontFamily: 'var(--mono)', fontSize: 11,
+            background: 'var(--surface)', color: 'var(--text)',
+            border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)',
+            padding: '4px 6px', outline: 'none', colorScheme: 'dark',
+          }}
+        />
+        <span style={{ color: 'var(--text-dim)', fontSize: 10 }}>to</span>
+        <input
+          type="time" value={end} onChange={e => setEnd(e.target.value)}
+          style={{
+            flex: 1, fontFamily: 'var(--mono)', fontSize: 11,
+            background: 'var(--surface)', color: 'var(--text)',
+            border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)',
+            padding: '4px 6px', outline: 'none', colorScheme: 'dark',
+          }}
+        />
+      </div>
+      <div style={{ display: 'flex', gap: 6 }}>
+        <button
+          disabled={!valid}
+          onClick={() => onAdd({
+            slot, kind,
+            weekday_mask: kind === 'weekly' ? mask : null,
+            day_date: kind === 'oneoff' ? date : null,
+            start_time: start, end_time: end,
+          })}
+          style={{
+            flex: 1, padding: '5px 0', fontSize: 10, fontWeight: 600,
+            background: valid ? 'var(--accent)' : 'var(--border)',
+            color: valid ? 'var(--bg)' : 'var(--text-dim)',
+            border: 'none', borderRadius: 'var(--radius-sm)',
+            cursor: valid ? 'pointer' : 'default',
+          }}
+        >ADD</button>
+        <button
+          onClick={onCancel}
+          style={{
+            padding: '5px 10px', fontSize: 10,
+            background: 'transparent', color: 'var(--text-dim)',
+            border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)',
+            cursor: 'pointer',
+          }}
+        >cancel</button>
+      </div>
+    </div>
+  )
+}
+
+function SlotCard({ slot, onRename, onAddWindow, onDeleteWindow }) {
+  const [editingName, setEditingName] = useState(false)
+  const [nameValue, setNameValue] = useState(slot.name || '')
+  const [adding, setAdding] = useState(null) // 'weekly' | 'oneoff' | null
+
+  useEffect(() => { setNameValue(slot.name || '') }, [slot.name])
+
+  function commitName() {
+    const trimmed = nameValue.trim()
+    if (trimmed !== (slot.name || '').trim()) onRename(trimmed)
+    setEditingName(false)
+  }
+
+  return (
+    <div style={{
+      marginBottom: 14, padding: 10,
+      background: 'var(--bg)', border: '1px solid var(--border)',
+      borderRadius: 'var(--radius-sm)',
+    }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
+        <span style={{
+          width: 22, height: 22, display: 'flex',
+          alignItems: 'center', justifyContent: 'center',
+          background: 'var(--accent)', color: 'var(--bg)',
+          fontSize: 12, fontWeight: 700, fontFamily: 'var(--mono)',
+          borderRadius: 'var(--radius-sm)', flexShrink: 0,
+        }}>{slot.slot}</span>
+        {editingName ? (
+          <input
+            autoFocus value={nameValue}
+            onChange={e => setNameValue(e.target.value)}
+            onBlur={commitName}
+            onKeyDown={e => { if (e.key === 'Enter') commitName(); if (e.key === 'Escape') { setNameValue(slot.name || ''); setEditingName(false) } }}
+            placeholder="e.g. School hours"
+            style={{
+              flex: 1, fontFamily: 'var(--sans)', fontSize: 12,
+              background: 'var(--surface)', color: 'var(--text)',
+              border: '1px solid var(--accent)', borderRadius: 'var(--radius-sm)',
+              padding: '3px 6px', outline: 'none',
+            }}
+          />
+        ) : (
+          <span
+            onClick={() => setEditingName(true)}
+            style={{
+              flex: 1, fontSize: 12, fontWeight: 600, cursor: 'pointer',
+              color: slot.name ? 'var(--text-bright)' : 'var(--text-dim)',
+              fontStyle: slot.name ? 'normal' : 'italic',
+            }}
+          >{slot.name || 'click to name...'}</span>
+        )}
+      </div>
+
+      {slot.windows.length === 0 && (
+        <div style={{ fontSize: 10, color: 'var(--text-dim)', padding: '4px 0' }}>no windows</div>
+      )}
+      {slot.windows.map(w => (
+        <div key={w.id} style={{
+          display: 'flex', alignItems: 'center', gap: 8,
+          padding: '3px 0', borderBottom: '1px solid rgba(255,255,255,0.03)',
+        }}>
+          <span style={{ flex: 1, fontSize: 11, fontFamily: 'var(--mono)', color: 'var(--text)' }}>
+            {w.kind === 'weekly' ? maskToLabel(w.weekday_mask) : w.day_date}
+            {' '}
+            <span style={{ color: 'var(--accent)' }}>{w.start_time}–{w.end_time}</span>
+          </span>
+          <span
+            onClick={() => onDeleteWindow(w.id)}
+            style={{ color: 'var(--text-dim)', cursor: 'pointer', fontSize: 12, lineHeight: 1 }}
+            onMouseEnter={e => e.target.style.color = 'var(--red)'}
+            onMouseLeave={e => e.target.style.color = 'var(--text-dim)'}
+          >x</span>
+        </div>
+      ))}
+
+      {adding ? (
+        <WindowForm
+          slot={slot.slot} kind={adding}
+          onAdd={async (payload) => { await onAddWindow(payload); setAdding(null) }}
+          onCancel={() => setAdding(null)}
+        />
+      ) : (
+        <div style={{ display: 'flex', gap: 6, marginTop: 8 }}>
+          <button
+            onClick={() => setAdding('weekly')}
+            style={{
+              flex: 1, padding: '5px 0', fontSize: 10, fontWeight: 600,
+              background: 'transparent', color: 'var(--text-dim)',
+              border: '1px dashed var(--border)', borderRadius: 'var(--radius-sm)',
+              cursor: 'pointer', letterSpacing: '0.04em',
+            }}
+          >+ WEEKLY</button>
+          <button
+            onClick={() => setAdding('oneoff')}
+            style={{
+              flex: 1, padding: '5px 0', fontSize: 10, fontWeight: 600,
+              background: 'transparent', color: 'var(--text-dim)',
+              border: '1px dashed var(--border)', borderRadius: 'var(--radius-sm)',
+              cursor: 'pointer', letterSpacing: '0.04em',
+            }}
+          >+ ONE-OFF</button>
+        </div>
+      )}
+    </div>
+  )
+}
+
+function SmsAvailabilityPanel({ daemonKey, onClose }) {
+  const [slots, setSlots] = useState([])
+  const [loading, setLoading] = useState(true)
+
+  async function reload() {
+    try {
+      const data = await apiFetch('/sms/availability', {}, daemonKey)
+      setSlots(data.slots || [])
+    } catch { /* ignore */ }
+    setLoading(false)
+  }
+
+  useEffect(() => { reload() }, [daemonKey])
+
+  async function renameSlot(slot, name) {
+    try {
+      await apiFetch(`/sms/availability/slots/${slot}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name }),
+      }, daemonKey)
+      reload()
+    } catch { /* ignore */ }
+  }
+
+  async function addWindow(payload) {
+    try {
+      await apiFetch('/sms/availability/windows', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }, daemonKey)
+      reload()
+    } catch { /* ignore */ }
+  }
+
+  async function deleteWindow(id) {
+    try {
+      await apiFetch(`/sms/availability/windows/${id}`, { method: 'DELETE' }, daemonKey)
+      reload()
+    } catch { /* ignore */ }
+  }
+
+  return (
+    <>
+      <div
+        onClick={onClose}
+        style={{ position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.4)', zIndex: 10 }}
+      />
+      <div style={{
+        position: 'absolute', top: 0, right: 0, bottom: 0,
+        width: 380, background: 'var(--surface)',
+        borderLeft: '1px solid var(--border)',
+        zIndex: 11, display: 'flex', flexDirection: 'column', overflow: 'hidden',
+      }}>
+        <div style={{
+          flexShrink: 0, padding: '14px 16px',
+          borderBottom: '1px solid var(--border)',
+          display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+        }}>
+          <div>
+            <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-bright)' }}>Availability</div>
+            <div style={{ fontSize: 9, color: 'var(--text-dim)', marginTop: 2 }}>
+              times evaluated in Mountain Time · rep turns ON inside windows
+            </div>
+          </div>
+          <span
+            onClick={onClose}
+            style={{ color: 'var(--text-dim)', cursor: 'pointer', fontSize: 14, lineHeight: 1 }}
+            onMouseEnter={e => e.target.style.color = 'var(--text)'}
+            onMouseLeave={e => e.target.style.color = 'var(--text-dim)'}
+          >x</span>
+        </div>
+
+        <div style={{ flex: 1, overflowY: 'auto', padding: 14 }}>
+          {loading && <div style={{ color: 'var(--text-dim)', fontSize: 11 }}>loading...</div>}
+          {!loading && slots.map(s => (
+            <SlotCard
+              key={s.slot}
+              slot={s}
+              onRename={name => renameSlot(s.slot, name)}
+              onAddWindow={addWindow}
+              onDeleteWindow={deleteWindow}
+            />
+          ))}
+        </div>
+      </div>
+    </>
+  )
+}
+
+function SmsSleepPanel({ daemonKey, contacts, onClose }) {
+  const [sleep, setSleep] = useState(null)
+  const [loading, setLoading] = useState(true)
+  const [sleepList, setSleepList] = useState([])
+  const [awakeBy, setAwakeBy] = useState('07:00')
+  const [addPhone, setAddPhone] = useState('')
+
+  async function reload() {
+    try {
+      const [s, l] = await Promise.all([
+        apiFetch('/sms/sleep', {}, daemonKey),
+        apiFetch('/sms/sleep/contacts', {}, daemonKey),
+      ])
+      setSleep(s)
+      setSleepList(l.phones || [])
+    } catch { /* ignore */ }
+    setLoading(false)
+  }
+
+  useEffect(() => { reload() }, [daemonKey])
+
+  async function start() {
+    try {
+      await apiFetch('/sms/sleep/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ awake_by_local: awakeBy }),
+      }, daemonKey)
+      reload()
+    } catch { /* ignore */ }
+  }
+
+  async function end() {
+    try {
+      await apiFetch('/sms/sleep/end', { method: 'POST' }, daemonKey)
+      reload()
+    } catch { /* ignore */ }
+  }
+
+  async function addContact() {
+    const phone = addPhone.trim()
+    if (!phone) return
+    try {
+      await apiFetch('/sms/sleep/contacts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ phone }),
+      }, daemonKey)
+      setAddPhone('')
+      reload()
+    } catch { /* ignore */ }
+  }
+
+  async function removeContact(phone) {
+    try {
+      await apiFetch(`/sms/sleep/contacts/${encodeURIComponent(phone)}`, { method: 'DELETE' }, daemonKey)
+      reload()
+    } catch { /* ignore */ }
+  }
+
+  const active = sleep?.active
+  const awakeAt = sleep?.awake_by
+    ? new Date(sleep.awake_by).toLocaleString([], { weekday: 'short', hour: '2-digit', minute: '2-digit' })
+    : null
+
+  // Suggest contacts not already in sleep list.
+  const candidates = contacts.filter(c => !sleepList.includes(c.phone))
+
+  return (
+    <>
+      <div
+        onClick={onClose}
+        style={{ position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.4)', zIndex: 10 }}
+      />
+      <div style={{
+        position: 'absolute', top: 0, right: 0, bottom: 0,
+        width: 360, background: 'var(--surface)',
+        borderLeft: '1px solid var(--border)',
+        zIndex: 11, display: 'flex', flexDirection: 'column', overflow: 'hidden',
+      }}>
+        <div style={{
+          flexShrink: 0, padding: '14px 16px',
+          borderBottom: '1px solid var(--border)',
+          display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+        }}>
+          <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-bright)' }}>Sleep mode</span>
+          <span
+            onClick={onClose}
+            style={{ color: 'var(--text-dim)', cursor: 'pointer', fontSize: 14, lineHeight: 1 }}
+            onMouseEnter={e => e.target.style.color = 'var(--text)'}
+            onMouseLeave={e => e.target.style.color = 'var(--text-dim)'}
+          >x</span>
+        </div>
+
+        <div style={{ flex: 1, overflowY: 'auto', padding: 14 }}>
+          {loading && <div style={{ color: 'var(--text-dim)', fontSize: 11 }}>loading...</div>}
+
+          {!loading && active && (
+            <div style={{
+              padding: 12, marginBottom: 16,
+              background: 'var(--accent-dim)',
+              border: '1px solid var(--accent)',
+              borderRadius: 'var(--radius-sm)',
+            }}>
+              <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--accent)', marginBottom: 4 }}>
+                SLEEPING
+              </div>
+              <div style={{ fontSize: 11, color: 'var(--text)', marginBottom: 10 }}>
+                Rep is covering {sleepList.length} contact{sleepList.length === 1 ? '' : 's'}
+                {awakeAt && <> until <strong>{awakeAt}</strong></>}.
+              </div>
+              <button
+                onClick={end}
+                style={{
+                  padding: '6px 14px', fontSize: 11, fontWeight: 600,
+                  background: 'var(--surface)', color: 'var(--text)',
+                  border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)',
+                  cursor: 'pointer',
+                }}
+              >Wake now</button>
+            </div>
+          )}
+
+          {!loading && !active && (
+            <div style={{ marginBottom: 16 }}>
+              <div style={{ fontSize: 9, fontWeight: 600, color: 'var(--text-dim)', letterSpacing: '0.08em', marginBottom: 6 }}>
+                AWAKE BY
+              </div>
+              <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                <input
+                  type="time" value={awakeBy} onChange={e => setAwakeBy(e.target.value)}
+                  style={{
+                    flex: 1, fontFamily: 'var(--mono)', fontSize: 12,
+                    background: 'var(--bg)', color: 'var(--text)',
+                    border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)',
+                    padding: '6px 8px', outline: 'none', colorScheme: 'dark',
+                  }}
+                />
+                <button
+                  onClick={start}
+                  disabled={sleepList.length === 0}
+                  title={sleepList.length === 0 ? 'add at least one contact to the sleep list' : ''}
+                  style={{
+                    padding: '6px 14px', fontSize: 11, fontWeight: 600,
+                    background: sleepList.length > 0 ? 'var(--accent)' : 'var(--border)',
+                    color: sleepList.length > 0 ? 'var(--bg)' : 'var(--text-dim)',
+                    border: 'none', borderRadius: 'var(--radius-sm)',
+                    cursor: sleepList.length > 0 ? 'pointer' : 'default',
+                  }}
+                >SLEEP NOW</button>
+              </div>
+              <div style={{ fontSize: 10, color: 'var(--text-dim)', marginTop: 6, lineHeight: 1.5 }}>
+                Time is Mountain Time. Press immediately activates sleep mode; wake-by is when it auto-ends.
+              </div>
+            </div>
+          )}
+
+          <div style={{ fontSize: 9, fontWeight: 600, color: 'var(--text-dim)', letterSpacing: '0.08em', marginBottom: 6 }}>
+            SLEEP LIST
+          </div>
+          {sleepList.length === 0 && (
+            <div style={{ fontSize: 11, color: 'var(--text-dim)', marginBottom: 8 }}>
+              no contacts — add some so they get auto-reply while you sleep
+            </div>
+          )}
+          {sleepList.map(phone => {
+            const c = contacts.find(x => x.phone === phone)
+            return (
+              <div key={phone} style={{
+                display: 'flex', alignItems: 'center', gap: 8,
+                padding: '5px 0', borderBottom: '1px solid rgba(255,255,255,0.03)',
+              }}>
+                <span style={{ flex: 1, fontSize: 11, color: 'var(--text)' }}>
+                  {c?.display_name || phone}
+                  {c?.display_name && <span style={{ color: 'var(--text-dim)', marginLeft: 6, fontFamily: 'var(--mono)', fontSize: 9 }}>{phone}</span>}
+                </span>
+                <span
+                  onClick={() => removeContact(phone)}
+                  style={{ color: 'var(--text-dim)', cursor: 'pointer', fontSize: 12, lineHeight: 1 }}
+                  onMouseEnter={e => e.target.style.color = 'var(--red)'}
+                  onMouseLeave={e => e.target.style.color = 'var(--text-dim)'}
+                >x</span>
+              </div>
+            )
+          })}
+
+          <div style={{ display: 'flex', gap: 6, marginTop: 10 }}>
+            <select
+              value={addPhone}
+              onChange={e => setAddPhone(e.target.value)}
+              style={{
+                flex: 1, fontFamily: 'var(--mono)', fontSize: 11,
+                background: 'var(--bg)', color: 'var(--text)',
+                border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)',
+                padding: '6px 8px', outline: 'none',
+              }}
+            >
+              <option value="">Pick a contact...</option>
+              {candidates.map(c => (
+                <option key={c.phone} value={c.phone}>{c.display_name || c.phone}</option>
+              ))}
+            </select>
+            <button
+              onClick={addContact} disabled={!addPhone}
+              style={{
+                padding: '4px 10px', fontSize: 10, fontWeight: 600,
+                background: addPhone ? 'var(--accent)' : 'var(--border)',
+                color: addPhone ? 'var(--bg)' : 'var(--text-dim)',
+                border: 'none', borderRadius: 'var(--radius-sm)',
+                cursor: addPhone ? 'pointer' : 'default',
+              }}
+            >Add</button>
+          </div>
+        </div>
+      </div>
+    </>
+  )
+}
+
 export default function SmsPanel({ daemonKey }) {
   const [contacts, setContacts] = useState([])
   const [loading, setLoading] = useState(true)
@@ -794,6 +1355,8 @@ export default function SmsPanel({ daemonKey }) {
   const [search, setSearch] = useState('')
   const [showSchedule, setShowSchedule] = useState(false)
   const [showFacts, setShowFacts] = useState(false)
+  const [showAvailability, setShowAvailability] = useState(false)
+  const [showSleep, setShowSleep] = useState(false)
   const [showAddForm, setShowAddForm] = useState(false)
   const [convos, setConvos] = useState({}) // { [phone]: { messages: [], hasMore: bool, loading: bool } }
   const [scheduleEntries, setScheduleEntries] = useState([])
@@ -937,6 +1500,30 @@ export default function SmsPanel({ daemonKey }) {
     } catch { /* ignore */ }
   }
 
+  async function cycleSlot(phone) {
+    const current = contacts.find(c => c.phone === phone)?.schedule_slot || null
+    // None → A → B → C → None
+    const next = current === null ? 'A'
+      : current === 'A' ? 'B'
+      : current === 'B' ? 'C'
+      : null
+    // Optimistic update: set new slot and also flip auto_reply ON when assigning
+    // a slot so the UI feels live (tick will re-evaluate in <=60s regardless).
+    setContacts(prev => prev.map(c => c.phone === phone ? { ...c, schedule_slot: next } : c))
+    try {
+      await apiFetch(`/sms/contacts/${encodeURIComponent(phone)}/schedule-slot`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ slot: next }),
+      }, daemonKey)
+      // Refresh to reflect whatever auto_reply the scheduler decided.
+      loadContacts()
+    } catch {
+      // Revert
+      setContacts(prev => prev.map(c => c.phone === phone ? { ...c, schedule_slot: current } : c))
+    }
+  }
+
   function handleSelectContact(phone) {
     setSelectedPhone(phone)
     if (!convos[phone]) loadConversation(phone)
@@ -995,11 +1582,11 @@ export default function SmsPanel({ daemonKey }) {
               title="Add contact"
             >+</span>
           </div>
-          <div style={{ display: 'flex', gap: 6 }}>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
             <button
               onClick={() => { setShowSchedule(!showSchedule); if (!showSchedule) loadSchedule() }}
               style={{
-                flex: 1, fontSize: 10, fontWeight: 600, padding: '5px 0',
+                fontSize: 10, fontWeight: 600, padding: '5px 0',
                 color: showSchedule ? 'var(--accent)' : 'var(--text-dim)',
                 cursor: 'pointer', letterSpacing: '0.04em',
                 background: showSchedule ? 'var(--accent-dim)' : 'transparent',
@@ -1014,7 +1601,7 @@ export default function SmsPanel({ daemonKey }) {
             <button
               onClick={() => setShowFacts(!showFacts)}
               style={{
-                flex: 1, fontSize: 10, fontWeight: 600, padding: '5px 0',
+                fontSize: 10, fontWeight: 600, padding: '5px 0',
                 color: showFacts ? 'var(--accent)' : 'var(--text-dim)',
                 cursor: 'pointer', letterSpacing: '0.04em',
                 background: showFacts ? 'var(--accent-dim)' : 'transparent',
@@ -1026,6 +1613,38 @@ export default function SmsPanel({ daemonKey }) {
               onMouseEnter={e => { if (!showFacts) e.currentTarget.style.color = 'var(--accent)' }}
               onMouseLeave={e => { if (!showFacts) e.currentTarget.style.color = 'var(--text-dim)' }}
             >FACTS</button>
+            <button
+              onClick={() => setShowAvailability(!showAvailability)}
+              title="Slot A/B/C schedules — when inside a window, the rep auto-replies for contacts on that slot."
+              style={{
+                fontSize: 10, fontWeight: 600, padding: '5px 0',
+                color: showAvailability ? 'var(--accent)' : 'var(--text-dim)',
+                cursor: 'pointer', letterSpacing: '0.04em',
+                background: showAvailability ? 'var(--accent-dim)' : 'transparent',
+                border: '1px solid var(--border)',
+                borderRadius: 'var(--radius-sm)',
+                transition: 'all var(--transition)',
+                fontFamily: 'var(--sans)',
+              }}
+              onMouseEnter={e => { if (!showAvailability) e.currentTarget.style.color = 'var(--accent)' }}
+              onMouseLeave={e => { if (!showAvailability) e.currentTarget.style.color = 'var(--text-dim)' }}
+            >AVAIL</button>
+            <button
+              onClick={() => setShowSleep(!showSleep)}
+              title="Manual sleep mode — rep covers a chosen contact list until your wake-by time."
+              style={{
+                fontSize: 10, fontWeight: 600, padding: '5px 0',
+                color: showSleep ? 'var(--accent)' : 'var(--text-dim)',
+                cursor: 'pointer', letterSpacing: '0.04em',
+                background: showSleep ? 'var(--accent-dim)' : 'transparent',
+                border: '1px solid var(--border)',
+                borderRadius: 'var(--radius-sm)',
+                transition: 'all var(--transition)',
+                fontFamily: 'var(--sans)',
+              }}
+              onMouseEnter={e => { if (!showSleep) e.currentTarget.style.color = 'var(--accent)' }}
+              onMouseLeave={e => { if (!showSleep) e.currentTarget.style.color = 'var(--text-dim)' }}
+            >SLEEP</button>
           </div>
           {showAddForm && <SmsAddForm onAdd={addContact} onCancel={() => setShowAddForm(false)} />}
         </div>
@@ -1048,6 +1667,7 @@ export default function SmsPanel({ daemonKey }) {
               onSelect={() => handleSelectContact(c.phone)}
               onToggleAutoReply={enabled => toggleAutoReply(c.phone, enabled)}
               onRename={name => renameContact(c.phone, name)}
+              onCycleSlot={() => cycleSlot(c.phone)}
             />
           ))}
         </div>
@@ -1093,6 +1713,23 @@ export default function SmsPanel({ daemonKey }) {
         <SmsFactsPanel
           daemonKey={daemonKey}
           onClose={() => setShowFacts(false)}
+        />
+      )}
+
+      {/* Availability (slot A/B/C schedules) overlay */}
+      {showAvailability && (
+        <SmsAvailabilityPanel
+          daemonKey={daemonKey}
+          onClose={() => { setShowAvailability(false); loadContacts() }}
+        />
+      )}
+
+      {/* Sleep mode overlay */}
+      {showSleep && (
+        <SmsSleepPanel
+          daemonKey={daemonKey}
+          contacts={contacts}
+          onClose={() => { setShowSleep(false); loadContacts() }}
         />
       )}
     </div>

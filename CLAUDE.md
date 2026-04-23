@@ -29,6 +29,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Prefer small, reviewable changes and keep generated bootstrap files aligned with actual repo workflows.
 - Keep shared defaults in `.claude.json`; reserve `.claude/settings.local.json` for machine-local overrides.
 - Do not overwrite existing `CLAUDE.md` content automatically; update it intentionally when repo workflows change.
+- **Clarify before building on any non-trivial feature.** When scope, semantics, or data model
+  have more than ~2 open design questions, ask a tight numbered list (<5 at a time) with a
+  "my gut" default for each, wait for answers, then restate the plan in a few lines and get
+  explicit go-ahead before writing code. Isaac has explicitly called out this behavior as the
+  right default — a guess-and-refactor approach wastes his time. One-line bug fixes and
+  mechanical edits don't need this treatment; reserve it for feature design.
 
 ## Design rules (locked 2026-04-20)
 These are the structural decisions for the Ghost expansion. See `ARCHITECTURE.md` for the full map.
@@ -104,6 +110,17 @@ All return JSON. CORS header on every response.
 | GET | `/schedule` | **bearer** | List all schedule entries (persistent + daily). |
 | POST | `/schedule` | **bearer** | Add entry. Body: `{"kind":"daily/persistent","day_date":"...","content":"..."}`. |
 | DELETE | `/schedule/{id}` | **bearer** | Delete a schedule entry by UUID. |
+| GET | `/sms/availability` | **bearer** | List all 3 slots (A/B/C) with their windows. |
+| PUT | `/sms/availability/slots/{slot}` | **bearer** | Rename a slot. Body: `{"name":"..."}`. |
+| POST | `/sms/availability/windows` | **bearer** | Add a window. Body: `{"slot":"A","kind":"weekly"/"oneoff","weekday_mask":62,"day_date":"YYYY-MM-DD","start_time":"HH:MM","end_time":"HH:MM"}`. |
+| DELETE | `/sms/availability/windows/{id}` | **bearer** | Delete a window by UUID. |
+| PUT | `/sms/contacts/{phone}/schedule-slot` | **bearer** | Assign contact to slot. Body: `{"slot":"A"/"B"/"C"/null}`. Triggers `tick_schedule` immediately. |
+| GET | `/sms/sleep` | **bearer** | Sleep state: `{active, asleep_at, awake_by}`. |
+| POST | `/sms/sleep/start` | **bearer** | Start sleep mode. Body: `{"awake_by_local":"HH:MM"}` — interpreted in Mountain Time, next occurrence. |
+| POST | `/sms/sleep/end` | **bearer** | Wake now. Clears sleep state. |
+| GET | `/sms/sleep/contacts` | **bearer** | Sleep list: `{phones: [...]}`. |
+| POST | `/sms/sleep/contacts` | **bearer** | Add a contact to sleep list. Body: `{"phone":"+1..."}`. |
+| DELETE | `/sms/sleep/contacts/{phone}` | **bearer** | Remove a contact from sleep list. |
 | GET | `/memories` | open | List up to 200 non-expired memory notes. 503 if DB not configured. |
 | DELETE | `/memories/:id` | **bearer** | Delete a single note by UUID. |
 | GET | `/bible/stats` | open | Row counts for all Bible tables. 503 if DB not configured. |
@@ -126,9 +143,10 @@ Additional hardening:
 - stdout/stderr piped through `redact_secrets` — replaces API keys with `***redacted***`.
 
 ### Background tasks (daemon startup)
-Two tasks are spawned alongside the HTTP server:
+Three tasks are spawned alongside the HTTP server:
 1. **Circuit-breaker reset** — calls `db::reset_health_flags` every 5 minutes. Restores `primary_healthy` / `fallback_healthy` after failures.
 2. **Confidence decay** — calls `db::decay_notes_confidence` every 24 hours. Reduces confidence 5% on notes older than 30 days; expires notes below 0.1.
+3. **SMS schedule tick** — calls `db::tick_schedule` every 60 seconds. Evaluates slot A/B/C windows + sleep mode against current Mountain Time and flips `sms_contacts.auto_reply` ON/OFF for contacts assigned to a slot or listed in `sms_sleep_contacts`. Auto-clears sleep mode when `now() >= awake_by`.
 
 ### Phone / network access
 ```bash
@@ -317,3 +335,40 @@ cd dashboard && npm run dev
 - **Memory tab** — lists all non-expired notes with category color badges. Filter input + refresh button. Delete (×) per note.
 - **Sessions sidebar** — right panel, sorted by most recent, workspace hash + time ago + size.
 - `ErrorBoundary` wraps `<App/>` in `main.jsx` — render crashes show a reload button.
+
+---
+
+## SMS availability + sleep mode (event-driven rep toggling)
+
+**Files:** `rust/migrations/017_sms_schedules.sql`, `db.rs` (schedule helpers), `daemon.rs` (`availability_*` / `sleep_*` handlers + 60s tick task), `dashboard/src/panels/SmsPanel.jsx` (`SmsAvailabilityPanel`, `SmsSleepPanel`, `cycleSlot`).
+
+### What it does
+- **Availability slots (A/B/C)**: each contact can be assigned to one of three named schedule slots, or none. A slot has 0..N *windows* (weekly-recurring with a weekday bitmask, or one-off on a specific date). While "now" in America/Denver falls inside any window of a contact's slot, that contact's `auto_reply` is forced **ON**. Outside all windows → **OFF**.
+- **Sleep mode**: a manual toggle. User presses "SLEEP NOW" in the SMS panel with an awake-by time (HH:MM in Mountain Time). While active, every contact in `sms_sleep_contacts` gets `auto_reply=TRUE` regardless of slot. Sleep always wins over slot scheduling. Auto-clears when `now() >= awake_by`.
+- **Manual override semantics**: toggling a contact's auto-reply via the toggle switch *also* clears `schedule_slot=NULL`. This means manual toggles opt the contact out of the scheduler until the user reassigns a slot — no fight between human intent and the tick task.
+- **Contacts with no slot and not in the sleep list** are untouched by this feature.
+
+### Evaluation
+A single SQL pass every 60 seconds in `db::tick_schedule`:
+1. If sleep is active **and** phone is in `sms_sleep_contacts` → `TRUE`.
+2. Else if `schedule_slot IS NOT NULL` → check if `now() AT TIME ZONE 'America/Denver'` is inside any of the slot's windows. Weekly windows match via `weekday_mask & (1 << dow)`; one-off windows match by date.
+3. Else → `FALSE`.
+
+All timezone math happens in Postgres (`AT TIME ZONE 'America/Denver'`) — no `chrono-tz` dependency. DST is handled correctly by Postgres.
+
+### Weekday bitmask
+Matches Postgres `EXTRACT(DOW)`: Sun=bit0, Mon=bit1, Tue=bit2, Wed=bit3, Thu=bit4, Fri=bit5, Sat=bit6. So Mon-Fri = `0b0111110 = 62`.
+
+### UI behavior
+- Contact rows show a slot indicator (A/B/C or "—"); click cycles None → A → B → C → None and calls `PUT /sms/contacts/{phone}/schedule-slot`. Daemon triggers `tick_schedule` immediately after so the toggle visibly snaps to whatever the scheduler decides.
+- **AVAIL** button opens an overlay with 3 slot cards. Each card has a name field + list of windows + "Add weekly" / "Add one-off" forms.
+- **SLEEP** button opens an overlay with the sleep state, a "SLEEP NOW" button + awake-by time picker, and a managed sleep list (picker pulls from existing contacts). Cannot start sleep with an empty list.
+
+### Tables (migration `017_sms_schedules.sql`)
+```
+sms_schedules            — (slot CHAR(1) PK, name, updated_at)
+sms_schedule_windows     — (id, slot FK, kind [weekly|oneoff], weekday_mask, day_date, start_time, end_time)
+sms_contacts.schedule_slot — new column, FK to sms_schedules.slot, nullable
+sms_sleep_mode           — singleton (id=1, active, asleep_at, awake_by)
+sms_sleep_contacts       — (phone PK)
+```
